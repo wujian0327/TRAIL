@@ -15,8 +15,8 @@ lazy_static! {
     static ref PATH_VERIFY_CACHE: DashMap<String, bool> = DashMap::new();
 }
 
-pub const DEFAULT_TOPOSTAKE_CHAIN_ID: u64 = 7_032_030;
-pub const TOPOSTAKE_TX_PATH_DOMAIN: &[u8] = b"TOPOSTAKE_TX_PATH_V1";
+pub const DEFAULT_TRAIL_CHAIN_ID: u64 = 7_032_030;
+pub const TRAIL_TX_PATH_DOMAIN: &[u8] = b"TRAIL_TX_PATH_V1";
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Path {
@@ -31,7 +31,7 @@ pub struct Path {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TransactionPaths {
     pub transaction: Transaction,
-    #[serde(default = "default_topostake_chain_id")]
+    #[serde(default = "default_trail_chain_id")]
     pub chain_id: u64,
     pub epoch: u64,
     pub paths: Vec<Path>,
@@ -43,7 +43,7 @@ pub struct TransactionPaths {
 /// from the block header during verification.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AggregatedSignedPaths {
-    #[serde(default = "default_topostake_chain_id")]
+    #[serde(default = "default_trail_chain_id")]
     pub chain_id: u64,
     #[serde(default)]
     pub epoch: u64,
@@ -57,7 +57,7 @@ impl TransactionPaths {
     }
 
     pub fn new_with_epoch(transaction: Transaction, epoch: u64) -> TransactionPaths {
-        Self::new_with_epoch_and_chain_id(transaction, epoch, DEFAULT_TOPOSTAKE_CHAIN_ID)
+        Self::new_with_epoch_and_chain_id(transaction, epoch, DEFAULT_TRAIL_CHAIN_ID)
     }
 
     pub fn new_with_epoch_and_chain_id(
@@ -76,7 +76,7 @@ impl TransactionPaths {
     pub fn new_with_paths(transaction: Transaction, paths: Vec<Path>) -> TransactionPaths {
         TransactionPaths {
             transaction,
-            chain_id: DEFAULT_TOPOSTAKE_CHAIN_ID,
+            chain_id: DEFAULT_TRAIL_CHAIN_ID,
             epoch: 0,
             paths,
         }
@@ -318,7 +318,7 @@ pub fn conflicting_receipt_count(tx_hash: &str, epoch: u64, receiver: &str) -> u
     RECEIPT_CONFLICT_CACHE
         .get(&receipt_cache_key(
             tx_hash,
-            DEFAULT_TOPOSTAKE_CHAIN_ID,
+            DEFAULT_TRAIL_CHAIN_ID,
             epoch,
             receiver,
         ))
@@ -551,14 +551,14 @@ fn chain_value_for_nodes(
     let tx_hash_bytes = decode(tx_hash)
         .unwrap_or_else(|_| tools::Hasher::hash(tx_hash.as_bytes().to_vec()).to_vec());
     if nodes.is_empty() {
-        let mut data = TOPOSTAKE_TX_PATH_DOMAIN.to_vec();
+        let mut data = TRAIL_TX_PATH_DOMAIN.to_vec();
         data.extend_from_slice(&chain_id.to_be_bytes());
         data.extend_from_slice(&epoch.to_be_bytes());
         data.extend_from_slice(&tx_hash_bytes);
         return tools::Hasher::hash(data).to_vec();
     }
     let capped_idx = node_idx.min(nodes.len() - 1);
-    let mut initial = TOPOSTAKE_TX_PATH_DOMAIN.to_vec();
+    let mut initial = TRAIL_TX_PATH_DOMAIN.to_vec();
     initial.extend_from_slice(&chain_id.to_be_bytes());
     initial.extend_from_slice(&tx_hash_bytes);
     initial.extend_from_slice(&epoch.to_be_bytes());
@@ -573,7 +573,7 @@ fn chain_value_for_nodes(
 }
 
 fn edge_statement(prefix: &[u8], from: &str, to: &str) -> Vec<u8> {
-    let mut message = TOPOSTAKE_TX_PATH_DOMAIN.to_vec();
+    let mut message = TRAIL_TX_PATH_DOMAIN.to_vec();
     message.extend_from_slice(prefix);
     message.extend_from_slice(&hash_identity(from));
     message.extend_from_slice(&hash_identity(to));
@@ -593,8 +593,8 @@ fn has_repeated_nodes(nodes: &[String]) -> bool {
     nodes.iter().any(|node| !seen.insert(node))
 }
 
-fn default_topostake_chain_id() -> u64 {
-    DEFAULT_TOPOSTAKE_CHAIN_ID
+fn default_trail_chain_id() -> u64 {
+    DEFAULT_TRAIL_CHAIN_ID
 }
 
 #[derive(Debug)]

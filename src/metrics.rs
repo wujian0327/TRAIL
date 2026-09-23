@@ -15,7 +15,7 @@ pub struct SlotMetrics {
     pub stake_concentration: f64, // Herfindahl index
     pub gini_coefficient: f64,    // Gini系数，衡量权益分布不平等程度
     pub consensus_type: String,
-    pub consensus_state: String, // e.g., "topostake(D=3)", "pos"
+    pub consensus_state: String, // e.g., "trail(D=3)", "pos"
     pub tx_packing_delay_stats: TxPackingDelayStats, // 交易打包延迟统计
     pub block_production_success: usize, // 成功出块数
     pub block_production_failed: usize, // 失败出块数
@@ -101,6 +101,8 @@ pub struct NodeEpochMetrics {
     pub fee_spent: f64,
     pub net_income: f64,
     pub relay_forward_attempts: u64,
+    pub relay_cost_per_forward: f64,
+    pub estimated_relay_benefit_per_forward: f64,
     pub degree: usize,
     pub betweenness: f64,
 }
@@ -116,6 +118,41 @@ pub struct RunSummary {
     pub adversary_fee_spent: f64,
     pub adversary_reward_income: f64,
     pub adversary_net_income: f64,
+    pub attack_tx_submitted: u64,
+    pub attack_tx_included: u64,
+    pub attack_fee_paid: f64,
+    pub attack_irrecoverable_cost_paid: f64,
+    pub attack_certified_path_cost: f64,
+    pub attack_proposer_fee_recovery: f64,
+    pub attack_relay_fee_recovery: f64,
+    pub attack_coalition_raw_contribution: f64,
+    pub attack_direct_net_cost: f64,
+    pub adversary_proposer_weight_share_mean: f64,
+    pub adversary_real_stake_share: f64,
+    pub coalition_identity_hash: String,
+    pub background_workload_hash: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AttackOnlyMetrics {
+    pub attack_tx_submitted: u64,
+    pub attack_tx_included: u64,
+    pub attack_fee_paid: f64,
+    pub attack_irrecoverable_cost_paid: f64,
+    pub attack_certified_path_cost: f64,
+    pub attack_proposer_fee_recovery: f64,
+    pub attack_relay_fee_recovery: f64,
+    pub attack_coalition_raw_contribution: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FloodingAuditState {
+    pub attack: AttackOnlyMetrics,
+    pub background_workload_trace: Vec<String>,
+    pub metrics_warmup_epochs: u64,
+    pub metric_epoch_count: u64,
+    pub adversary_proposer_weight_share_sum: f64,
+    pub adversary_real_stake_share_sum: f64,
 }
 
 impl SlotMetrics {
@@ -213,13 +250,13 @@ impl NodeEpochMetrics {
     pub fn to_csv_header() -> String {
         "epoch,validator_id,relay_profile,focal_relayer,adversarial,economic_stake,balance,raw_contribution,saturated_contribution,ema_score,normalized_score,\
          bonus,unnormalized_proposer_weight,normalized_proposer_weight,proposer_count,relay_reward,proposer_reward,fee_spent,\
-         net_income,relay_forward_attempts,degree,betweenness"
+         net_income,relay_forward_attempts,relay_cost_per_forward,estimated_relay_benefit_per_forward,degree,betweenness"
             .to_string()
     }
 
     pub fn to_csv_row(&self) -> String {
         format!(
-            "{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{},{},{}",
+            "{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{},{:.17e},{:.12},{},{}",
             self.epoch,
             self.validator_id,
             self.relay_profile,
@@ -240,6 +277,8 @@ impl NodeEpochMetrics {
             self.fee_spent,
             self.net_income,
             self.relay_forward_attempts,
+            self.relay_cost_per_forward,
+            self.estimated_relay_benefit_per_forward,
             self.degree,
             self.betweenness,
         )

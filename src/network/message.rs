@@ -2,6 +2,7 @@ use crate::blockchain::block::Block;
 use crate::blockchain::path::TransactionPaths;
 use crate::consensus::{RandaoSeed, Validator};
 use crate::network::world_state::SlotManager;
+use crate::network::RelayProfile;
 use std::sync::Arc;
 
 pub enum Message {
@@ -16,6 +17,12 @@ pub enum Message {
     GenerateBlock,
     GenerateTransactionPaths {
         to: String,
+        self_generated_attack: bool,
+    },
+    RecordGeneratedTransaction {
+        tx_hash: String,
+        created_epoch: u64,
+        created_slot: u64,
     },
     SendRandaoSeed,
     ReceiveRandaoSeed(RandaoSeed),
@@ -40,6 +47,7 @@ pub enum Message {
         new_balance: f64,
     },
     UpdateNodeBalance(f64),
+    UpdateRelayProfile(RelayProfile),
     BlockProductionFailed {
         node_index: u32,
         slot: u64,
@@ -67,7 +75,29 @@ impl Message {
     }
 
     pub fn new_generate_transaction_path_msg(to: String) -> Message {
-        Message::GenerateTransactionPaths { to }
+        Message::GenerateTransactionPaths {
+            to,
+            self_generated_attack: false,
+        }
+    }
+
+    pub fn new_generate_attack_transaction_path_msg(to: String) -> Message {
+        Message::GenerateTransactionPaths {
+            to,
+            self_generated_attack: true,
+        }
+    }
+
+    pub fn new_record_generated_transaction_msg(
+        tx_hash: String,
+        created_epoch: u64,
+        created_slot: u64,
+    ) -> Message {
+        Message::RecordGeneratedTransaction {
+            tx_hash,
+            created_epoch,
+            created_slot,
+        }
     }
 
     pub fn new_send_randao_seed_msg() -> Message {
@@ -118,6 +148,10 @@ impl Message {
 
     pub fn new_update_node_balance_msg(new_balance: f64) -> Message {
         Message::UpdateNodeBalance(new_balance)
+    }
+
+    pub fn new_update_relay_profile_msg(relay_profile: RelayProfile) -> Message {
+        Message::UpdateRelayProfile(relay_profile)
     }
 
     pub fn new_block_production_failed_msg(node_index: u32, slot: u64, reason: String) -> Message {

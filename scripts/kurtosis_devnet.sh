@@ -3,10 +3,10 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PACKAGE="${KURTOSIS_PACKAGE:-github.com/ethpandaops/ethereum-package}"
-DEFAULT_ENCLAVE="${DEFAULT_ENCLAVE:-topostake-devnet}"
-CUSTOM_ENCLAVE="${CUSTOM_ENCLAVE:-topostake-devnet-custom}"
-DEFAULT_ARGS="${DEFAULT_ARGS:-$ROOT_DIR/results/raw/topostake-devnet-4node-1validator-custom-geth-private.yaml}"
-CUSTOM_ARGS="${CUSTOM_ARGS:-$ROOT_DIR/results/raw/topostake-devnet-4node-1validator-custom-geth-private.yaml}"
+DEFAULT_ENCLAVE="${DEFAULT_ENCLAVE:-trail-devnet}"
+CUSTOM_ENCLAVE="${CUSTOM_ENCLAVE:-trail-devnet-custom}"
+DEFAULT_ARGS="${DEFAULT_ARGS:-$ROOT_DIR/results/raw/trail-devnet-4node-1validator-custom-geth-private.yaml}"
+CUSTOM_ARGS="${CUSTOM_ARGS:-$ROOT_DIR/results/raw/trail-devnet-4node-1validator-custom-geth-private.yaml}"
 LIGHTHOUSE_IMAGE="${LIGHTHOUSE_IMAGE:-}"
 DRY_RUN=0
 
@@ -15,17 +15,17 @@ usage() {
 Usage: scripts/kurtosis_devnet.sh [--dry-run] <command>
 
 Commands:
-  start-default   Start the current TopoStake custom geth+lighthouse devnet.
-  start-custom    Start the current TopoStake custom geth+lighthouse devnet.
+  start-default   Start the current TRAIL custom geth+lighthouse devnet.
+  start-custom    Start the current TRAIL custom geth+lighthouse devnet.
   status          Inspect default and custom enclaves if they exist.
   clean           Remove default and custom enclaves.
 
 Environment:
-  LIGHTHOUSE_IMAGE   Override cl_image for start-custom, e.g. topostake/lighthouse:dev.
+  LIGHTHOUSE_IMAGE   Override cl_image for start-custom, e.g. trail/lighthouse:dev.
   KURTOSIS_PACKAGE   Ethereum package path/ref, default github.com/ethpandaops/ethereum-package.
-  DEFAULT_ENCLAVE    Default enclave name, default topostake-devnet.
-  CUSTOM_ENCLAVE     Custom enclave name, default topostake-devnet-custom.
-  CUSTOM_ARGS        Args file. Current default is results/raw/topostake-devnet-4node-1validator-custom-geth-private.yaml.
+  DEFAULT_ENCLAVE    Default enclave name, default trail-devnet.
+  CUSTOM_ENCLAVE     Custom enclave name, default trail-devnet-custom.
+  CUSTOM_ARGS        Args file. Current default is results/raw/trail-devnet-4node-1validator-custom-geth-private.yaml.
 EOF
 }
 
@@ -53,7 +53,7 @@ custom_args_file() {
     dashboard_src="$ROOT_DIR/kurtosis/grafana-dashboards"
 
     if [ -d "$PACKAGE" ] && [ -d "$dashboard_src" ]; then
-        dashboard_path="/topostake-grafana-dashboards"
+        dashboard_path="/trail-grafana-dashboards"
         if [ "$DRY_RUN" -eq 0 ]; then
             mkdir -p "$PACKAGE$dashboard_path"
             cp "$dashboard_src"/*.json "$PACKAGE$dashboard_path"/
@@ -65,7 +65,7 @@ custom_args_file() {
         return
     fi
 
-    tmp_file=$(mktemp "${TMPDIR:-/tmp}/topostake-devnet-custom-lighthouse.XXXXXX.yaml")
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/trail-devnet-custom-lighthouse.XXXXXX.yaml")
     if [ -n "$LIGHTHOUSE_IMAGE" ]; then
         sed "s|^    cl_image: .*|    cl_image: $LIGHTHOUSE_IMAGE|" "$source_args" > "$tmp_file"
     else

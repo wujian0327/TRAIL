@@ -1,11 +1,13 @@
 use crate::blockchain::block::Block;
 use crate::blockchain::Blockchain;
-use crate::consensus::topostake::TopoStakeConfig;
+use crate::consensus::trail::TrailConfig;
 use crate::consensus::ConsensusType;
+use crate::metrics::FloodingAuditState;
 use crate::network::graph::TopologyType;
 use crate::network::message::Message;
 use crate::network::node::{Neighbor, Node, NodeType};
 use crate::network::world_state::WorldState;
+use crate::tools;
 use clap::ValueEnum;
 use futures::future::join_all;
 use log::{debug, info};
@@ -49,6 +51,64 @@ pub enum RelayProfile {
     Normal,
     Lazy,
     Mixed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveRelayConfig {
+    pub enabled: bool,
+    pub initial_active_fraction: f64,
+    pub cost_reference: f64,
+    pub cost_median_multiplier: f64,
+    pub cost_log_sigma: f64,
+    pub warmup_epochs: u64,
+    pub update_interval_epochs: u64,
+    pub update_fraction: f64,
+    pub benefit_ema_alpha: f64,
+    pub switching_hysteresis: f64,
+    pub exploration_fraction: f64,
+}
+
+impl Default for AdaptiveRelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            initial_active_fraction: 0.5,
+            cost_reference: 0.0,
+            cost_median_multiplier: 1.0,
+            cost_log_sigma: 0.75,
+            warmup_epochs: 5,
+            update_interval_epochs: 5,
+            update_fraction: 0.25,
+            benefit_ema_alpha: 0.5,
+            switching_hysteresis: 0.05,
+            exploration_fraction: 0.0,
+        }
+    }
+}
+
+impl AdaptiveRelayConfig {
+    fn resolved(mut self) -> Self {
+        self.initial_active_fraction = self.initial_active_fraction.clamp(0.0, 1.0);
+        self.update_fraction = self.update_fraction.clamp(0.0, 1.0);
+        self.benefit_ema_alpha = self.benefit_ema_alpha.clamp(0.0, 1.0);
+        self.switching_hysteresis = self.switching_hysteresis.clamp(0.0, 0.99);
+        self.exploration_fraction = if self.exploration_fraction.is_finite() {
+            self.exploration_fraction.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.update_interval_epochs = self.update_interval_epochs.max(1);
+        if !self.cost_reference.is_finite() || self.cost_reference < 0.0 {
+            self.cost_reference = 0.0;
+        }
+        if !self.cost_median_multiplier.is_finite() || self.cost_median_multiplier <= 0.0 {
+            self.cost_median_multiplier = 1.0;
+        }
+        if !self.cost_log_sigma.is_finite() || self.cost_log_sigma <= 0.0 {
+            self.cost_log_sigma = 0.75;
+        }
+        self
+    }
 }
 
 impl Display for AdversaryPlacement {
@@ -102,18 +162,12 @@ fn select_lazy_relayer_addresses(
     // HashMap iteration order is process-dependent. Canonicalize the candidate
     // population before applying the seeded shuffle so paired protocol runs
     // assign the same validator identities to the lazy strategy.
-    candidates.sort_by(|left, right| {
-        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
-    });
-    let mut addresses: Vec<String> = candidates
-        .into_iter()
-        .map(|(_, address)| address)
-        .collect();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut addresses: Vec<String> = candidates.into_iter().map(|(_, address)| address).collect();
     let mut relay_rng = StdRng::seed_from_u64(failure_seed ^ 0x5245_4c41_595f_4d49);
     addresses.shuffle(&mut relay_rng);
-    let lazy_count =
-        ((addresses.len() as f64 * lazy_fraction.clamp(0.0, 1.0)).round() as usize)
-            .min(addresses.len());
+    let lazy_count = ((addresses.len() as f64 * lazy_fraction.clamp(0.0, 1.0)).round() as usize)
+        .min(addresses.len());
     addresses.into_iter().take(lazy_count).collect()
 }
 
@@ -149,9 +203,14 @@ pub struct SimulationConfig {
     pub failure_seed: u64,
     pub attack_seed: u64,
     pub base_reward: f64,
+    /// Fraction of each epoch's proposer and relay rewards added to economic
+    /// stake at the following epoch boundary.
+    pub reward_reinvestment_rate: f64,
     pub max_tx_per_block: usize,
-    pub topostake_config: TopoStakeConfig,
+    pub trail_config: TrailConfig,
     pub max_epochs: u64,
+    /// Initial epochs excluded from run-level steady-state means.
+    pub warmup_epochs: u64,
     pub metrics_prefix: String,
     pub run_id: String,
     pub output_dir: String,
@@ -159,14 +218,15 @@ pub struct SimulationConfig {
     pub time_scale: f64,
     pub network_delay_multiplier: f64,
     pub validator_scale_capacity_penalty: f64,
-    pub topostake_scale_capacity_bonus: f64,
+    pub trail_scale_capacity_bonus: f64,
     pub validator_scale_latency_penalty: f64,
-    pub topostake_scale_latency_reduction: f64,
-    pub topostake_latency_reduction_s: f64,
+    pub trail_scale_latency_reduction: f64,
+    pub trail_latency_reduction_s: f64,
     pub relay_profile: RelayProfile,
     pub relay_background_profile: RelayProfile,
     pub focal_relayer_count: u32,
     pub lazy_fraction: f64,
+    pub adaptive_relay: AdaptiveRelayConfig,
     pub adversary_stake_fraction: f64,
     pub adversary_placement: AdversaryPlacement,
     pub attack_mode: AttackMode,
@@ -193,30 +253,39 @@ impl SimulationConfig {
         {
             self.validator_scale_capacity_penalty = 0.0;
         }
-        if self.topostake_scale_capacity_bonus < 0.0
-            || !self.topostake_scale_capacity_bonus.is_finite()
+        if self.trail_scale_capacity_bonus < 0.0
+            || !self.trail_scale_capacity_bonus.is_finite()
         {
-            self.topostake_scale_capacity_bonus = 0.0;
+            self.trail_scale_capacity_bonus = 0.0;
         }
         if self.validator_scale_latency_penalty < 0.0
             || !self.validator_scale_latency_penalty.is_finite()
         {
             self.validator_scale_latency_penalty = 0.0;
         }
-        if self.topostake_scale_latency_reduction < 0.0
-            || !self.topostake_scale_latency_reduction.is_finite()
+        if self.trail_scale_latency_reduction < 0.0
+            || !self.trail_scale_latency_reduction.is_finite()
         {
-            self.topostake_scale_latency_reduction = 0.0;
+            self.trail_scale_latency_reduction = 0.0;
         }
-        if self.topostake_latency_reduction_s < 0.0
-            || !self.topostake_latency_reduction_s.is_finite()
+        if self.trail_latency_reduction_s < 0.0
+            || !self.trail_latency_reduction_s.is_finite()
         {
-            self.topostake_latency_reduction_s = 0.0;
+            self.trail_latency_reduction_s = 0.0;
         }
         self.unstable_fraction = self.unstable_fraction.clamp(0.0, 1.0);
         self.offline_probability = self.offline_probability.clamp(0.0, 1.0);
         self.adversary_stake_fraction = self.adversary_stake_fraction.clamp(0.0, 1.0);
         self.lazy_fraction = self.lazy_fraction.clamp(0.0, 1.0);
+        self.adaptive_relay = self.adaptive_relay.resolved();
+        if self.adaptive_relay.enabled && self.adaptive_relay.cost_reference <= 0.0 {
+            panic!("adaptive relay participation requires a positive cost reference");
+        }
+        self.reward_reinvestment_rate = if self.reward_reinvestment_rate.is_finite() {
+            self.reward_reinvestment_rate.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         if self.attack_tx_rate_multiplier < 0.0 || !self.attack_tx_rate_multiplier.is_finite() {
             self.attack_tx_rate_multiplier = 0.0;
         }
@@ -251,6 +320,7 @@ impl SimulationConfig {
 #[derive(Serialize)]
 struct RunConfigFile {
     git_commit_sha: String,
+    git_source_diff_sha256: String,
     config: SimulationConfig,
 }
 
@@ -266,6 +336,7 @@ pub async fn start_network(config: SimulationConfig) {
     }
     let run_config = RunConfigFile {
         git_commit_sha: current_git_sha(),
+        git_source_diff_sha256: current_source_diff_sha256(),
         config: config.clone(),
     };
     let run_config_path = output_dir.join("run_config.json");
@@ -292,7 +363,7 @@ pub async fn start_network(config: SimulationConfig) {
     let max_tx_per_block = effective_max_tx_per_block(&config);
     let confirmation_latency_adjustment_s = confirmation_latency_adjustment_s(&config);
     let wallet_seed = config.wallet_seed;
-    let topostake_config = config.topostake_config.clone();
+    let trail_config = config.trail_config.clone();
     let max_epochs = config.max_epochs;
     let relay_profile = config.relay_profile;
     let initial_relay_profile = if config.focal_relayer_count > 0 {
@@ -302,6 +373,10 @@ pub async fn start_network(config: SimulationConfig) {
     };
     let generated_tx_counter = Arc::new(AtomicU64::new(0));
     let fee_spent = Arc::new(Mutex::new(HashMap::new()));
+    let flooding_audit = Arc::new(Mutex::new(FloodingAuditState {
+        metrics_warmup_epochs: config.warmup_epochs,
+        ..FloodingAuditState::default()
+    }));
     info!("Consensus Type is {}", consensus);
 
     //1. new blockchain
@@ -318,8 +393,9 @@ pub async fn start_network(config: SimulationConfig) {
         slot_per_epoch,
         pow_difficulty,
         pow_max_threads,
-        topostake_config.clone(),
+        trail_config.clone(),
         base_reward,
+        config.reward_reinvestment_rate,
         node_num,
         trans_num_per_second,
         topology.to_string(),
@@ -333,6 +409,7 @@ pub async fn start_network(config: SimulationConfig) {
         confirmation_latency_adjustment_s,
         generated_tx_counter.clone(),
         fee_spent.clone(),
+        flooding_audit.clone(),
     );
     let logical_slot_counter = world.logical_slot_counter.clone();
     info!("Generate world state");
@@ -527,7 +604,28 @@ pub async fn start_network(config: SimulationConfig) {
 
     // 找到最大度数
     let max_degree = node_degrees.values().cloned().max().unwrap_or(1);
-    if config.focal_relayer_count > 0 {
+    if config.adaptive_relay.enabled {
+        let relay_candidates: Vec<(u32, String)> = node_map
+            .iter()
+            .filter(|(_, node)| node.index < node_num)
+            .map(|(address, node)| (node.index, address.clone()))
+            .collect();
+        let lazy_addresses = select_lazy_relayer_addresses(
+            relay_candidates,
+            1.0 - config.adaptive_relay.initial_active_fraction,
+            config.failure_seed,
+        );
+        for (address, node) in node_map
+            .iter_mut()
+            .filter(|(_, node)| node.index < node_num)
+        {
+            node.set_relay_profile(if lazy_addresses.contains(address) {
+                RelayProfile::Lazy
+            } else {
+                RelayProfile::Active
+            });
+        }
+    } else if config.focal_relayer_count > 0 {
         let mut focal_candidates: Vec<(u32, String)> = node_map
             .iter()
             .filter(|(_, node)| node.index < node_num)
@@ -619,6 +717,7 @@ pub async fn start_network(config: SimulationConfig) {
     world.adversarial_nodes = adversarial_nodes.clone();
     world.node_degrees = node_degrees.clone();
     world.node_betweenness = node_betweenness.clone();
+    world.configure_adaptive_relay(config.adaptive_relay.clone(), config.failure_seed);
     info!(
         "Selected {} adversarial validators with target stake fraction {:.3}",
         adversarial_nodes.len(),
@@ -712,10 +811,12 @@ pub async fn start_network(config: SimulationConfig) {
         config.scaled_duration(Duration::from_secs(1)),
         trans_num_per_second,
         config.workload_seed,
+        config.attack_seed,
         generated_tx_counter,
         logical_slot_counter,
         slot_duration as f64,
         fee_spent,
+        flooding_audit,
         transaction_fee,
         adversarial_nodes.clone(),
         config.attack_mode,
@@ -750,8 +851,8 @@ fn effective_max_tx_per_block(config: &SimulationConfig) -> usize {
     let scale_pressure = scale_ratio.ln();
     let mut capacity =
         base_capacity / (1.0 + config.validator_scale_capacity_penalty * scale_pressure);
-    if config.consensus == ConsensusType::TopoStake {
-        capacity *= 1.0 + config.topostake_scale_capacity_bonus;
+    if config.consensus == ConsensusType::Trail {
+        capacity *= 1.0 + config.trail_scale_capacity_bonus;
     }
     capacity.round().clamp(1.0, base_capacity) as usize
 }
@@ -760,9 +861,9 @@ fn confirmation_latency_adjustment_s(config: &SimulationConfig) -> f64 {
     let scale_ratio = (config.node_num as f64 / 50.0).max(1.0);
     let scale_pressure = scale_ratio.ln() * scale_ratio;
     let mut adjustment = config.validator_scale_latency_penalty * scale_pressure;
-    if config.consensus == ConsensusType::TopoStake {
-        adjustment *= 1.0 - config.topostake_scale_latency_reduction.clamp(0.0, 1.0);
-        adjustment -= config.topostake_latency_reduction_s;
+    if config.consensus == ConsensusType::Trail {
+        adjustment *= 1.0 - config.trail_scale_latency_reduction.clamp(0.0, 1.0);
+        adjustment -= config.trail_latency_reduction_s;
     }
     adjustment
 }
@@ -772,12 +873,16 @@ struct TransactionGenerator {
     nodes_address: Vec<String>,
     time_interval: Duration,
     trans_num_per_interval: u32,
-    rng: StdRng,
+    background_count_rng: StdRng,
+    background_route_rng: StdRng,
+    attack_count_rng: StdRng,
+    attack_route_rng: StdRng,
     generated_tx_counter: Arc<AtomicU64>,
     logical_slot_counter: Arc<AtomicU64>,
     logical_slot_duration_secs: f64,
     last_logical_slot: u64,
     fee_spent: Arc<Mutex<HashMap<String, f64>>>,
+    flooding_audit: Arc<Mutex<FloodingAuditState>>,
     transaction_fee: f64,
     adversarial_nodes: HashSet<String>,
     attack_mode: AttackMode,
@@ -791,10 +896,12 @@ impl TransactionGenerator {
         time_interval: Duration,
         trans_num_per_interval: u32,
         workload_seed: u64,
+        attack_seed: u64,
         generated_tx_counter: Arc<AtomicU64>,
         logical_slot_counter: Arc<AtomicU64>,
         logical_slot_duration_secs: f64,
         fee_spent: Arc<Mutex<HashMap<String, f64>>>,
+        flooding_audit: Arc<Mutex<FloodingAuditState>>,
         transaction_fee: f64,
         adversarial_nodes: HashSet<String>,
         attack_mode: AttackMode,
@@ -805,12 +912,16 @@ impl TransactionGenerator {
             nodes_address,
             time_interval,
             trans_num_per_interval,
-            rng: StdRng::seed_from_u64(workload_seed),
+            background_count_rng: StdRng::seed_from_u64(workload_seed ^ 0x4247_5f43_4f55_4e54),
+            background_route_rng: StdRng::seed_from_u64(workload_seed ^ 0x4247_5f52_4f55_5445),
+            attack_count_rng: StdRng::seed_from_u64(attack_seed ^ 0x4154_4b5f_434f_554e),
+            attack_route_rng: StdRng::seed_from_u64(attack_seed ^ 0x4154_4b5f_524f_5554),
             generated_tx_counter,
             logical_slot_counter,
             logical_slot_duration_secs,
             last_logical_slot: 0,
             fee_spent,
+            flooding_audit,
             transaction_fee,
             adversarial_nodes,
             attack_mode,
@@ -836,7 +947,7 @@ impl TransactionGenerator {
                 let poisson = Poisson::new(lambda).unwrap();
 
                 // 获取当前逻辑 slot 生成的消息数
-                let num_messages: usize = poisson.sample(&mut self.rng) as usize;
+                let num_messages: usize = poisson.sample(&mut self.background_count_rng) as usize;
 
                 for _ in 0..num_messages {
                     self.emit_one_transaction(false).await;
@@ -848,7 +959,8 @@ impl TransactionGenerator {
                     let attack_lambda = lambda * self.attack_tx_rate_multiplier;
                     if attack_lambda > 0.0 {
                         let attack_poisson = Poisson::new(attack_lambda).unwrap();
-                        attack_messages = attack_poisson.sample(&mut self.rng) as usize;
+                        attack_messages =
+                            attack_poisson.sample(&mut self.attack_count_rng) as usize;
                         for _ in 0..attack_messages {
                             self.emit_one_transaction(true).await;
                         }
@@ -878,19 +990,45 @@ impl TransactionGenerator {
         if candidates.len() < 2 || self.nodes_address.len() < 2 {
             return;
         }
-        let from = candidates[self.rng.gen_range(0..candidates.len())].clone();
-        let mut to = self.nodes_address[self.rng.gen_range(0..self.nodes_address.len())].clone();
+        let route_rng = if adversarial_only {
+            &mut self.attack_route_rng
+        } else {
+            &mut self.background_route_rng
+        };
+        let from = candidates[route_rng.gen_range(0..candidates.len())].clone();
+        let mut to = self.nodes_address[route_rng.gen_range(0..self.nodes_address.len())].clone();
         while to == from {
-            to = self.nodes_address[self.rng.gen_range(0..self.nodes_address.len())].clone();
+            to = self.nodes_address[route_rng.gen_range(0..self.nodes_address.len())].clone();
+        }
+        if !adversarial_only {
+            // Record the pre-generated background input, not whether the target
+            // node's queue happened to accept it. Queue pressure is an attack
+            // outcome and must not alter the paired-workload identity check.
+            if let Ok(mut audit) = self.flooding_audit.lock() {
+                audit
+                    .background_workload_trace
+                    .push(format!("{}|{}|{}", self.last_logical_slot, from, to));
+            }
         }
         let Some(sender) = self.nodes_sender.get(&from) else {
             return;
         };
-        let sent = sender.try_send(Message::new_generate_transaction_path_msg(to));
+        let sent = sender.try_send(if adversarial_only {
+            Message::new_generate_attack_transaction_path_msg(to.clone())
+        } else {
+            Message::new_generate_transaction_path_msg(to.clone())
+        });
         if sent.is_err() {
             return;
         }
         self.generated_tx_counter.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut audit) = self.flooding_audit.lock() {
+            if adversarial_only {
+                audit.attack.attack_tx_submitted += 1;
+                audit.attack.attack_fee_paid += self.transaction_fee;
+                audit.attack.attack_irrecoverable_cost_paid += self.transaction_fee;
+            }
+        }
         if let Ok(mut ledger) = self.fee_spent.lock() {
             // `with_fee` models an equal-size distributable fee and irrecoverable
             // protocol cost. Both are paid by the transaction originator.
@@ -1048,6 +1186,16 @@ fn current_git_sha() -> String {
             }
         })
         .filter(|sha| !sha.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn current_source_diff_sha256() -> String {
+    std::process::Command::new("git")
+        .args(["diff", "--binary", "HEAD", "--", "src"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| hex::encode(tools::Hasher::hash(output.stdout)))
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -1310,8 +1458,7 @@ mod tests {
         reversed.reverse();
 
         let selected = super::select_lazy_relayer_addresses(candidates, 0.5, 12345);
-        let selected_reversed =
-            super::select_lazy_relayer_addresses(reversed, 0.5, 12345);
+        let selected_reversed = super::select_lazy_relayer_addresses(reversed, 0.5, 12345);
 
         assert_eq!(selected, selected_reversed);
         assert_eq!(selected.len(), 3);
@@ -1350,8 +1497,7 @@ mod tests {
             .map(|i| (format!("validator-{i:02}"), 1.0))
             .collect();
         let forward: std::collections::HashMap<_, _> = entries.iter().cloned().collect();
-        let reverse: std::collections::HashMap<_, _> =
-            entries.iter().rev().cloned().collect();
+        let reverse: std::collections::HashMap<_, _> = entries.iter().rev().cloned().collect();
         let degrees = std::collections::HashMap::new();
         let betweenness = std::collections::HashMap::new();
 

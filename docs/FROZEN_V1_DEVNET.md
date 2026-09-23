@@ -10,11 +10,11 @@ Build Geth from its checkout, then package the resulting binary from the
 repository root:
 
 ```bash
-cd ethereum-topostake/go-ethereum-topostake
+cd ethereum-trail/go-ethereum-trail
 make geth
 
 cd ../..
-GETH_BINARY="$PWD/ethereum-topostake/go-ethereum-topostake/build/bin/geth" \
+GETH_BINARY="$PWD/ethereum-trail/go-ethereum-trail/build/bin/geth" \
   ./scripts/geth_image.sh package-local
 ./scripts/geth_image.sh verify
 ```
@@ -23,11 +23,11 @@ The Lighthouse devnet uses the minimal preset, so its release binary must be
 built with `spec-minimal` before packaging:
 
 ```bash
-cd ethereum-topostake/lighthouse
+cd ethereum-trail/lighthouse
 cargo build --release -p lighthouse --features spec-minimal
 
 cd ../..
-LIGHTHOUSE_BINARY="$PWD/ethereum-topostake/lighthouse/target/release/lighthouse" \
+LIGHTHOUSE_BINARY="$PWD/ethereum-trail/lighthouse/target/release/lighthouse" \
   ./scripts/lighthouse_image.sh package-local
 ./scripts/lighthouse_image.sh verify
 ```
@@ -94,7 +94,7 @@ activation delay, within-epoch proposer-weight stability, and the proposer
 weight cap.
 
 `experiments/run_frozen_devnet_smoke.py` runs baseline, path-observation, and
-TopoStake enclaves sequentially and applies those checks to every artifact.
+TRAIL enclaves sequentially and applies those checks to every artifact.
 The runner is a smoke gate; its small sample is not paper evidence.
 Each summary also records the source commit, Docker image IDs, creation times,
 and image revision labels so results cannot silently mix current source with

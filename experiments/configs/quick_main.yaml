@@ -1,7 +1,7 @@
 {
   "suite": "quick_main",
   "build_command": ["cargo", "build", "--release"],
-  "binary": "target/release/topostake",
+  "binary": "target/release/trail",
   "max_parallel": 1,
   "timeout_seconds": 1200,
   "seeds": [0],
@@ -21,9 +21,9 @@
     "warmup_epochs": 0,
     "max_tx_per_block": 250,
     "time_scale": 0.1,
-    "topostake_initial_depth": 4,
+    "trail_initial_depth": 4,
     "beta": 0.2,
-    "topostake_saturation_k": 1.0,
+    "trail_saturation_k": 1.0,
     "eta": 0.5,
     "bonus_cap": 1.0,
     "proposer_fee_ratio": 0.7,
@@ -32,57 +32,57 @@
   "experiments": [
     {
       "name": "performance_load",
-      "protocols": ["pos", "topostake"],
+      "protocols": ["pos", "trail"],
       "node_num": [100],
       "topology": ["ba"],
       "tx_rate": [25, 50, 100, 150, 200]
     },
     {
       "name": "performance_scale",
-      "protocols": ["pos", "topostake"],
+      "protocols": ["pos", "trail"],
       "node_num": [50, 100, 200],
       "topology": ["ba"],
       "tx_rate": [100]
     },
     {
       "name": "topology_robustness",
-      "protocols": ["pos", "topostake"],
+      "protocols": ["pos", "trail"],
       "node_num": [100],
       "topology": ["ba", "er", "ws"],
       "tx_rate": [100]
     },
     {
       "name": "reward_fairness",
-      "protocols": ["pos", "topostake_eta0", "topostake"],
+      "protocols": ["pos", "trail_eta0", "trail"],
       "stake_gini": [0.6],
       "relay_profile": ["normal"]
     },
     {
       "name": "real_stake_bound",
-      "protocols": ["topostake"],
+      "protocols": ["trail"],
       "adversary_stake_fraction": [0.10],
       "adversary_placement": ["random"],
       "eta_bonus_product": [0.5]
     },
     {
       "name": "path_padding",
-      "protocols": ["topostake"],
+      "protocols": ["trail"],
       "padding_identities": [0, 2],
-      "topostake_initial_depth": [4],
+      "trail_initial_depth": [4],
       "adversary_stake_fraction": [0.10],
       "sybil_node_num": [1],
       "attack_mode": "path-padding"
     },
     {
       "name": "transaction_flooding",
-      "protocols": ["topostake"],
+      "protocols": ["trail"],
       "attack_tx_rate_multiplier": [0, 1],
       "adversary_stake_fraction": [0.10],
       "attack_mode": "flooding"
     },
     {
       "name": "churn_appendix",
-      "protocols": ["topostake"],
+      "protocols": ["trail"],
       "unstable_fraction": [0, 0.3],
       "offline_probability": [0.5]
     }

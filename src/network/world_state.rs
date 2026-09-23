@@ -5,25 +5,29 @@ use crate::blockchain::{BlockChainError, Blockchain};
 use crate::consensus::minotaur::MinotaurConsensus;
 use crate::consensus::pos::PosConsensus;
 use crate::consensus::pow::PowConsensus;
-use crate::consensus::topostake::{TopoStakeConfig, TopoStakeConsensus};
+use crate::consensus::trail::{TrailConfig, TrailConsensus};
 use crate::consensus::{Consensus, ConsensusMetricsSnapshot, ConsensusType, RandaoSeed, Validator};
 use crate::metrics::{
-    self, calculate_hhi, calculate_stake_concentration, EpochMetrics, NodeEpochMetrics, RunSummary,
-    SlotMetrics,
+    self, calculate_hhi, calculate_stake_concentration, AttackOnlyMetrics, EpochMetrics,
+    FloodingAuditState, NodeEpochMetrics, RunSummary, SlotMetrics,
 };
-use crate::network::calculate_gini;
 use crate::network::message::Message;
+use crate::network::{calculate_gini, AdaptiveRelayConfig, RelayProfile};
 use crate::tools;
 use crate::tools::get_timestamp;
 use crate::wallet::Wallet;
 use log::{debug, error, info, warn};
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
+use rand_distr::{Distribution, LogNormal};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
@@ -46,6 +50,12 @@ pub struct WorldState {
     pub node_mempools: HashMap<String, Arc<RwLock<HashMap<String, Arc<TransactionPaths>>>>>,
     pub node_relay_profiles: HashMap<String, String>,
     pub node_relay_forward_counters: HashMap<String, Arc<AtomicU64>>,
+    adaptive_relay_config: AdaptiveRelayConfig,
+    adaptive_relay_costs: HashMap<String, f64>,
+    adaptive_benefit_ema: Option<f64>,
+    adaptive_observation_window: AdaptiveObservationWindow,
+    adaptive_update_round: u64,
+    adaptive_failure_seed: u64,
     pub node_availability: HashMap<String, Arc<AtomicBool>>,
     pub blockchain: Arc<RwLock<Blockchain>>,
     pub consensus: Box<dyn Consensus>,
@@ -56,8 +66,12 @@ pub struct WorldState {
     epoch_metrics_file: Option<std::fs::File>,
     node_epoch_metrics_filename: PathBuf,
     node_epoch_metrics_file: Option<std::fs::File>,
+    adaptive_relay_metrics_filename: PathBuf,
+    adaptive_relay_metrics_file: Option<std::fs::File>,
     inclusion_samples_filename: PathBuf,
     inclusion_samples_file: Option<std::fs::File>,
+    generation_samples_filename: PathBuf,
+    generation_samples_file: Option<std::fs::File>,
     run_summary_filename: PathBuf,
     proposer_duties_filename: PathBuf,
     proposer_duties_file: Option<std::fs::File>,
@@ -75,6 +89,7 @@ pub struct WorldState {
     generated_tx_counter: Arc<AtomicU64>,
     last_generated_tx_counter: u64,
     fee_spent: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    flooding_audit: Arc<Mutex<FloodingAuditState>>,
     pub nodes_index: HashMap<String, u32>,
     pub adversarial_nodes: HashSet<String>,
     pub focal_relayer_nodes: HashSet<String>,
@@ -90,7 +105,8 @@ pub struct WorldState {
     last_block_production_success: usize,
     last_block_production_failed: usize,
     pub base_reward: f64, // 所有共识的固定奖励
-    pub max_epochs: u64,  // 最大运行Epoch数
+    reward_reinvestment_rate: f64,
+    pub max_epochs: u64, // 最大运行Epoch数
     max_tx_per_block: usize,
     confirmation_latency_adjustment_s: f64,
 }
@@ -112,6 +128,79 @@ struct EpochRewardReport {
     total_proposer_reward: f64,
     total_relay_reward: f64,
     burned_relay_fee: f64,
+}
+
+#[derive(Default, Debug, Clone)]
+struct AdaptiveGroupObservation {
+    stake_exposure: f64,
+    expected_reward: f64,
+    forward_attempts: u64,
+}
+
+impl AdaptiveGroupObservation {
+    fn expected_reward_per_stake(&self) -> Option<f64> {
+        if self.stake_exposure > 0.0 {
+            Some(self.expected_reward / self.stake_exposure)
+        } else {
+            None
+        }
+    }
+
+    fn forwards_per_stake(&self) -> Option<f64> {
+        if self.stake_exposure > 0.0 {
+            Some(self.forward_attempts as f64 / self.stake_exposure)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct AdaptiveObservationWindow {
+    epochs: u64,
+    active: AdaptiveGroupObservation,
+    lazy: AdaptiveGroupObservation,
+}
+
+impl AdaptiveObservationWindow {
+    fn observed_benefit_per_forward(&self) -> Option<f64> {
+        let reward_premium =
+            self.active.expected_reward_per_stake()? - self.lazy.expected_reward_per_stake()?;
+        let work_premium = self.active.forwards_per_stake()? - self.lazy.forwards_per_stake()?;
+        if work_premium > 0.0 && reward_premium.is_finite() {
+            Some(reward_premium / work_premium)
+        } else {
+            None
+        }
+    }
+}
+
+fn adaptive_target_profile(
+    active: bool,
+    benefit: f64,
+    cost: f64,
+    hysteresis: f64,
+    explore_opposite: bool,
+) -> RelayProfile {
+    let best_response = if active {
+        if benefit < cost * (1.0 - hysteresis) {
+            RelayProfile::Lazy
+        } else {
+            RelayProfile::Active
+        }
+    } else if benefit > cost * (1.0 + hysteresis) {
+        RelayProfile::Active
+    } else {
+        RelayProfile::Lazy
+    };
+    if explore_opposite {
+        match best_response {
+            RelayProfile::Active => RelayProfile::Lazy,
+            _ => RelayProfile::Active,
+        }
+    } else {
+        best_response
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -150,6 +239,32 @@ impl EpochRewardReport {
         }
         totals
     }
+}
+
+fn reinvest_epoch_rewards(
+    validators: &[Validator],
+    rewards: &EpochRewardReport,
+    rate: f64,
+) -> Vec<Validator> {
+    let rate = if rate.is_finite() {
+        rate.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let total_rewards = rewards.total_by_address();
+    validators
+        .iter()
+        .cloned()
+        .map(|mut validator| {
+            let reward = total_rewards
+                .get(&validator.address)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0);
+            validator.stake += rate * reward;
+            validator
+        })
+        .collect()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -193,8 +308,9 @@ impl WorldState {
         slot_per_epoch: u64,
         pow_difficulty: usize,
         pow_max_threads: usize,
-        topostake_config: TopoStakeConfig,
+        trail_config: TrailConfig,
         base_reward: f64,
+        reward_reinvestment_rate: f64,
         node_num: u32,
         trans_num: u32,
         topology: String,
@@ -208,6 +324,7 @@ impl WorldState {
         confirmation_latency_adjustment_s: f64,
         generated_tx_counter: Arc<AtomicU64>,
         fee_spent: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+        flooding_audit: Arc<Mutex<FloodingAuditState>>,
     ) -> (Self, Sender<Message>, Receiver<Message>) {
         let (sender, receiver) = tokio::sync::mpsc::channel(4096);
         let nodes_sender: HashMap<String, Sender<Message>> = HashMap::new();
@@ -219,9 +336,9 @@ impl WorldState {
         };
         let consensus_name = consensus_type.to_string();
         let consensus: Box<dyn Consensus> = match consensus_type {
-            ConsensusType::TopoStake => Box::new(
-                TopoStakeConsensus::new(base_reward, topostake_config.clone())
-                    .expect("invalid TopoStake config"),
+            ConsensusType::Trail => Box::new(
+                TrailConsensus::new(base_reward, trail_config.clone())
+                    .expect("invalid TRAIL config"),
             ),
             ConsensusType::POS => Box::new(PosConsensus::new(base_reward)),
             ConsensusType::POW => Box::new(PowConsensus::new(
@@ -237,16 +354,16 @@ impl WorldState {
         // Initialize metrics files - delete old file and create new one
         let _ = std::fs::create_dir_all(&output_dir);
         let metrics_filename = match consensus_type {
-            ConsensusType::TopoStake => format!(
+            ConsensusType::Trail => format!(
                 "slot_metrics_{}_n_{}_t_{}_{}_D_{}_beta_{}_eta_{}_cap_{}.csv",
                 consensus_name,
                 node_num,
                 trans_num,
                 topology,
-                topostake_config.target_depth,
-                topostake_config.beta,
-                topostake_config.eta,
-                topostake_config.bonus_cap
+                trail_config.target_depth,
+                trail_config.beta,
+                trail_config.eta,
+                trail_config.bonus_cap
             ),
             _ => format!(
                 "slot_metrics_{}_n_{}_t_{}_{}.csv",
@@ -256,13 +373,17 @@ impl WorldState {
         let metrics_path = output_dir.join(metrics_filename);
         let epoch_metrics_filename = output_dir.join("epoch_metrics.csv");
         let node_epoch_metrics_filename = output_dir.join("node_epoch_metrics.csv");
+        let adaptive_relay_metrics_filename = output_dir.join("adaptive_relay_metrics.csv");
         let inclusion_samples_filename = output_dir.join("inclusion_samples.csv");
+        let generation_samples_filename = output_dir.join("generation_samples.csv");
         let run_summary_filename = output_dir.join("run_summary.json");
         let proposer_duties_filename = output_dir.join("proposer_duties.csv");
         let _ = std::fs::remove_file(&metrics_path);
         let _ = std::fs::remove_file(&epoch_metrics_filename);
         let _ = std::fs::remove_file(&node_epoch_metrics_filename);
+        let _ = std::fs::remove_file(&adaptive_relay_metrics_filename);
         let _ = std::fs::remove_file(&inclusion_samples_filename);
+        let _ = std::fs::remove_file(&generation_samples_filename);
         let _ = std::fs::remove_file(&run_summary_filename);
         let _ = std::fs::remove_file(&proposer_duties_filename);
         let metrics_slots_file = std::fs::OpenOptions::new()
@@ -280,10 +401,20 @@ impl WorldState {
             .append(true)
             .open(&node_epoch_metrics_filename)
             .ok();
+        let adaptive_relay_metrics_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&adaptive_relay_metrics_filename)
+            .ok();
         let inclusion_samples_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&inclusion_samples_filename)
+            .ok();
+        let generation_samples_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&generation_samples_filename)
             .ok();
         let proposer_duties_file = std::fs::OpenOptions::new()
             .create(true)
@@ -308,6 +439,12 @@ impl WorldState {
                 node_mempools: HashMap::new(),
                 node_relay_profiles: HashMap::new(),
                 node_relay_forward_counters: HashMap::new(),
+                adaptive_relay_config: AdaptiveRelayConfig::default(),
+                adaptive_relay_costs: HashMap::new(),
+                adaptive_benefit_ema: None,
+                adaptive_observation_window: AdaptiveObservationWindow::default(),
+                adaptive_update_round: 0,
+                adaptive_failure_seed: 0,
                 node_availability: HashMap::new(),
                 blockchain: Arc::new(RwLock::new(blockchain)),
                 consensus,
@@ -318,8 +455,12 @@ impl WorldState {
                 epoch_metrics_file,
                 node_epoch_metrics_filename,
                 node_epoch_metrics_file,
+                adaptive_relay_metrics_filename,
+                adaptive_relay_metrics_file,
                 inclusion_samples_filename,
                 inclusion_samples_file,
+                generation_samples_filename,
+                generation_samples_file,
                 run_summary_filename,
                 proposer_duties_filename,
                 proposer_duties_file,
@@ -337,6 +478,7 @@ impl WorldState {
                 generated_tx_counter,
                 last_generated_tx_counter: 0,
                 fee_spent,
+                flooding_audit,
                 nodes_index: HashMap::new(),
                 adversarial_nodes: HashSet::new(),
                 focal_relayer_nodes: HashSet::new(),
@@ -351,6 +493,11 @@ impl WorldState {
                 last_block_production_success: 0,
                 last_block_production_failed: 0,
                 base_reward,
+                reward_reinvestment_rate: if reward_reinvestment_rate.is_finite() {
+                    reward_reinvestment_rate.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
                 max_epochs,
                 max_tx_per_block,
                 confirmation_latency_adjustment_s,
@@ -358,6 +505,41 @@ impl WorldState {
             sender,
             receiver,
         )
+    }
+
+    pub fn configure_adaptive_relay(&mut self, config: AdaptiveRelayConfig, failure_seed: u64) {
+        self.adaptive_relay_config = config;
+        self.adaptive_failure_seed = failure_seed;
+        self.adaptive_relay_costs.clear();
+        self.adaptive_benefit_ema = None;
+        self.adaptive_observation_window = AdaptiveObservationWindow::default();
+        self.adaptive_update_round = 0;
+        if !self.adaptive_relay_config.enabled {
+            return;
+        }
+
+        let median = self.adaptive_relay_config.cost_reference
+            * self.adaptive_relay_config.cost_median_multiplier;
+        let distribution = LogNormal::new(median.ln(), self.adaptive_relay_config.cost_log_sigma)
+            .expect("validated adaptive relay cost distribution");
+        let mut rng = StdRng::seed_from_u64(failure_seed ^ 0x4144_4150_5449_5645);
+        let mut addresses: Vec<String> = self.nodes_index.keys().cloned().collect();
+        addresses.sort_by(|left, right| {
+            self.nodes_index
+                .get(left)
+                .cmp(&self.nodes_index.get(right))
+                .then_with(|| left.cmp(right))
+        });
+        for address in addresses {
+            self.adaptive_relay_costs
+                .insert(address, distribution.sample(&mut rng));
+        }
+        info!(
+            "Adaptive relay participation enabled: validators={}, median_cost={:.3e}, log_sigma={:.3}",
+            self.adaptive_relay_costs.len(),
+            median,
+            self.adaptive_relay_config.cost_log_sigma
+        );
     }
 
     /// Configure an evaluation-only sustained outage after node indices and
@@ -421,7 +603,10 @@ impl WorldState {
             return false;
         }
         self.outage_duration_epochs == 0
-            || epoch < self.outage_start_epoch.saturating_add(self.outage_duration_epochs)
+            || epoch
+                < self
+                    .outage_start_epoch
+                    .saturating_add(self.outage_duration_epochs)
     }
 
     fn update_scheduled_availability(&self, epoch: u64) {
@@ -621,7 +806,7 @@ impl WorldState {
 
         let duty_snapshot = self.consensus.metrics_snapshot();
         let proposer_weight = if duty_snapshot.normalized_proposer_weights.is_empty() {
-            TopoStakeConsensus::normalized_stake(&validators)
+            TrailConsensus::normalized_stake(&validators)
                 .get(&miner_validator.address)
                 .copied()
                 .unwrap_or(0.0)
@@ -659,8 +844,13 @@ impl WorldState {
         let blocks = self.blockchain.read().await.get_last_epoch_block();
         let validators = self.validators.read().await.clone();
         self.consensus.on_epoch_end(&blocks, &validators);
-        self.collect_epoch_metrics(current_slot.current_epoch, &blocks, &validators)
+        let next_validators = self
+            .collect_epoch_metrics(current_slot.current_epoch, &blocks, &validators)
             .await;
+        if self.reward_reinvestment_rate > 0.0 {
+            *self.validators.write().await = next_validators.clone();
+            self.consensus.on_stake_update(&next_validators);
+        }
         if !self.scheduled_outage_active(next_epoch) {
             self.update_scheduled_availability(next_epoch);
         }
@@ -669,12 +859,7 @@ impl WorldState {
         } else {
             self.blockchain.read().await.get_last_index() + 1
         };
-        let next_seed = derive_election_seed(
-            self.election_seed,
-            next_epoch,
-            0,
-            seed_block_index,
-        );
+        let next_seed = derive_election_seed(self.election_seed, next_epoch, 0, seed_block_index);
         self.current_slot = Arc::new(RwLock::new(SlotManager {
             randao_seeds: vec![],
             slot_duration: self.slot_duration,
@@ -685,7 +870,12 @@ impl WorldState {
         }));
 
         // 打印每个 epoch 的节点余额信息
-        let mut node_stakes: Vec<(u32, f64)> = validators
+        let effective_validators = if self.reward_reinvestment_rate > 0.0 {
+            &next_validators
+        } else {
+            &validators
+        };
+        let mut node_stakes: Vec<(u32, f64)> = effective_validators
             .iter()
             .filter_map(|validator| {
                 self.nodes_index
@@ -908,7 +1098,7 @@ impl WorldState {
         epoch: u64,
         blocks: &[Block],
         validators: &[Validator],
-    ) {
+    ) -> Vec<Validator> {
         let snapshot = self.consensus.metrics_snapshot();
         let generated_total = self.generated_tx_counter.load(Ordering::Relaxed);
         let generated_tx = generated_total.saturating_sub(self.last_generated_tx_counter);
@@ -972,7 +1162,19 @@ impl WorldState {
         self.write_inclusion_samples(&inclusion_samples);
 
         let reward_report = self.estimate_epoch_rewards(&epoch_blocks, validators, &snapshot);
+        let next_validators =
+            reinvest_epoch_rewards(validators, &reward_report, self.reward_reinvestment_rate);
         let organic_capture = self.organic_capture_report(&epoch_blocks, validators, &snapshot);
+        let attack_capture = self.attack_capture_report(&epoch_blocks, validators, &snapshot);
+        if let Ok(mut audit) = self.flooding_audit.lock() {
+            audit.attack.attack_tx_included += attack_capture.attack_tx_included;
+            audit.attack.attack_certified_path_cost += attack_capture.attack_certified_path_cost;
+            audit.attack.attack_proposer_fee_recovery +=
+                attack_capture.attack_proposer_fee_recovery;
+            audit.attack.attack_relay_fee_recovery += attack_capture.attack_relay_fee_recovery;
+            audit.attack.attack_coalition_raw_contribution +=
+                attack_capture.attack_coalition_raw_contribution;
+        }
         for (address, reward) in reward_report.total_by_address() {
             *self.total_reward_income.entry(address).or_insert(0.0) += reward;
         }
@@ -980,7 +1182,7 @@ impl WorldState {
         let stake_values: Vec<f64> = validators.iter().map(|v| v.stake).collect();
         let stake_gini = calculate_gini(&stake_values);
         let stake_hhi = calculate_hhi(&stake_values);
-        let normalized_stake = TopoStakeConsensus::normalized_stake(validators);
+        let normalized_stake = TrailConsensus::normalized_stake(validators);
         let proposer_weights = if snapshot.normalized_proposer_weights.is_empty() {
             normalized_stake.clone()
         } else {
@@ -1013,12 +1215,19 @@ impl WorldState {
             .sum();
         let adversary_proposer_weight_share =
             metrics::share_for(&self.adversarial_nodes, &proposer_weights);
-        let eta = snapshot.topostake_eta.unwrap_or(0.0);
-        let bonus_cap = snapshot.topostake_bonus_cap.unwrap_or(0.0);
-        let zeta = snapshot.topostake_bonus_zeta.unwrap_or(1.0);
+        if let Ok(mut audit) = self.flooding_audit.lock() {
+            if epoch >= audit.metrics_warmup_epochs {
+                audit.metric_epoch_count += 1;
+                audit.adversary_proposer_weight_share_sum += adversary_proposer_weight_share;
+                audit.adversary_real_stake_share_sum += adversary_real_stake_share;
+            }
+        }
+        let eta = snapshot.trail_eta.unwrap_or(0.0);
+        let bonus_cap = snapshot.trail_bonus_cap.unwrap_or(0.0);
+        let zeta = snapshot.trail_bonus_zeta.unwrap_or(1.0);
         let a = adversary_real_stake_share;
         let coalition_bonus = if a > 0.0 {
-            TopoStakeConsensus::propagation_bonus(adversary_damped_score_mass / a, bonus_cap, zeta)
+            TrailConsensus::propagation_bonus(adversary_damped_score_mass / a, bonus_cap, zeta)
         } else {
             0.0
         };
@@ -1082,11 +1291,11 @@ impl WorldState {
             invalid_path_count,
             conflicting_receipt_count: conflict_count,
             active_score_epoch: snapshot
-                .topostake_active_score_epoch
+                .trail_active_score_epoch
                 .map(|value| value as i64)
                 .unwrap_or(-1),
             latest_score_epoch: snapshot
-                .topostake_latest_score_epoch
+                .trail_latest_score_epoch
                 .map(|value| value as i64)
                 .unwrap_or(-1),
             total_proposer_reward: reward_report.total_proposer_reward,
@@ -1096,8 +1305,7 @@ impl WorldState {
             organic_valid_path_count: organic_capture.valid_path_count,
             organic_relay_reward: organic_capture.relay_reward,
             adversary_organic_relay_reward: organic_capture.adversary_relay_reward,
-            adversary_organic_relay_reward_share: organic_capture
-                .adversary_relay_reward_share(),
+            adversary_organic_relay_reward_share: organic_capture.adversary_relay_reward_share(),
             organic_raw_contribution: organic_capture.raw_contribution,
             adversary_organic_raw_contribution: organic_capture.adversary_raw_contribution,
             adversary_organic_raw_contribution_share: organic_capture
@@ -1125,6 +1333,22 @@ impl WorldState {
             .map(|ledger| ledger.clone())
             .unwrap_or_default();
         let raw_contribution = self.raw_epoch_contribution(&epoch_blocks, validators, &snapshot);
+        let mut epoch_forward_attempts = HashMap::new();
+        for validator in validators {
+            let cumulative = self
+                .node_relay_forward_counters
+                .get(&validator.address)
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let previous = self
+                .last_relay_forward_attempts
+                .insert(validator.address.clone(), cumulative)
+                .unwrap_or(0);
+            epoch_forward_attempts.insert(
+                validator.address.clone(),
+                cumulative.saturating_sub(previous),
+            );
+        }
         for validator in validators {
             let s_hat = normalized_stake
                 .get(&validator.address)
@@ -1134,10 +1358,10 @@ impl WorldState {
                 .get(&validator.address)
                 .copied()
                 .unwrap_or(0.0);
-            let saturated = TopoStakeConsensus::saturated_contribution(
+            let saturated = TrailConsensus::saturated_contribution(
                 raw,
                 s_hat,
-                snapshot.topostake_saturation_k.unwrap_or(1.0),
+                snapshot.trail_saturation_k.unwrap_or(1.0),
             );
             let proposer_reward = reward_report
                 .proposer_by_address
@@ -1150,17 +1374,10 @@ impl WorldState {
                 .copied()
                 .unwrap_or(0.0);
             let fee = fee_spent.get(&validator.address).copied().unwrap_or(0.0);
-            let cumulative_forward_attempts = self
-                .node_relay_forward_counters
+            let relay_forward_attempts = epoch_forward_attempts
                 .get(&validator.address)
-                .map(|counter| counter.load(Ordering::Relaxed))
+                .copied()
                 .unwrap_or(0);
-            let previous_forward_attempts = self
-                .last_relay_forward_attempts
-                .insert(validator.address.clone(), cumulative_forward_attempts)
-                .unwrap_or(0);
-            let relay_forward_attempts =
-                cumulative_forward_attempts.saturating_sub(previous_forward_attempts);
             let node_metrics = NodeEpochMetrics {
                 epoch,
                 validator_id: self
@@ -1218,6 +1435,12 @@ impl WorldState {
                 fee_spent: fee,
                 net_income: proposer_reward + relay_reward - fee,
                 relay_forward_attempts,
+                relay_cost_per_forward: self
+                    .adaptive_relay_costs
+                    .get(&validator.address)
+                    .copied()
+                    .unwrap_or(0.0),
+                estimated_relay_benefit_per_forward: self.adaptive_benefit_ema.unwrap_or(0.0),
                 degree: self
                     .node_degrees
                     .get(&validator.address)
@@ -1231,10 +1454,279 @@ impl WorldState {
             };
             self.write_node_epoch_metrics(&node_metrics);
         }
+        self.update_adaptive_relay_profiles(
+            epoch,
+            validators,
+            &reward_report,
+            &proposer_weights,
+            &epoch_forward_attempts,
+        )
+        .await;
         self.epoch_proposer_counts.clear();
         self.last_block_production_success = self.block_production_success;
         self.last_block_production_failed = self.block_production_failed;
         self.write_run_summary(epoch + 1).await;
+        next_validators
+    }
+
+    async fn update_adaptive_relay_profiles(
+        &mut self,
+        epoch: u64,
+        validators: &[Validator],
+        rewards: &EpochRewardReport,
+        proposer_weights: &HashMap<String, f64>,
+        forward_attempts: &HashMap<String, u64>,
+    ) {
+        if !self.adaptive_relay_config.enabled {
+            return;
+        }
+
+        let mut epoch_window = AdaptiveObservationWindow {
+            epochs: 1,
+            ..AdaptiveObservationWindow::default()
+        };
+        for validator in validators {
+            let profile = self
+                .node_relay_profiles
+                .get(&validator.address)
+                .map(String::as_str)
+                .unwrap_or("lazy");
+            let group = match profile {
+                "active" => &mut epoch_window.active,
+                "lazy" => &mut epoch_window.lazy,
+                _ => continue,
+            };
+            let expected_proposer_reward = rewards.total_proposer_reward
+                * proposer_weights
+                    .get(&validator.address)
+                    .copied()
+                    .unwrap_or(0.0);
+            group.stake_exposure += validator.stake;
+            group.expected_reward += rewards
+                .relay_by_address
+                .get(&validator.address)
+                .copied()
+                .unwrap_or(0.0)
+                + expected_proposer_reward;
+            group.forward_attempts += forward_attempts
+                .get(&validator.address)
+                .copied()
+                .unwrap_or(0);
+        }
+        self.adaptive_observation_window.epochs += 1;
+        self.adaptive_observation_window.active.stake_exposure +=
+            epoch_window.active.stake_exposure;
+        self.adaptive_observation_window.active.expected_reward +=
+            epoch_window.active.expected_reward;
+        self.adaptive_observation_window.active.forward_attempts +=
+            epoch_window.active.forward_attempts;
+        self.adaptive_observation_window.lazy.stake_exposure += epoch_window.lazy.stake_exposure;
+        self.adaptive_observation_window.lazy.expected_reward += epoch_window.lazy.expected_reward;
+        self.adaptive_observation_window.lazy.forward_attempts +=
+            epoch_window.lazy.forward_attempts;
+
+        let completed_epochs = epoch + 1;
+        let warmup = self.adaptive_relay_config.warmup_epochs;
+        let interval = self.adaptive_relay_config.update_interval_epochs;
+        let update_due = completed_epochs >= warmup && (completed_epochs - warmup) % interval == 0;
+        if !update_due {
+            let window_epochs = self.adaptive_observation_window.epochs;
+            self.write_adaptive_relay_metrics(
+                epoch,
+                false,
+                None,
+                0,
+                0,
+                0,
+                0,
+                validators,
+                window_epochs,
+                None,
+            );
+            return;
+        }
+
+        let window = std::mem::take(&mut self.adaptive_observation_window);
+        let observed_benefit = window.observed_benefit_per_forward();
+        if let Some(observed) = observed_benefit {
+            let alpha = self.adaptive_relay_config.benefit_ema_alpha;
+            self.adaptive_benefit_ema = Some(match self.adaptive_benefit_ema {
+                Some(previous) => alpha * observed + (1.0 - alpha) * previous,
+                None => observed,
+            });
+        }
+
+        let mut switched_active = 0usize;
+        let mut switched_lazy = 0usize;
+        let mut exploratory_decisions = 0usize;
+        let mut reconsidered_validators = 0usize;
+        if let Some(benefit) = self.adaptive_benefit_ema {
+            let mut candidates: Vec<String> = self.adaptive_relay_costs.keys().cloned().collect();
+            candidates.sort_by(|left, right| {
+                self.nodes_index
+                    .get(left)
+                    .cmp(&self.nodes_index.get(right))
+                    .then_with(|| left.cmp(right))
+            });
+            let mut rng = StdRng::seed_from_u64(
+                self.adaptive_failure_seed ^ 0x5550_4441_5445_5253 ^ self.adaptive_update_round,
+            );
+            candidates.shuffle(&mut rng);
+            let update_count = ((candidates.len() as f64
+                * self.adaptive_relay_config.update_fraction)
+                .round() as usize)
+                .max(1)
+                .min(candidates.len());
+            let hysteresis = self.adaptive_relay_config.switching_hysteresis;
+            let exploration = self.adaptive_relay_config.exploration_fraction;
+            for address in candidates.into_iter().take(update_count) {
+                reconsidered_validators += 1;
+                let cost = self
+                    .adaptive_relay_costs
+                    .get(&address)
+                    .copied()
+                    .unwrap_or(f64::INFINITY);
+                let active = self
+                    .node_relay_profiles
+                    .get(&address)
+                    .map(|profile| profile == "active")
+                    .unwrap_or(false);
+                let explore_opposite = rng.gen_bool(exploration);
+                if explore_opposite {
+                    exploratory_decisions += 1;
+                }
+                let target =
+                    adaptive_target_profile(active, benefit, cost, hysteresis, explore_opposite);
+                if active == (target == RelayProfile::Active) {
+                    continue;
+                }
+                if let Some(sender) = self.nodes_sender.get(&address).cloned() {
+                    if sender
+                        .send(Message::new_update_relay_profile_msg(target))
+                        .await
+                        .is_ok()
+                    {
+                        self.node_relay_profiles.insert(address, target.to_string());
+                        if target == RelayProfile::Active {
+                            switched_active += 1;
+                        } else {
+                            switched_lazy += 1;
+                        }
+                    }
+                }
+            }
+            self.adaptive_update_round += 1;
+        }
+        self.write_adaptive_relay_metrics(
+            epoch,
+            true,
+            observed_benefit,
+            switched_active,
+            switched_lazy,
+            exploratory_decisions,
+            reconsidered_validators,
+            validators,
+            window.epochs,
+            Some(&window),
+        );
+    }
+
+    fn adaptive_active_stats(&self, validators: &[Validator]) -> (f64, f64) {
+        if validators.is_empty() {
+            return (0.0, 0.0);
+        }
+        let active_count = validators
+            .iter()
+            .filter(|validator| {
+                self.node_relay_profiles
+                    .get(&validator.address)
+                    .map(|profile| profile == "active")
+                    .unwrap_or(false)
+            })
+            .count();
+        let total_stake: f64 = validators.iter().map(|validator| validator.stake).sum();
+        let active_stake: f64 = validators
+            .iter()
+            .filter(|validator| {
+                self.node_relay_profiles
+                    .get(&validator.address)
+                    .map(|profile| profile == "active")
+                    .unwrap_or(false)
+            })
+            .map(|validator| validator.stake)
+            .sum();
+        (
+            active_count as f64 / validators.len() as f64,
+            if total_stake > 0.0 {
+                active_stake / total_stake
+            } else {
+                0.0
+            },
+        )
+    }
+
+    fn write_adaptive_relay_metrics(
+        &mut self,
+        epoch: u64,
+        update_applied: bool,
+        observed_benefit: Option<f64>,
+        switched_active: usize,
+        switched_lazy: usize,
+        exploratory_decisions: usize,
+        reconsidered_validators: usize,
+        validators: &[Validator],
+        window_epochs: u64,
+        window: Option<&AdaptiveObservationWindow>,
+    ) {
+        if self.adaptive_relay_metrics_file.is_none() {
+            self.adaptive_relay_metrics_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.adaptive_relay_metrics_filename)
+                .ok();
+        }
+        let (active_fraction, active_stake_share) = self.adaptive_active_stats(validators);
+        let mean_cost = if self.adaptive_relay_costs.is_empty() {
+            0.0
+        } else {
+            self.adaptive_relay_costs.values().sum::<f64>() / self.adaptive_relay_costs.len() as f64
+        };
+        let observed = observed_benefit
+            .map(|value| format!("{value:.17e}"))
+            .unwrap_or_default();
+        let smoothed = self
+            .adaptive_benefit_ema
+            .map(|value| format!("{value:.17e}"))
+            .unwrap_or_default();
+        let active_reward = window
+            .and_then(|value| value.active.expected_reward_per_stake())
+            .map(|value| format!("{value:.17e}"))
+            .unwrap_or_default();
+        let lazy_reward = window
+            .and_then(|value| value.lazy.expected_reward_per_stake())
+            .map(|value| format!("{value:.17e}"))
+            .unwrap_or_default();
+        let active_work = window
+            .and_then(|value| value.active.forwards_per_stake())
+            .map(|value| format!("{value:.17e}"))
+            .unwrap_or_default();
+        let lazy_work = window
+            .and_then(|value| value.lazy.forwards_per_stake())
+            .map(|value| format!("{value:.17e}"))
+            .unwrap_or_default();
+        if let Some(file) = self.adaptive_relay_metrics_file.as_mut() {
+            if file.metadata().map(|metadata| metadata.len()).unwrap_or(0) == 0 {
+                let _ = writeln!(
+                    file,
+                    "epoch,window_epochs,update_applied,active_fraction,active_stake_share,observed_benefit_per_forward,smoothed_benefit_per_forward,active_expected_reward_per_stake,lazy_expected_reward_per_stake,active_forward_attempts_per_stake,lazy_forward_attempts_per_stake,switched_to_active,switched_to_lazy,exploratory_decisions,reconsidered_validators,mean_cost_per_forward"
+                );
+            }
+            let _ = writeln!(
+                file,
+                "{epoch},{window_epochs},{update_applied},{active_fraction:.9},{active_stake_share:.9},{observed},{smoothed},{active_reward},{lazy_reward},{active_work},{lazy_work},{switched_active},{switched_lazy},{exploratory_decisions},{reconsidered_validators},{mean_cost:.17e}"
+            );
+            let _ = file.flush();
+        }
     }
 
     fn write_epoch_metrics(&mut self, metrics: &EpochMetrics) {
@@ -1271,10 +1763,7 @@ impl WorldState {
         }
     }
 
-    fn write_inclusion_samples(
-        &mut self,
-        samples: &[(u64, String, u64, u64, f64, bool)],
-    ) {
+    fn write_inclusion_samples(&mut self, samples: &[(u64, String, u64, u64, f64, bool)]) {
         if samples.is_empty() {
             return;
         }
@@ -1303,6 +1792,23 @@ impl WorldState {
         }
     }
 
+    fn write_generation_sample(&mut self, tx_hash: &str, epoch: u64, slot: u64) {
+        if self.generation_samples_file.is_none() {
+            self.generation_samples_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.generation_samples_filename)
+                .ok();
+        }
+        if let Some(file) = self.generation_samples_file.as_mut() {
+            if file.metadata().map(|metadata| metadata.len()).unwrap_or(0) == 0 {
+                let _ = writeln!(file, "tx_hash,created_epoch,created_slot");
+            }
+            let _ = writeln!(file, "{tx_hash},{epoch},{slot}");
+            let _ = file.flush();
+        }
+    }
+
     async fn write_run_summary(&self, completed_epochs: u64) {
         let fee_spent = self
             .fee_spent
@@ -1324,6 +1830,34 @@ impl WorldState {
                     .unwrap_or(0.0)
             })
             .sum();
+        let audit = self
+            .flooding_audit
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        let attack = audit.attack;
+        let attack_direct_net_cost = attack.attack_fee_paid + attack.attack_irrecoverable_cost_paid
+            - attack.attack_proposer_fee_recovery
+            - attack.attack_relay_fee_recovery;
+        let adversary_proposer_weight_share_mean = if audit.metric_epoch_count == 0 {
+            0.0
+        } else {
+            audit.adversary_proposer_weight_share_sum / audit.metric_epoch_count as f64
+        };
+        let adversary_real_stake_share = if audit.metric_epoch_count == 0 {
+            0.0
+        } else {
+            audit.adversary_real_stake_share_sum / audit.metric_epoch_count as f64
+        };
+        let mut coalition_identities: Vec<&str> =
+            self.adversarial_nodes.iter().map(String::as_str).collect();
+        coalition_identities.sort_unstable();
+        let coalition_identity_hash = hex::encode(tools::Hasher::hash(
+            coalition_identities.join("\n").into_bytes(),
+        ));
+        let background_workload_hash = hex::encode(tools::Hasher::hash(
+            audit.background_workload_trace.join("\n").into_bytes(),
+        ));
         let summary = RunSummary {
             run_id: self.run_id.clone(),
             completed_epochs,
@@ -1334,6 +1868,19 @@ impl WorldState {
             adversary_fee_spent,
             adversary_reward_income,
             adversary_net_income: adversary_reward_income - adversary_fee_spent,
+            attack_tx_submitted: attack.attack_tx_submitted,
+            attack_tx_included: attack.attack_tx_included,
+            attack_fee_paid: attack.attack_fee_paid,
+            attack_irrecoverable_cost_paid: attack.attack_irrecoverable_cost_paid,
+            attack_certified_path_cost: attack.attack_certified_path_cost,
+            attack_proposer_fee_recovery: attack.attack_proposer_fee_recovery,
+            attack_relay_fee_recovery: attack.attack_relay_fee_recovery,
+            attack_coalition_raw_contribution: attack.attack_coalition_raw_contribution,
+            attack_direct_net_cost,
+            adversary_proposer_weight_share_mean,
+            adversary_real_stake_share,
+            coalition_identity_hash,
+            background_workload_hash,
         };
         if let Ok(json) = serde_json::to_string_pretty(&summary) {
             let _ = tokio::fs::write(&self.run_summary_filename, json).await;
@@ -1348,7 +1895,7 @@ impl WorldState {
     ) -> HashMap<String, f64> {
         let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
         let mut raw = HashMap::new();
-        let depth = snapshot.topostake_depth.unwrap_or(1);
+        let depth = snapshot.trail_depth.unwrap_or(1);
         for block in blocks {
             for (idx, tx) in block.body.transactions.iter().enumerate() {
                 let Some(path) = block.body.paths.get(idx) else {
@@ -1366,10 +1913,10 @@ impl WorldState {
                     let relayer = &full_path[position];
                     if validator_set.contains(relayer.as_str()) {
                         let gamma =
-                            TopoStakeConsensus::gamma_for_depth(depth, position, path_length);
-                        let q = TopoStakeConsensus::transaction_credit_weight(
+                            TrailConsensus::gamma_for_depth(depth, position, path_length);
+                        let q = TrailConsensus::transaction_credit_weight(
                             tx.irrecoverable_cost,
-                            snapshot.topostake_score_cost_reference.unwrap_or(1.0),
+                            snapshot.trail_score_cost_reference.unwrap_or(1.0),
                         );
                         *raw.entry(relayer.clone()).or_insert(0.0) += q * gamma;
                     }
@@ -1377,6 +1924,60 @@ impl WorldState {
             }
         }
         raw
+    }
+
+    fn attack_capture_report(
+        &self,
+        blocks: &[Block],
+        validators: &[Validator],
+        snapshot: &ConsensusMetricsSnapshot,
+    ) -> AttackOnlyMetrics {
+        let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
+        let theta = snapshot.trail_proposer_fee_ratio.unwrap_or(1.0);
+        let depth = snapshot.trail_depth.unwrap_or(1);
+        let cost_reference = snapshot.trail_score_cost_reference.unwrap_or(1.0);
+        let mut report = AttackOnlyMetrics::default();
+
+        for block in blocks {
+            for (idx, tx) in block.body.transactions.iter().enumerate() {
+                if !tx.self_generated_attack {
+                    continue;
+                }
+                report.attack_tx_included += 1;
+                if self.adversarial_nodes.contains(&block.header.miner) {
+                    report.attack_proposer_fee_recovery += theta * tx.fee;
+                }
+                let Some(path) = block.body.paths.get(idx) else {
+                    continue;
+                };
+                if !block.verify_path_evidence(idx) {
+                    continue;
+                }
+                let full_path = path.full_path(block.header.miner.clone());
+                let path_length = full_path.len().saturating_sub(1);
+                if path_length < 2 {
+                    continue;
+                }
+                report.attack_certified_path_cost += tx.irrecoverable_cost;
+                let relay_budget = (1.0 - theta) * tx.fee;
+                let cost_weight = TrailConsensus::transaction_credit_weight(
+                    tx.irrecoverable_cost,
+                    cost_reference,
+                );
+                for position in 1..path_length {
+                    let relayer = &full_path[position];
+                    if !validator_set.contains(relayer.as_str())
+                        || !self.adversarial_nodes.contains(relayer)
+                    {
+                        continue;
+                    }
+                    let gamma = TrailConsensus::gamma_for_depth(depth, position, path_length);
+                    report.attack_relay_fee_recovery += relay_budget * gamma;
+                    report.attack_coalition_raw_contribution += cost_weight * gamma;
+                }
+            }
+        }
+        report
     }
 
     fn estimate_epoch_rewards(
@@ -1387,11 +1988,11 @@ impl WorldState {
     ) -> EpochRewardReport {
         let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
         let mut report = EpochRewardReport::default();
-        let theta = snapshot.topostake_proposer_fee_ratio.unwrap_or(1.0);
-        let depth = snapshot.topostake_depth.unwrap_or(1);
+        let theta = snapshot.trail_proposer_fee_ratio.unwrap_or(1.0);
+        let depth = snapshot.trail_depth.unwrap_or(1);
         for block in blocks {
             let total_fee: f64 = block.body.transactions.iter().map(|tx| tx.fee).sum();
-            let proposer_reward = if snapshot.topostake_depth.is_some() {
+            let proposer_reward = if snapshot.trail_depth.is_some() {
                 self.base_reward + theta * total_fee
             } else {
                 self.base_reward + total_fee
@@ -1402,7 +2003,7 @@ impl WorldState {
                 .or_insert(0.0) += proposer_reward;
             report.total_proposer_reward += proposer_reward;
 
-            if snapshot.topostake_depth.is_none() {
+            if snapshot.trail_depth.is_none() {
                 continue;
             }
             for (idx, tx) in block.body.transactions.iter().enumerate() {
@@ -1428,7 +2029,7 @@ impl WorldState {
                         continue;
                     }
                     let amount = relay_budget
-                        * TopoStakeConsensus::gamma_for_depth(depth, position, path_length);
+                        * TrailConsensus::gamma_for_depth(depth, position, path_length);
                     if amount > 0.0 {
                         paid += amount;
                         *report
@@ -1454,12 +2055,12 @@ impl WorldState {
         snapshot: &ConsensusMetricsSnapshot,
     ) -> OrganicCaptureReport {
         let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
-        let theta = snapshot.topostake_proposer_fee_ratio.unwrap_or(1.0);
-        let depth = snapshot.topostake_depth.unwrap_or(1);
-        let cost_reference = snapshot.topostake_score_cost_reference.unwrap_or(1.0);
+        let theta = snapshot.trail_proposer_fee_ratio.unwrap_or(1.0);
+        let depth = snapshot.trail_depth.unwrap_or(1);
+        let cost_reference = snapshot.trail_score_cost_reference.unwrap_or(1.0);
         let mut report = OrganicCaptureReport::default();
 
-        if snapshot.topostake_depth.is_none() {
+        if snapshot.trail_depth.is_none() {
             return report;
         }
 
@@ -1482,7 +2083,7 @@ impl WorldState {
                 }
                 report.valid_path_count += 1;
                 let relay_budget = (1.0 - theta) * tx.fee;
-                let q = TopoStakeConsensus::transaction_credit_weight(
+                let q = TrailConsensus::transaction_credit_weight(
                     tx.irrecoverable_cost,
                     cost_reference,
                 );
@@ -1491,8 +2092,7 @@ impl WorldState {
                     if !validator_set.contains(relayer.as_str()) {
                         continue;
                     }
-                    let gamma =
-                        TopoStakeConsensus::gamma_for_depth(depth, position, path_length);
+                    let gamma = TrailConsensus::gamma_for_depth(depth, position, path_length);
                     let reward = relay_budget * gamma;
                     let contribution = q * gamma;
                     report.relay_reward += reward;
@@ -1545,6 +2145,18 @@ impl WorldState {
                             let shared_self = shared_self.write().await;
                             let mut balances = shared_self.account_balances.write().await;
                             balances.insert(address, new_balance);
+                        }
+                        Message::RecordGeneratedTransaction {
+                            tx_hash,
+                            created_epoch,
+                            created_slot,
+                        } => {
+                            let mut shared_self = shared_self.write().await;
+                            shared_self.write_generation_sample(
+                                &tx_hash,
+                                created_epoch,
+                                created_slot,
+                            );
                         }
                         Message::SendBlock { block, from: _ } => {
                             {
@@ -1905,28 +2517,110 @@ mod tests {
     use log::info;
 
     #[test]
+    fn adaptive_window_uses_reward_premium_over_extra_work() {
+        let window = AdaptiveObservationWindow {
+            epochs: 5,
+            active: AdaptiveGroupObservation {
+                stake_exposure: 10.0,
+                expected_reward: 8.0,
+                forward_attempts: 50,
+            },
+            lazy: AdaptiveGroupObservation {
+                stake_exposure: 10.0,
+                expected_reward: 4.0,
+                forward_attempts: 10,
+            },
+        };
+        let benefit = window.observed_benefit_per_forward().unwrap();
+        assert!((benefit - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn adaptive_window_rejects_missing_counterfactual_group() {
+        let window = AdaptiveObservationWindow {
+            epochs: 5,
+            active: AdaptiveGroupObservation {
+                stake_exposure: 10.0,
+                expected_reward: 8.0,
+                forward_attempts: 50,
+            },
+            lazy: AdaptiveGroupObservation::default(),
+        };
+        assert_eq!(window.observed_benefit_per_forward(), None);
+    }
+
+    #[test]
+    fn adaptive_best_response_respects_hysteresis() {
+        assert_eq!(
+            adaptive_target_profile(false, 1.2, 1.0, 0.05, false),
+            RelayProfile::Active
+        );
+        assert_eq!(
+            adaptive_target_profile(true, 0.8, 1.0, 0.05, false),
+            RelayProfile::Lazy
+        );
+        assert_eq!(
+            adaptive_target_profile(true, 1.0, 1.0, 0.05, false),
+            RelayProfile::Active
+        );
+    }
+
+    #[test]
+    fn adaptive_exploration_tries_opposite_best_response() {
+        assert_eq!(
+            adaptive_target_profile(false, 1.2, 1.0, 0.05, true),
+            RelayProfile::Lazy
+        );
+        assert_eq!(
+            adaptive_target_profile(true, 0.8, 1.0, 0.05, true),
+            RelayProfile::Active
+        );
+    }
+
+    #[test]
+    fn reinvestment_applies_proposer_and_relay_rewards_atomically() {
+        let validators = vec![
+            Validator::new("alice".to_string(), 2.0, 1.0),
+            Validator::new("bob".to_string(), 3.0, 1.0),
+        ];
+        let mut rewards = EpochRewardReport::default();
+        rewards.proposer_by_address.insert("alice".to_string(), 0.4);
+        rewards.relay_by_address.insert("alice".to_string(), 0.2);
+        rewards.relay_by_address.insert("bob".to_string(), 0.6);
+
+        let updated = reinvest_epoch_rewards(&validators, &rewards, 0.5);
+        assert!((updated[0].stake - 2.3).abs() < 1e-12);
+        assert!((updated[1].stake - 3.3).abs() < 1e-12);
+        assert_eq!(validators[0].stake, 2.0);
+        assert_eq!(validators[1].stake, 3.0);
+    }
+
+    #[test]
+    fn zero_reinvestment_preserves_stake_exactly() {
+        let validators = vec![Validator::new("alice".to_string(), 2.0, 1.0)];
+        let mut rewards = EpochRewardReport::default();
+        rewards
+            .proposer_by_address
+            .insert("alice".to_string(), 99.0);
+        assert_eq!(
+            reinvest_epoch_rewards(&validators, &rewards, 0.0)[0].stake,
+            2.0
+        );
+    }
+
+    #[test]
     fn organic_capture_excludes_coalition_origins_and_accounts_relayer_credit() {
         let origin = Wallet::new();
         let adversary = Wallet::new();
         let miner = Wallet::new();
-        let tx = Transaction::with_costs(
-            miner.address.clone(),
-            0,
-            1.0,
-            1.0,
-            origin.clone(),
-        );
+        let tx = Transaction::with_costs(miner.address.clone(), 0, 1.0, 1.0, origin.clone());
         let mut path = TransactionPaths::new_with_epoch(tx.clone(), 0);
         assert!(path.append_completed_hop(
             adversary.address.clone(),
             origin.clone(),
             adversary.clone(),
         ));
-        assert!(path.append_completed_hop(
-            miner.address.clone(),
-            adversary.clone(),
-            miner.clone(),
-        ));
+        assert!(path.append_completed_hop(miner.address.clone(), adversary.clone(), miner.clone(),));
         let block = Block::new(
             1,
             0,
@@ -1936,14 +2630,14 @@ mod tests {
             miner.clone(),
         )
         .unwrap();
-        let config = TopoStakeConfig {
+        let config = TrailConfig {
             proposer_fee_ratio: 0.5,
             score_cost_reference: 1.0,
-            ..TopoStakeConfig::default()
+            ..TrailConfig::default()
         };
         let (mut world, _sender, _receiver) = WorldState::new(
             Block::gen_genesis_block(),
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
             Blockchain::new(Block::gen_genesis_block()),
             1,
             5,
@@ -1951,12 +2645,13 @@ mod tests {
             8,
             config,
             0.1,
+            0.0,
             3,
             1,
             "ba".to_string(),
             1,
             10,
-            PathBuf::from("/tmp/topostake-organic-capture-test"),
+            PathBuf::from("/tmp/trail-organic-capture-test"),
             "organic-capture-test".to_string(),
             1,
             false,
@@ -1964,6 +2659,7 @@ mod tests {
             0.0,
             Arc::new(AtomicU64::new(0)),
             Arc::new(std::sync::Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(FloodingAuditState::default())),
         );
         world.adversarial_nodes.insert(adversary.address.clone());
         let validators = vec![
@@ -1978,10 +2674,7 @@ mod tests {
         assert!(report.relay_reward > 0.0);
         assert_eq!(report.adversary_relay_reward, report.relay_reward);
         assert!(report.raw_contribution > 0.0);
-        assert_eq!(
-            report.adversary_raw_contribution,
-            report.raw_contribution
-        );
+        assert_eq!(report.adversary_raw_contribution, report.raw_contribution);
 
         world.adversarial_nodes.insert(origin.address);
         let excluded = world.organic_capture_report(&[block], &validators, &snapshot);
@@ -2005,8 +2698,9 @@ mod tests {
             5,
             20,
             8,
-            TopoStakeConfig::default(),
+            TrailConfig::default(),
             0.0, // base_reward
+            0.0, // reward_reinvestment_rate
             20,
             10,
             "ba".to_string(),
@@ -2020,6 +2714,7 @@ mod tests {
             0.0,
             Arc::new(AtomicU64::new(0)),
             Arc::new(std::sync::Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(FloodingAuditState::default())),
         );
         tokio::spawn(async move {
             world.run(world_receiver).await;
@@ -2043,8 +2738,9 @@ mod tests {
             5,
             20,
             8,
-            TopoStakeConfig::default(),
+            TrailConfig::default(),
             0.0, // base_reward
+            0.0, // reward_reinvestment_rate
             20,
             10,
             "ba".to_string(),
@@ -2058,6 +2754,7 @@ mod tests {
             0.0,
             Arc::new(AtomicU64::new(0)),
             Arc::new(std::sync::Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(FloodingAuditState::default())),
         );
 
         let validators = world.validators.clone();
@@ -2069,7 +2766,7 @@ mod tests {
             blockchain.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
             0,
         );
         let mut node1 = Node::new(
@@ -2079,7 +2776,7 @@ mod tests {
             blockchain,
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
             0,
         );
         let node0_sender = node0.sender.clone();

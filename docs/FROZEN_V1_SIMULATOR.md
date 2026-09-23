@@ -41,8 +41,8 @@ parameters in the next migration stage.
 
 ## Compatibility
 
-The experiment runner maps the legacy key `topostake_initial_depth` to
-`topostake_target_depth`, but labels old suites as protocol version `legacy`.
+The experiment runner maps the legacy key `trail_initial_depth` to
+`trail_target_depth`, but labels old suites as protocol version `legacy`.
 Final paper experiments must use a suite that explicitly declares
 `"protocol_version": "frozen-v1"`.
 
@@ -107,26 +107,17 @@ identities, exhaustively enumerates all other coalition relay positions up to
 python scripts/task.py frozen-padding-check
 ```
 
-## Frozen-v1 paper figures
+## Current TRAIL security figures
 
-After `frozen-security-report` has refreshed the processed run and paired CSVs,
-generate all security figures with:
+Generate the maintained security figures with:
 
 ```bash
-python scripts/task.py frozen-security-figures
+python scripts/task.py trail-security-figures
 ```
 
-The command writes PDF and PNG versions plus
-`figures/frozen_v1_security/figure_manifest.json`. The plotting code accepts a
-partial matrix while long runs are in progress, but labels figures with fewer
-than 20 seeds as preliminary. Re-run the same command after all seeds complete;
-no plotting-code or input-path change is required. Every panel is written as a
-separate single-axis PDF/PNG with an `_a`, `_b`, and so on suffix, so LaTeX
-`subfloat` environments can arrange and number them directly. The manifest maps
-every suffix to its metric. Relay-participation figures
-use focal-relayer metrics, while network-wide lazy-relay latency is reported in
-a separate stress figure. End-to-end padding stress is also kept distinct from
-the fixed-path non-amplification check.
+The command consumes existing processed/raw artifacts and writes the maintained
+proposer-influence, proposer-scaling, path-padding, and transaction-flooding
+figures under `figures/trail_security/`.
 
 ## Path-evidence microbenchmark
 
@@ -142,31 +133,19 @@ signature aggregation, cold aggregate verification, and encoding size for
 budget, verifies that one extra maximum-length record is rejected before
 cryptographic processing, and checks malformed signature, wrong-epoch, and
 repeated-identity rejection. Outputs are written to
-`results/processed/frozen_v1_evidence_benchmark_*`; the paper figure is
-split into `figures/frozen_v1_evidence_overhead_a.pdf` for runtime and
-`figures/frozen_v1_evidence_overhead_b.pdf` for encoded size.
+`results/processed/frozen_v1_evidence_benchmark_*`. The former standalone
+frozen-v1 evidence plots are no longer maintained.
 
-## Frozen-v1 devnet figures
+## Current TRAIL devnet figures
 
-After `frozen-devnet-main` completes the formal 75-run matrix, generate the
-devnet figures with:
+Generate the maintained devnet figures with:
 
 ```bash
-python scripts/task.py frozen-devnet-figures
+python scripts/task.py trail-devnet-figures
 ```
 
-The command requires all protocol-acceptance and measurement-quality gates to
-pass. It pairs runs by seed and reports two-sided 95% Student-t intervals for
-each difference from baseline. The compact main-paper row uses four independent
-single-axis files: performance (`_a` throughput, `_b` p95 latency), aggregate
-single-host CPU (`resources_a`), and additional serialized bytes per included
-transaction (`evidence_a`). Every panel carries the same compact two-column
-variant legend inside a metric-specific empty corner of the plotting area;
-this avoids both an outer whitespace band and the central confidence
-intervals. Memory, network traffic, and block-level inline-evidence
-verification remain separate outputs for the table or appendix. The manifest
-records the four primary stems, exact source, seed set, statistical method,
-and resource scope.
+The task regenerates the maintained throughput and latency figures under
+`figures/trail_devnet/` from the checked devnet artifacts.
 
 The score-floor sweep crosses `kappa = {0.1, 1, 10}` with low-to-normal offered
 loads. This is intentional: at high score mass, changing `kappa` has little
@@ -178,6 +157,6 @@ and active/normal/lazy correspond to forwarding probabilities 1.0/0.75/0.25.
 All three strategies use the same topology-derived link delay. A separate
 `relay_network_stress` experiment retains the all-active versus all-lazy
 comparison, but it is interpreted only as network-wide participation collapse,
-not as a TopoStake latency improvement. Transaction-level records in
+not as a TRAIL latency improvement. Transaction-level records in
 `inclusion_samples.csv` provide pooled latency quantiles and sample coverage;
 the report does not use a mean of epoch-level p95 values as its primary latency.

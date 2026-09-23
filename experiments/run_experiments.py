@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run reproducible TopoStake paper experiments from YAML specs."""
+"""Run reproducible TRAIL paper experiments from YAML specs."""
 
 from __future__ import annotations
 
@@ -26,20 +26,23 @@ DIMENSION_KEYS = [
     "topology",
     "tx_rate",
     "stake_gini",
+    "reward_reinvestment_rate",
     "relay_profile",
     "relay_background_profile",
     "focal_relayer_count",
     "lazy_fraction",
+    "adaptive_initial_active_fraction",
+    "adaptive_cost_median_multiplier",
     "adversary_stake_fraction",
     "adversary_placement",
     "eta_bonus_product",
     "padding_identities",
-    "topostake_target_depth",
+    "trail_target_depth",
     "beta",
-    "topostake_saturation_k",
-    "topostake_score_cost_reference",
-    "topostake_score_floor_kappa",
-    "topostake_bonus_zeta",
+    "trail_saturation_k",
+    "trail_score_cost_reference",
+    "trail_score_floor_kappa",
+    "trail_bonus_zeta",
     "eta",
     "bonus_cap",
     "proposer_fee_ratio",
@@ -63,35 +66,47 @@ CLI_KEYS = {
     "stake_gini": "--gini",
     "transaction_fee": "--transaction-fee",
     "base_reward": "--base-reward",
+    "reward_reinvestment_rate": "--reward-reinvestment-rate",
     "slot_duration": "--slot-duration",
     "slot_per_epoch": "--slot-per-epoch",
     "max_epochs": "--max-epochs",
+    "warmup_epochs": "--metrics-warmup-epochs",
     "max_tx_per_block": "--max-tx-per-block",
-    "topostake_target_depth": "--topostake-target-depth",
+    "trail_target_depth": "--trail-target-depth",
     "beta": "--beta",
-    "topostake_saturation_k": "--topostake-saturation-k",
-    "topostake_score_cost_reference": "--topostake-score-cost-reference",
-    "topostake_score_floor_kappa": "--topostake-score-floor-kappa",
-    "topostake_bonus_zeta": "--topostake-bonus-zeta",
+    "trail_saturation_k": "--trail-saturation-k",
+    "trail_score_cost_reference": "--trail-score-cost-reference",
+    "trail_score_floor_kappa": "--trail-score-floor-kappa",
+    "trail_bonus_zeta": "--trail-bonus-zeta",
     "eta": "--eta",
     "bonus_cap": "--bonus-cap",
     "proposer_fee_ratio": "--proposer-fee-ratio",
     "reward_settlement_depth": "--reward-settlement-depth",
-    "topostake_score_activation_delay_epochs": "--topostake-score-activation-delay-epochs",
-    "topostake_max_path_hops": "--topostake-max-path-hops",
-    "topostake_evidence_work_limit": "--topostake-evidence-work-limit",
-    "topostake_challenge_work_limit": "--topostake-challenge-work-limit",
+    "trail_score_activation_delay_epochs": "--trail-score-activation-delay-epochs",
+    "trail_max_path_hops": "--trail-max-path-hops",
+    "trail_evidence_work_limit": "--trail-evidence-work-limit",
+    "trail_challenge_work_limit": "--trail-challenge-work-limit",
     "time_scale": "--time-scale",
     "network_delay_multiplier": "--network-delay-multiplier",
     "validator_scale_capacity_penalty": "--validator-scale-capacity-penalty",
-    "topostake_scale_capacity_bonus": "--topostake-scale-capacity-bonus",
+    "trail_scale_capacity_bonus": "--trail-scale-capacity-bonus",
     "validator_scale_latency_penalty": "--validator-scale-latency-penalty",
-    "topostake_scale_latency_reduction": "--topostake-scale-latency-reduction",
-    "topostake_latency_reduction_s": "--topostake-latency-reduction-s",
+    "trail_scale_latency_reduction": "--trail-scale-latency-reduction",
+    "trail_latency_reduction_s": "--trail-latency-reduction-s",
     "relay_profile": "--relay-profile",
     "relay_background_profile": "--relay-background-profile",
     "focal_relayer_count": "--focal-relayer-count",
     "lazy_fraction": "--lazy-fraction",
+    "adaptive_initial_active_fraction": "--adaptive-initial-active-fraction",
+    "adaptive_cost_reference": "--adaptive-cost-reference",
+    "adaptive_cost_median_multiplier": "--adaptive-cost-median-multiplier",
+    "adaptive_cost_log_sigma": "--adaptive-cost-log-sigma",
+    "adaptive_warmup_epochs": "--adaptive-warmup-epochs",
+    "adaptive_update_interval_epochs": "--adaptive-update-interval-epochs",
+    "adaptive_update_fraction": "--adaptive-update-fraction",
+    "adaptive_benefit_ema_alpha": "--adaptive-benefit-ema-alpha",
+    "adaptive_switching_hysteresis": "--adaptive-switching-hysteresis",
+    "adaptive_exploration_fraction": "--adaptive-exploration-fraction",
     "unstable_fraction": "--unstable-fraction",
     "offline_probability": "--offline-probability",
     "outage_start_epoch": "--outage-start-epoch",
@@ -104,15 +119,19 @@ CLI_KEYS = {
     "attack_tx_rate_multiplier": "--attack-tx-rate-multiplier",
 }
 
-EXPERIMENT_OVERRIDE_KEYS = set(CLI_KEYS) | {"warmup_epochs", "real_time"}
+EXPERIMENT_OVERRIDE_KEYS = set(CLI_KEYS) | {
+    "warmup_epochs",
+    "real_time",
+    "adaptive_relay_participation",
+}
 
 RUN_ID_KEY_ALIASES = {
     "network_delay_multiplier": "netdelay",
     "validator_scale_capacity_penalty": "capovh",
-    "topostake_scale_capacity_bonus": "topocap",
+    "trail_scale_capacity_bonus": "topocap",
     "validator_scale_latency_penalty": "latovh",
-    "topostake_scale_latency_reduction": "topolat",
-    "topostake_latency_reduction_s": "topolatsec",
+    "trail_scale_latency_reduction": "topolat",
+    "trail_latency_reduction_s": "topolatsec",
 }
 
 
@@ -153,15 +172,26 @@ def seed_bundle(seed_value: int) -> Dict[str, int]:
 
 
 def protocol_cli(protocol_variant: str) -> Dict[str, Any]:
-    if protocol_variant == "topostake_eta0":
-        return {"protocol": "topostake", "protocol_label": "topostake_eta0", "eta": 0.0}
+    if protocol_variant.startswith("trail_eta"):
+        encoded_eta = protocol_variant.removeprefix("trail_eta").replace("p", ".")
+        try:
+            eta = float(encoded_eta)
+        except ValueError as error:
+            raise ValueError(f"invalid TRAIL eta variant: {protocol_variant}") from error
+        if not 0.0 <= eta <= 1.0:
+            raise ValueError(f"TRAIL eta variant outside [0,1]: {protocol_variant}")
+        return {
+            "protocol": "trail",
+            "protocol_label": protocol_variant,
+            "eta": eta,
+        }
     return {"protocol": protocol_variant, "protocol_label": protocol_variant}
 
 
 def migrate_legacy_keys(values: Dict[str, Any]) -> Dict[str, Any]:
     migrated = dict(values)
-    if "topostake_target_depth" not in migrated and "topostake_initial_depth" in migrated:
-        migrated["topostake_target_depth"] = migrated.pop("topostake_initial_depth")
+    if "trail_target_depth" not in migrated and "trail_initial_depth" in migrated:
+        migrated["trail_target_depth"] = migrated.pop("trail_initial_depth")
     return migrated
 
 
@@ -178,7 +208,7 @@ def expand_runs(spec: Dict[str, Any], only: Iterable[str] | None = None) -> List
         name = experiment["name"]
         if only_set and name not in only_set:
             continue
-        protocols = experiment.get("protocols", [defaults.get("protocol", "topostake")])
+        protocols = experiment.get("protocols", [defaults.get("protocol", "trail")])
         experiment_overrides = {
             key: experiment[key]
             for key in EXPERIMENT_OVERRIDE_KEYS
@@ -243,6 +273,7 @@ def filter_runs(
     runs: List[Dict[str, Any]],
     protocols: Iterable[str] | None = None,
     seed_indices: Iterable[int] | None = None,
+    node_nums: Iterable[int] | None = None,
     tx_rates: Iterable[float] | None = None,
     unstable_fractions: Iterable[float] | None = None,
     stake_ginis: Iterable[float] | None = None,
@@ -250,6 +281,7 @@ def filter_runs(
 ) -> List[Dict[str, Any]]:
     protocol_set = set(protocols or [])
     seed_set = set(seed_indices or [])
+    node_num_set = set(node_nums or [])
     tx_rate_set = set(tx_rates or [])
     unstable_fraction_set = set(unstable_fractions or [])
     stake_gini_set = set(stake_ginis or [])
@@ -260,6 +292,8 @@ def filter_runs(
         if protocol_set and run.get("protocol_label") not in protocol_set and run.get("protocol") not in protocol_set:
             continue
         if seed_set and int(run.get("seed_index", -1)) not in seed_set:
+            continue
+        if node_num_set and int(run.get("node_num", -1)) not in node_num_set:
             continue
         if tx_rate_set and float(run.get("tx_rate", -1)) not in tx_rate_set:
             continue
@@ -293,6 +327,8 @@ def command_for_run(binary: str, run: Dict[str, Any]) -> List[str]:
         cmd.append("--real-time")
     if run.get("outage_common_slot_randomness"):
         cmd.append("--outage-common-slot-randomness")
+    if run.get("adaptive_relay_participation"):
+        cmd.append("--adaptive-relay-participation")
     return cmd
 
 
@@ -350,6 +386,7 @@ def run_one(binary: str, run: Dict[str, Any], timeout: int, force: bool) -> Dict
             "runner_action": "skipped_existing",
             "cmd": cmd,
             "output_dir": str(out_dir),
+            "duration_seconds": previous_status.get("duration_seconds", 0),
         }
         write_json(status_path, status)
         return status
@@ -369,7 +406,7 @@ def run_one(binary: str, run: Dict[str, Any], timeout: int, force: bool) -> Dict
     try:
         with log_path.open("w") as log_file:
             env = os.environ.copy()
-            env.setdefault("TOPOSTAKE_LOG_LEVEL", "off")
+            env.setdefault("TRAIL_LOG_LEVEL", "off")
             completed = subprocess.run(
                 cmd,
                 cwd=ROOT,
@@ -429,6 +466,7 @@ def main() -> int:
     parser.add_argument("--only", action="append", help="Run only this experiment group")
     parser.add_argument("--protocol", action="append", help="Run only this protocol/protocol label")
     parser.add_argument("--seed-index", action="append", type=int, help="Run only this zero-based seed index")
+    parser.add_argument("--node-num", action="append", type=int, help="Run only this validator count")
     parser.add_argument("--tx-rate", action="append", type=float, help="Run only this input transaction rate")
     parser.add_argument("--unstable-fraction", action="append", type=float, help="Run only this unstable node fraction")
     parser.add_argument("--stake-gini", action="append", type=float, help="Run only this stake Gini value")
@@ -447,6 +485,7 @@ def main() -> int:
         runs,
         args.protocol,
         args.seed_index,
+        args.node_num,
         args.tx_rate,
         args.unstable_fraction,
         args.stake_gini,
@@ -454,7 +493,7 @@ def main() -> int:
     )
     max_parallel = args.max_parallel or int(spec.get("max_parallel", 1))
     timeout = args.timeout_seconds or int(spec.get("timeout_seconds", 600))
-    binary = spec.get("binary", "target/release/topostake")
+    binary = spec.get("binary", "target/release/trail")
 
     print(f"Loaded {len(runs)} runs from {spec_path.relative_to(ROOT)}")
     if args.dry_run:

@@ -4,14 +4,16 @@ use simplelog::{
     ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
 };
 use std::fs::File;
-use topostake::consensus::topostake::TopoStakeConfig;
-use topostake::consensus::ConsensusType;
-use topostake::network;
-use topostake::network::graph::TopologyType;
-use topostake::network::{AdversaryPlacement, AttackMode, RelayProfile, SimulationConfig};
+use trail::consensus::trail::TrailConfig;
+use trail::consensus::ConsensusType;
+use trail::network;
+use trail::network::graph::TopologyType;
+use trail::network::{
+    AdaptiveRelayConfig, AdversaryPlacement, AttackMode, RelayProfile, SimulationConfig,
+};
 
 #[derive(Parser, Debug)]
-#[clap(version = "1.0", author = "wujian", about = "TopoStake协议模拟")]
+#[clap(version = "1.0", author = "wujian", about = "TRAIL协议模拟")]
 struct Args {
     /// 节点个数(Node number)
     #[clap(short, long, default_value = "20")]
@@ -75,7 +77,7 @@ struct Args {
     pow_max_threads: usize,
 
     /// 共识算法类型 (Consensus algorithm type)
-    #[arg(short, long, default_value_t = ConsensusType::TopoStake)]
+    #[arg(short, long, default_value_t = ConsensusType::Trail)]
     consensus: ConsensusType,
 
     ///拓扑结构 (Topology)
@@ -117,6 +119,10 @@ struct Args {
     #[clap(long, default_value = "1.0")]
     base_reward: f64,
 
+    /// Fraction of proposer and relay rewards reinvested into next-epoch stake
+    #[clap(long, default_value = "0.0")]
+    reward_reinvestment_rate: f64,
+
     /// 每个区块最大交易数量 (Max transactions per block)
     #[clap(long, default_value = "250")]
     max_tx_per_block: usize,
@@ -127,66 +133,70 @@ struct Args {
     #[clap(long, default_value = "8")]
     wallet_seed: u64,
 
-    /// TopoStake EMA update coefficient beta
+    /// TRAIL EMA update coefficient beta
     #[clap(long)]
     beta: Option<f64>,
 
-    /// Frozen TopoStake target depth D
+    /// Frozen TRAIL target depth D
     #[clap(long)]
-    topostake_target_depth: Option<usize>,
+    trail_target_depth: Option<usize>,
 
-    /// Revised TopoStake saturation parameter K
+    /// Revised TRAIL saturation parameter K
     #[clap(long)]
-    topostake_saturation_k: Option<f64>,
+    trail_saturation_k: Option<f64>,
 
     /// Irrecoverable transaction cost that yields unit score credit
     #[clap(long)]
-    topostake_score_cost_reference: Option<f64>,
+    trail_score_cost_reference: Option<f64>,
 
     /// Absolute-score floor kappa used in damped score mass
     #[clap(long)]
-    topostake_score_floor_kappa: Option<f64>,
+    trail_score_floor_kappa: Option<f64>,
 
     /// Concave proposer-bonus saturation parameter zeta
     #[clap(long)]
-    topostake_bonus_zeta: Option<f64>,
+    trail_bonus_zeta: Option<f64>,
 
-    /// Revised TopoStake proposer bonus strength eta
+    /// Revised TRAIL proposer bonus strength eta
     #[clap(long)]
     eta: Option<f64>,
 
-    /// Revised TopoStake maximum propagation bonus
+    /// Revised TRAIL maximum propagation bonus
     #[clap(long)]
     bonus_cap: Option<f64>,
 
-    /// Revised TopoStake proposer fee ratio theta
+    /// Revised TRAIL proposer fee ratio theta
     #[clap(long)]
     proposer_fee_ratio: Option<f64>,
 
-    /// Canonical block depth before revised TopoStake rewards settle
+    /// Canonical block depth before revised TRAIL rewards settle
     #[clap(long)]
     reward_settlement_depth: Option<u64>,
 
     /// Epoch delay before a produced score root becomes active
     #[clap(long)]
-    topostake_score_activation_delay_epochs: Option<u64>,
+    trail_score_activation_delay_epochs: Option<u64>,
 
     /// Maximum certified path length accepted for score and reward
     #[clap(long)]
-    topostake_max_path_hops: Option<usize>,
+    trail_max_path_hops: Option<usize>,
 
     /// Per-block normal evidence work-unit limit
     #[clap(long)]
-    topostake_evidence_work_limit: Option<usize>,
+    trail_evidence_work_limit: Option<usize>,
 
     /// Per-block challenge work-unit limit
     #[clap(long)]
-    topostake_challenge_work_limit: Option<usize>,
+    trail_challenge_work_limit: Option<usize>,
 
     /// 最大运行Epoch数 (Max epochs to run)
     /// 当达到此Epoch数时，程序将自动退出
     #[clap(long, default_value = "100")]
     max_epochs: u64,
+
+    /// Initial epochs excluded from run-level steady-state means
+    #[clap(long, default_value = "0")]
+    metrics_warmup_epochs: u64,
 
     /// Metrics 文件前缀 (Metrics file prefix)
     #[clap(long, default_value = "metrics")]
@@ -216,21 +226,21 @@ struct Args {
     #[clap(long, default_value = "0.0")]
     validator_scale_capacity_penalty: f64,
 
-    /// Capacity bonus for TopoStake under validator-scale overhead
+    /// Capacity bonus for TRAIL under validator-scale overhead
     #[clap(long, default_value = "0.0")]
-    topostake_scale_capacity_bonus: f64,
+    trail_scale_capacity_bonus: f64,
 
     /// Confirmation latency overhead per validator-scale log factor
     #[clap(long, default_value = "0.0")]
     validator_scale_latency_penalty: f64,
 
-    /// Confirmation latency reduction for TopoStake scale experiments
+    /// Confirmation latency reduction for TRAIL scale experiments
     #[clap(long, default_value = "0.0")]
-    topostake_scale_latency_reduction: f64,
+    trail_scale_latency_reduction: f64,
 
-    /// Fixed confirmation latency reduction for TopoStake
+    /// Fixed confirmation latency reduction for TRAIL
     #[clap(long, default_value = "0.0")]
-    topostake_latency_reduction_s: f64,
+    trail_latency_reduction_s: f64,
 
     /// Relay participation behavior
     #[arg(long, default_value_t = RelayProfile::Normal)]
@@ -247,6 +257,50 @@ struct Args {
     /// Fraction of non-focal honest validators assigned the lazy relay profile
     #[clap(long, default_value = "0.0")]
     lazy_fraction: f64,
+
+    /// Let validators update Active/Lazy relay strategies from past observations
+    #[clap(long, default_value_t = false)]
+    adaptive_relay_participation: bool,
+
+    /// Initial fraction of validators using the Active relay strategy
+    #[clap(long, default_value = "0.5")]
+    adaptive_initial_active_fraction: f64,
+
+    /// Absolute per-forward cost scale calibrated before the adaptive run
+    #[clap(long, default_value = "0.0")]
+    adaptive_cost_reference: f64,
+
+    /// Median relay cost relative to the calibrated reference
+    #[clap(long, default_value = "1.0")]
+    adaptive_cost_median_multiplier: f64,
+
+    /// Log-space standard deviation of heterogeneous relay costs
+    #[clap(long, default_value = "0.75")]
+    adaptive_cost_log_sigma: f64,
+
+    /// Completed epochs observed before the first strategy update
+    #[clap(long, default_value = "5")]
+    adaptive_warmup_epochs: u64,
+
+    /// Epochs aggregated into each backward-looking benefit estimate
+    #[clap(long, default_value = "5")]
+    adaptive_update_interval_epochs: u64,
+
+    /// Fraction of validators allowed to reconsider per update
+    #[clap(long, default_value = "0.25")]
+    adaptive_update_fraction: f64,
+
+    /// EMA coefficient applied to completed-window benefit estimates
+    #[clap(long, default_value = "0.5")]
+    adaptive_benefit_ema_alpha: f64,
+
+    /// Relative switching band around each validator's relay cost
+    #[clap(long, default_value = "0.05")]
+    adaptive_switching_hysteresis: f64,
+
+    /// Fraction of updating validators that try the opposite relay strategy
+    #[clap(long, default_value = "0.0")]
+    adaptive_exploration_fraction: f64,
 
     /// Target corrupted real-stake fraction
     #[clap(long, default_value = "0.0")]
@@ -277,50 +331,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //log setting
     init_logger()?;
 
-    let mut topostake_config = TopoStakeConfig::default();
-    if let Some(value) = args.topostake_target_depth {
-        topostake_config.target_depth = value;
+    let mut trail_config = TrailConfig::default();
+    if let Some(value) = args.trail_target_depth {
+        trail_config.target_depth = value;
     }
     if let Some(value) = args.beta {
-        topostake_config.beta = value;
+        trail_config.beta = value;
     }
-    if let Some(value) = args.topostake_saturation_k {
-        topostake_config.saturation_k = value;
+    if let Some(value) = args.trail_saturation_k {
+        trail_config.saturation_k = value;
     }
-    if let Some(value) = args.topostake_score_cost_reference {
-        topostake_config.score_cost_reference = value;
+    if let Some(value) = args.trail_score_cost_reference {
+        trail_config.score_cost_reference = value;
     }
-    if let Some(value) = args.topostake_score_floor_kappa {
-        topostake_config.score_floor_kappa = value;
+    if let Some(value) = args.trail_score_floor_kappa {
+        trail_config.score_floor_kappa = value;
     }
-    if let Some(value) = args.topostake_bonus_zeta {
-        topostake_config.bonus_zeta = value;
+    if let Some(value) = args.trail_bonus_zeta {
+        trail_config.bonus_zeta = value;
     }
     if let Some(value) = args.eta {
-        topostake_config.eta = value;
+        trail_config.eta = value;
     }
     if let Some(value) = args.bonus_cap {
-        topostake_config.bonus_cap = value;
+        trail_config.bonus_cap = value;
     }
     if let Some(value) = args.proposer_fee_ratio {
-        topostake_config.proposer_fee_ratio = value;
+        trail_config.proposer_fee_ratio = value;
     }
     if let Some(value) = args.reward_settlement_depth {
-        topostake_config.reward_settlement_depth = value;
+        trail_config.reward_settlement_depth = value;
     }
-    if let Some(value) = args.topostake_score_activation_delay_epochs {
-        topostake_config.score_activation_delay_epochs = value;
+    if let Some(value) = args.trail_score_activation_delay_epochs {
+        trail_config.score_activation_delay_epochs = value;
     }
-    if let Some(value) = args.topostake_max_path_hops {
-        topostake_config.max_path_hops = value;
+    if let Some(value) = args.trail_max_path_hops {
+        trail_config.max_path_hops = value;
     }
-    if let Some(value) = args.topostake_evidence_work_limit {
-        topostake_config.evidence_work_limit = value;
+    if let Some(value) = args.trail_evidence_work_limit {
+        trail_config.evidence_work_limit = value;
     }
-    if let Some(value) = args.topostake_challenge_work_limit {
-        topostake_config.challenge_work_limit = value;
+    if let Some(value) = args.trail_challenge_work_limit {
+        trail_config.challenge_work_limit = value;
     }
-    topostake_config
+    trail_config
         .validate()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
 
@@ -351,9 +405,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         failure_seed: args.failure_seed,
         attack_seed: args.attack_seed,
         base_reward: args.base_reward,
+        reward_reinvestment_rate: args.reward_reinvestment_rate,
         max_tx_per_block: args.max_tx_per_block,
-        topostake_config,
+        trail_config,
         max_epochs: args.max_epochs,
+        warmup_epochs: args.metrics_warmup_epochs,
         metrics_prefix: args.metrics_prefix,
         run_id: args.run_id,
         output_dir: args.output_dir,
@@ -361,14 +417,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         time_scale: args.time_scale,
         network_delay_multiplier: args.network_delay_multiplier,
         validator_scale_capacity_penalty: args.validator_scale_capacity_penalty,
-        topostake_scale_capacity_bonus: args.topostake_scale_capacity_bonus,
+        trail_scale_capacity_bonus: args.trail_scale_capacity_bonus,
         validator_scale_latency_penalty: args.validator_scale_latency_penalty,
-        topostake_scale_latency_reduction: args.topostake_scale_latency_reduction,
-        topostake_latency_reduction_s: args.topostake_latency_reduction_s,
+        trail_scale_latency_reduction: args.trail_scale_latency_reduction,
+        trail_latency_reduction_s: args.trail_latency_reduction_s,
         relay_profile: args.relay_profile,
         relay_background_profile: args.relay_background_profile,
         focal_relayer_count: args.focal_relayer_count,
         lazy_fraction: args.lazy_fraction,
+        adaptive_relay: AdaptiveRelayConfig {
+            enabled: args.adaptive_relay_participation,
+            initial_active_fraction: args.adaptive_initial_active_fraction,
+            cost_reference: args.adaptive_cost_reference,
+            cost_median_multiplier: args.adaptive_cost_median_multiplier,
+            cost_log_sigma: args.adaptive_cost_log_sigma,
+            warmup_epochs: args.adaptive_warmup_epochs,
+            update_interval_epochs: args.adaptive_update_interval_epochs,
+            update_fraction: args.adaptive_update_fraction,
+            benefit_ema_alpha: args.adaptive_benefit_ema_alpha,
+            switching_hysteresis: args.adaptive_switching_hysteresis,
+            exploration_fraction: args.adaptive_exploration_fraction,
+        },
         adversary_stake_fraction: args.adversary_stake_fraction,
         adversary_placement: args.adversary_placement,
         attack_mode: args.attack_mode,
@@ -380,7 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
-    let level = match std::env::var("TOPOSTAKE_LOG_LEVEL")
+    let level = match std::env::var("TRAIL_LOG_LEVEL")
         .unwrap_or_else(|_| "info".to_string())
         .to_lowercase()
         .as_str()

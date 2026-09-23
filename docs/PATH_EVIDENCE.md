@@ -1,6 +1,6 @@
-# TopoStake Path Evidence
+# TRAIL Path Evidence
 
-This document describes the revised path evidence implemented for TopoStake.
+This document describes the revised path evidence implemented for TRAIL.
 
 ## In-Flight Representation
 
@@ -28,14 +28,14 @@ and adds the receiver signature with `complete_pending_hop`.
 For transaction `tx` on chain `chain_id` in epoch `e` and path `v0,...,vm`:
 
 ```text
-c0 = H("TOPOSTAKE_TX_PATH_V1" || chain_id || H(tx) || e || H(v0))
+c0 = H("TRAIL_TX_PATH_V1" || chain_id || H(tx) || e || H(v0))
 ci = H(c{i-1} || H(vi)) for i > 0
 ```
 
 For edge `(vi, v{i+1})`:
 
 ```text
-Mi = "TOPOSTAKE_TX_PATH_V1" || ci || H(vi) || H(v{i+1})
+Mi = "TRAIL_TX_PATH_V1" || ci || H(vi) || H(v{i+1})
 ```
 
 Both endpoints sign the same edge statement. An `m`-hop path therefore produces

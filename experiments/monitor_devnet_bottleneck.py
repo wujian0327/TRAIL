@@ -210,8 +210,8 @@ def docker_stats(containers: dict[str, str]) -> list[dict[str, str]]:
         if not container_id:
             continue
         service_name = containers[container_id]
-        row["TopoStakeService"] = service_name
-        row["TopoStakeKind"] = client_kind(service_name)
+        row["TrailService"] = service_name
+        row["TrailKind"] = client_kind(service_name)
         rows.append(row)
     return rows
 

@@ -1284,7 +1284,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "topostake-rs"
+name = "trail-rs"
 version = "0.1.0"
 dependencies = [
  "blst",

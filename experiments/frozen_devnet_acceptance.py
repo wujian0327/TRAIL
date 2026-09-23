@@ -3,7 +3,7 @@
 
 The static checks are dependency-free and validate the shared protocol profile
 against the golden vectors. Artifact checks consume the ``summary.json``
-written by ``topostake_devnet_runner.py`` and fail closed on missing evidence or
+written by ``trail_devnet_runner.py`` and fail closed on missing evidence or
 Prometheus data for modes that require them.
 """
 
@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = ROOT / "experiments" / "configs" / "protocol_frozen_v1.yaml"
 GOLDEN_PATH = ROOT / "experiments" / "golden" / "frozen_v1_vectors.yaml"
 DEFAULT_REPORT = ROOT / "results" / "processed" / "frozen_v1_devnet_acceptance.json"
-MODES = ("baseline", "pathobs", "fee_only", "bonus_only", "topostake")
+MODES = ("baseline", "pathobs", "fee_only", "bonus_only", "trail")
 
 
 @dataclass(frozen=True)
@@ -157,7 +157,7 @@ def metric_max(summary: dict[str, Any], name: str) -> float:
 
 
 def frozen_weight_checks(summary: dict[str, Any]) -> list[Check]:
-    samples, error = metric_samples(summary, "topostake_proposer_weight_scaled")
+    samples, error = metric_samples(summary, "trail_proposer_weight_scaled")
     if error:
         return [check("proposer-weight-metric", False, error)]
     within_instance: dict[tuple[str, str, str], set[float]] = {}
@@ -173,7 +173,7 @@ def frozen_weight_checks(summary: dict[str, Any]) -> list[Check]:
     intra_unstable = {key: values for key, values in within_instance.items() if len(values) > 1}
     cross_unstable = {key: values for key, values in across_instances.items() if len(values) > 1}
 
-    selected, selected_error = metric_samples(summary, "topostake_selected_proposer")
+    selected, selected_error = metric_samples(summary, "trail_selected_proposer")
     selected_by_slot: dict[tuple[str, str], set[str]] = {}
     for sample in selected:
         if sample_value(sample) != 1.0:
@@ -204,7 +204,7 @@ def frozen_weight_checks(summary: dict[str, Any]) -> list[Check]:
 
 
 def activation_checks(summary: dict[str, Any], delay: int) -> list[Check]:
-    samples, error = metric_samples(summary, "topostake_selection_score_epoch")
+    samples, error = metric_samples(summary, "trail_selection_score_epoch")
     if error:
         return [check("activation-metric", False, error)]
     violations = []
@@ -238,25 +238,25 @@ def artifact_checks(summary: dict[str, Any], mode: str) -> list[Check]:
     max_path = int(fixed["max_path_evidence_len"])
     work_limit = int(fixed["evidence_work_limit"])
     slots_per_epoch = int(fixed["slots_per_epoch"])
-    _, fee_metric_error = metric_samples(summary, "topostake_fee_conservation_violation")
+    _, fee_metric_error = metric_samples(summary, "trail_fee_conservation_violation")
 
     checks = [
         check("finality-progress", finalized_after > finalized_before, f"before={finalized_before}, after={finalized_after}"),
         check("peer-graph", summary.get("peer_graph", {}).get("matches_target") is True, str(summary.get("peer_graph", {}).get("matches_target"))),
         check("fee-conservation-metric-query", fee_metric_error is None, str(fee_metric_error)),
-        check("fee-conservation", metric_sum(summary, "topostake_fee_conservation_violation") == 0.0, str(metric_sum(summary, "topostake_fee_conservation_violation"))),
+        check("fee-conservation", metric_sum(summary, "trail_fee_conservation_violation") == 0.0, str(metric_sum(summary, "trail_fee_conservation_violation"))),
     ]
 
     if mode == "baseline":
         checks.extend(
             [
                 check("baseline-no-evidence", len(records) == 0, f"records={len(records)}"),
-                check("baseline-no-score", metric_max(summary, "topostake_epoch_score_scaled") == 0.0, str(metric_max(summary, "topostake_epoch_score_scaled"))),
+                check("baseline-no-score", metric_max(summary, "trail_epoch_score_scaled") == 0.0, str(metric_max(summary, "trail_epoch_score_scaled"))),
             ]
         )
         return checks
 
-    geth_statuses = summary.get("geth_topostake_status", [])
+    geth_statuses = summary.get("geth_trail_status", [])
     expected_relay_epoch = int(after.get("head_slot", 0)) // slots_per_epoch
     checks.extend(
         [
@@ -310,18 +310,18 @@ def artifact_checks(summary: dict[str, Any], mode: str) -> list[Check]:
             check(
                 "stale-evidence-no-credit",
                 not stale
-                or metric_sum(summary, "topostake_evidence_epoch_invalid_paths") > 0.0,
+                or metric_sum(summary, "trail_evidence_epoch_invalid_paths") > 0.0,
                 (
                     f"stale={len(stale)}, "
                     "invalid_metric="
-                    f"{metric_sum(summary, 'topostake_evidence_epoch_invalid_paths')}"
+                    f"{metric_sum(summary, 'trail_evidence_epoch_invalid_paths')}"
                 ),
             ),
             check("path-length-cap", not oversized, f"oversized={len(oversized)}"),
             check("evidence-work-cap", not excess_work, f"excess_slots={excess_work}"),
             check("irrecoverable-cost-carried", not missing_cost, f"missing={len(missing_cost)}"),
             check("irrecoverable-cost-positive", bool(positive_cost_records), f"positive={len(positive_cost_records)}"),
-            check("valid-path-metric", metric_sum(summary, "topostake_evidence_epoch_valid_paths") > 0.0, str(metric_sum(summary, "topostake_evidence_epoch_valid_paths"))),
+            check("valid-path-metric", metric_sum(summary, "trail_evidence_epoch_valid_paths") > 0.0, str(metric_sum(summary, "trail_evidence_epoch_valid_paths"))),
         ]
     )
 
@@ -330,14 +330,14 @@ def artifact_checks(summary: dict[str, Any], mode: str) -> list[Check]:
 
     checks.extend(
         [
-            check("score-positive", metric_max(summary, "topostake_epoch_score_scaled") > 0.0, str(metric_max(summary, "topostake_epoch_score_scaled"))),
-            check("proposer-score-positive", metric_max(summary, "topostake_proposer_score_scaled") > 0.0, str(metric_max(summary, "topostake_proposer_score_scaled"))),
+            check("score-positive", metric_max(summary, "trail_epoch_score_scaled") > 0.0, str(metric_max(summary, "trail_epoch_score_scaled"))),
+            check("proposer-score-positive", metric_max(summary, "trail_proposer_score_scaled") > 0.0, str(metric_max(summary, "trail_proposer_score_scaled"))),
         ]
     )
     checks.extend(activation_checks(summary, int(fixed["score_activation_delay_epochs"])))
     checks.extend(frozen_weight_checks(summary))
 
-    observed_weight = metric_max(summary, "topostake_proposer_weight_scaled")
+    observed_weight = metric_max(summary, "trail_proposer_weight_scaled")
     if mode == "fee_only":
         checks.append(
             check(
@@ -346,12 +346,12 @@ def artifact_checks(summary: dict[str, Any], mode: str) -> list[Check]:
                 f"observed={observed_weight:.0f}",
             )
         )
-    if mode in ("fee_only", "topostake"):
+    if mode in ("fee_only", "trail"):
         checks.append(
             check(
                 "fee-settlement-positive",
-                metric_max(summary, "topostake_fee_settlement_amount_wei") > 0.0,
-                str(metric_max(summary, "topostake_fee_settlement_amount_wei")),
+                metric_max(summary, "trail_fee_settlement_amount_wei") > 0.0,
+                str(metric_max(summary, "trail_fee_settlement_amount_wei")),
             )
         )
 
@@ -381,7 +381,7 @@ def print_report(payload: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, help="Devnet summary.json to validate")
-    parser.add_argument("--mode", choices=MODES, default="topostake")
+    parser.add_argument("--mode", choices=MODES, default="trail")
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     parser.add_argument("--no-static", action="store_true", help="Skip shared profile/golden checks")
     args = parser.parse_args()

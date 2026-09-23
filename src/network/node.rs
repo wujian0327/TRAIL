@@ -274,8 +274,7 @@ impl Node {
     }
 
     fn should_forward_relay_path(&mut self) -> bool {
-        self.failure_rng
-            .gen_bool(self.relay_forward_probability())
+        self.failure_rng.gen_bool(self.relay_forward_probability())
     }
 
     pub fn set_failure_seed(&mut self, seed: u64) {
@@ -442,7 +441,7 @@ impl Node {
             // 离线逻辑：如果节点离线，跳过大多数消息处理
             // 但 UpdateSlot 消息用于恢复在线逻辑，需要处理
             if (!self.is_online || !self.scheduled_online.load(Ordering::Relaxed))
-                && !matches!(msg, Message::UpdateSlot(_))
+                && !matches!(msg, Message::UpdateSlot(_) | Message::UpdateRelayProfile(_))
             {
                 debug!("Node[{}] is offline, skipping message", self.index);
                 match msg {
@@ -764,7 +763,10 @@ impl Node {
                             .await;
                     });
                 }
-                Message::GenerateTransactionPaths { to } => {
+                Message::GenerateTransactionPaths {
+                    to,
+                    self_generated_attack,
+                } => {
                     // 检查余额是否充足
                     let total_transaction_cost = 2.0 * self.transaction_fee;
                     if !self.deduct_balance(total_transaction_cost) {
@@ -784,8 +786,13 @@ impl Node {
                         ))
                         .await;
 
-                    let mut transaction =
-                        Transaction::with_fee(to, 0, self.transaction_fee, self.wallet.clone());
+                    let mut transaction = Transaction::with_fee_and_attack_marker(
+                        to,
+                        0,
+                        self.transaction_fee,
+                        self.wallet.clone(),
+                        self_generated_attack,
+                    );
                     transaction.data = logical_tx_metadata(self.epoch, self.slot);
                     let mut transaction_paths =
                         TransactionPaths::new_with_epoch(transaction, self.epoch);
@@ -823,6 +830,14 @@ impl Node {
                     if !is_cached {
                         continue;
                     }
+                    let _ = self
+                        .world_state_sender
+                        .send(Message::new_record_generated_transaction_msg(
+                            transaction_paths.transaction.hash.clone(),
+                            self.epoch,
+                            self.slot,
+                        ))
+                        .await;
                     match self.node_type {
                         NodeType::Sybil => {
                             //Sybil,伪造路径,再广播
@@ -995,6 +1010,13 @@ impl Node {
                     // WorldState 通知 Node 更新其 balance（例如获得奖励）
                     self.set_balance(new_balance);
                     debug!("Node[{}] updated balance to {}", self.index, new_balance);
+                }
+                Message::UpdateRelayProfile(relay_profile) => {
+                    self.set_relay_profile(relay_profile);
+                    debug!(
+                        "Node[{}] updated relay profile to {}",
+                        self.index, relay_profile
+                    );
                 }
                 Message::UpdateSlot(slot) => {
                     debug!("Node[{}] received msg[UpdateSlot]", self.index);
@@ -1413,7 +1435,7 @@ mod tests {
             blockchain,
             world_sender,
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
             0,
         );
         let node_sender = node.sender.clone();
@@ -1453,7 +1475,7 @@ mod tests {
             wallet0.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
         );
         let mut node1 = Node::new_with_wallet(
             1,
@@ -1463,7 +1485,7 @@ mod tests {
             wallet1.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
         );
         let mut node2 = Node::new_with_wallet(
             2,
@@ -1473,7 +1495,7 @@ mod tests {
             wallet2.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
         );
         let mut node3 = Node::new_with_wallet(
             3,
@@ -1483,7 +1505,7 @@ mod tests {
             wallet3.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
         );
 
         node0.neighbors.push(Neighbor::new(
@@ -1583,7 +1605,7 @@ mod tests {
         let (_tx, _rx) = tokio::sync::mpsc::channel::<Message>(8);
         let (world_tx, _world_rx) = tokio::sync::mpsc::channel::<Message>(8);
         let bc = Blockchain::new(Block::gen_genesis_block());
-        let mut node = Node::new(0, 0, 0, bc, world_tx, 1000, ConsensusType::TopoStake, 0);
+        let mut node = Node::new(0, 0, 0, bc, world_tx, 1000, ConsensusType::Trail, 0);
 
         assert_eq!(node.get_balance(), 0.0);
 
@@ -1607,7 +1629,7 @@ mod tests {
     fn relay_profiles_change_forwarding_probability_not_delay() {
         let (world_tx, _world_rx) = tokio::sync::mpsc::channel::<Message>(8);
         let bc = Blockchain::new(Block::gen_genesis_block());
-        let mut node = Node::new(0, 0, 0, bc, world_tx, 1000, ConsensusType::TopoStake, 0);
+        let mut node = Node::new(0, 0, 0, bc, world_tx, 1000, ConsensusType::Trail, 0);
         node.set_tx_propagation_delay(123);
 
         node.set_relay_profile(RelayProfile::Active);

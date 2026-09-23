@@ -29,7 +29,7 @@ REFERENCE_FIELDS = {
     "flooding_cost_to_influence": ("attack_tx_rate_multiplier", 0),
     "relay_participation": ("relay_profile", "lazy"),
     "relay_network_stress": ("relay_profile", "lazy"),
-    "score_floor_sensitivity": ("topostake_score_floor_kappa", 1.0),
+    "score_floor_sensitivity": ("trail_score_floor_kappa", 1.0),
 }
 PAIR_METRICS = [
     "adversary_raw_contribution_total",
@@ -65,7 +65,27 @@ RUN_METRICS = [
     "theoretical_proposer_weight_bound",
     "observed_adversary_proposer_share",
 ]
-IDENTITY_FIELDS = ["suite", "protocol_version", "experiment", "protocol_label", "protocol"]
+FINITE_SECURITY_METRICS = [
+    "max_score_bound_excess",
+    "max_cap_bound_excess",
+    "max_bound_order_excess",
+    "adversary_raw_contribution_total",
+    "adversary_relay_reward_total",
+    "adversary_credit_share",
+    "adversary_relay_reward_share",
+    "credit_ineligible_path_rate",
+    "relay_reward_per_stake",
+    "inclusion_ratio",
+    "p95_inclusion_latency_s_pooled",
+]
+IDENTITY_FIELDS = [
+    "suite",
+    "protocol_version",
+    "run_revision",
+    "experiment",
+    "protocol_label",
+    "protocol",
+]
 SCENARIO_FIELDS = IDENTITY_FIELDS + DIMENSION_KEYS
 
 
@@ -311,22 +331,13 @@ def aggregate_run(run: dict[str, Any]) -> dict[str, Any]:
     out["focal_proposer_weight_mean"] = mean_ci95(
         to_float(row.get("normalized_proposer_weight"), math.nan) for row in focal
     )[0]
-    out["finite_metrics"] = all(
-        math.isfinite(to_float(out.get(field), math.nan))
-        for field in [
-            "max_score_bound_excess",
-            "max_cap_bound_excess",
-            "max_bound_order_excess",
-            "adversary_raw_contribution_total",
-            "adversary_relay_reward_total",
-            "adversary_credit_share",
-            "adversary_relay_reward_share",
-            "credit_ineligible_path_rate",
-            "relay_reward_per_stake",
-            "inclusion_ratio",
-            "p95_inclusion_latency_s_pooled",
-        ]
-    )
+    non_finite_fields = [
+        field
+        for field in FINITE_SECURITY_METRICS
+        if not math.isfinite(to_float(out.get(field), math.nan))
+    ]
+    out["non_finite_fields"] = ",".join(non_finite_fields)
+    out["finite_metrics"] = not non_finite_fields
     return out
 
 
@@ -424,6 +435,22 @@ def fixed_padding_check(path: Path = FIXED_PADDING_REPORT) -> dict[str, Any]:
 
 def validation(rows: list[dict[str, Any]], expected_seeds: int) -> list[dict[str, Any]]:
     complete = [row for row in rows if row["complete"]]
+    non_finite_runs = [row for row in complete if not row["finite_metrics"]]
+    scale_runs = [
+        row for row in complete if row.get("experiment") == "proposer_envelope_scale"
+    ]
+    non_finite_details = "; ".join(
+        "{}[experiment={},nodes={},placement={},eta={},seed={},fields={}]".format(
+            row.get("run_id", "unknown"),
+            row.get("experiment", ""),
+            row.get("node_num", ""),
+            row.get("adversary_placement", ""),
+            row.get("eta", ""),
+            row.get("seed_value", ""),
+            row.get("non_finite_fields", "unknown"),
+        )
+        for row in non_finite_runs[:10]
+    )
     scenario_counts: dict[tuple[Any, ...], int] = defaultdict(int)
     for row in complete:
         scenario_counts[scenario_key(row)] += 1
@@ -433,7 +460,12 @@ def validation(rows: list[dict[str, Any]], expected_seeds: int) -> list[dict[str
     max_order_excess = max(
         (to_float(row["max_bound_order_excess"]) for row in complete), default=0.0
     )
-    revisions = {
+    run_revisions = {
+        str(row.get("run_revision", "")).strip()
+        for row in complete
+        if str(row.get("run_revision", "")).strip()
+    }
+    git_revisions = {
         str(row.get("git_commit_sha", "")).strip()
         for row in complete
         if str(row.get("git_commit_sha", "")).strip()
@@ -447,9 +479,16 @@ def validation(rows: list[dict[str, Any]], expected_seeds: int) -> list[dict[str
         ),
         check(
             "run-revision-consistency",
-            len(revisions) == 1 and "unknown" not in revisions,
+            len(run_revisions) == 1,
+            "semantic run revisions={}".format(
+                ",".join(sorted(run_revisions)) if run_revisions else "missing"
+            ),
+        ),
+        check(
+            "git-revision-provenance",
+            bool(git_revisions) and "unknown" not in git_revisions,
             "referenced git revisions={}".format(
-                ",".join(sorted(revisions)) if revisions else "missing"
+                ",".join(sorted(git_revisions)) if git_revisions else "missing"
             ),
         ),
         check(
@@ -533,8 +572,41 @@ def validation(rows: list[dict[str, Any]], expected_seeds: int) -> list[dict[str
         ),
         check(
             "finite-security-metrics",
-            all(row["finite_metrics"] for row in complete),
-            f"non-finite runs={sum(not row['finite_metrics'] for row in complete)}",
+            not non_finite_runs,
+            "non-finite runs={}{}".format(
+                len(non_finite_runs),
+                f": {non_finite_details}" if non_finite_details else "",
+            ),
+        ),
+        check(
+            "scale-evidence-nonvacuity",
+            all(
+                int(to_float(row.get("cohort_included_tx_total"))) > 0
+                and int(to_float(row.get("eligible_path_count"))) > 0
+                and to_float(row.get("adversary_raw_contribution_total")) > 0.0
+                for row in scale_runs
+            ),
+            "runs={}, minimum cohort={}, eligible paths={}, adversarial contribution={:.6g}".format(
+                len(scale_runs),
+                min(
+                    (
+                        int(to_float(row.get("cohort_included_tx_total")))
+                        for row in scale_runs
+                    ),
+                    default=0,
+                ),
+                min(
+                    (int(to_float(row.get("eligible_path_count"))) for row in scale_runs),
+                    default=0,
+                ),
+                min(
+                    (
+                        to_float(row.get("adversary_raw_contribution_total"))
+                        for row in scale_runs
+                    ),
+                    default=0.0,
+                ),
+            ),
         ),
     ]
 

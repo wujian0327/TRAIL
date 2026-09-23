@@ -4,8 +4,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(CDPATH= cd "$SCRIPT_DIR/.." && pwd)
 
-GETH_DIR="${GETH_DIR:-$REPO_DIR/ethereum-topostake/go-ethereum-topostake}"
-GETH_IMAGE="${GETH_IMAGE:-topostake/geth:dev}"
+GETH_DIR="${GETH_DIR:-$REPO_DIR/ethereum-trail/go-ethereum-trail}"
+GETH_IMAGE="${GETH_IMAGE:-trail/geth:dev}"
 GETH_RUNTIME_IMAGE="${GETH_RUNTIME_IMAGE:-ubuntu:24.04}"
 GETH_BINARY="${GETH_BINARY:-}"
 
@@ -19,8 +19,8 @@ Commands:
   verify         Run `geth version` inside GETH_IMAGE.
 
 Environment:
-  GETH_DIR            go-ethereum checkout/worktree path, default ./ethereum-topostake/go-ethereum-topostake.
-  GETH_IMAGE          Output image tag, default topostake/geth:dev.
+  GETH_DIR            go-ethereum checkout/worktree path, default ./ethereum-trail/go-ethereum-trail.
+  GETH_IMAGE          Output image tag, default trail/geth:dev.
   GETH_RUNTIME_IMAGE  Runtime base image, default ubuntu:24.04.
   GETH_BINARY         Local geth binary path. Defaults to $GETH_DIR/geth.
 EOF
@@ -80,7 +80,7 @@ cmd_package_local() {
     fi
 
     docker image inspect "$GETH_RUNTIME_IMAGE" >/dev/null 2>&1 || docker pull "$GETH_RUNTIME_IMAGE"
-    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/topostake-geth-image.XXXXXX")
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/trail-geth-image.XXXXXX")
     cp "$binary_path" "$tmp_dir/geth"
     printf 'FROM %s\n' "$GETH_RUNTIME_IMAGE" > "$tmp_dir/Dockerfile"
     printf 'LABEL org.opencontainers.image.revision="%s"\n' "$(commit_hash)" >> "$tmp_dir/Dockerfile"

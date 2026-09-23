@@ -4,8 +4,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(CDPATH= cd "$SCRIPT_DIR/.." && pwd)
 
-LIGHTHOUSE_DIR="${LIGHTHOUSE_DIR:-$REPO_DIR/ethereum-topostake/lighthouse}"
-LIGHTHOUSE_IMAGE="${LIGHTHOUSE_IMAGE:-topostake/lighthouse:dev}"
+LIGHTHOUSE_DIR="${LIGHTHOUSE_DIR:-$REPO_DIR/ethereum-trail/lighthouse}"
+LIGHTHOUSE_IMAGE="${LIGHTHOUSE_IMAGE:-trail/lighthouse:dev}"
 UPSTREAM_IMAGE="${UPSTREAM_IMAGE:-sigp/lighthouse:latest}"
 LIGHTHOUSE_RUNTIME_IMAGE="${LIGHTHOUSE_RUNTIME_IMAGE:-ubuntu:24.04}"
 LIGHTHOUSE_REPO="${LIGHTHOUSE_REPO:-https://github.com/sigp/lighthouse.git}"
@@ -24,8 +24,8 @@ Commands:
   verify        Run `lighthouse --version` inside LIGHTHOUSE_IMAGE.
 
 Environment:
-  LIGHTHOUSE_DIR     Lighthouse checkout path, default ./ethereum-topostake/lighthouse.
-  LIGHTHOUSE_IMAGE   Output image tag, default topostake/lighthouse:dev.
+  LIGHTHOUSE_DIR     Lighthouse checkout path, default ./ethereum-trail/lighthouse.
+  LIGHTHOUSE_IMAGE   Output image tag, default trail/lighthouse:dev.
   UPSTREAM_IMAGE     Source image for tag-upstream, default sigp/lighthouse:latest.
   LIGHTHOUSE_RUNTIME_IMAGE
                      Runtime base image for package-local, default ubuntu:24.04.
@@ -98,7 +98,7 @@ cmd_build_simple() {
         echo "run: LIGHTHOUSE_DIR=$LIGHTHOUSE_DIR scripts/lighthouse_image.sh clone" >&2
         exit 1
     fi
-    tmp_file=$(mktemp "${TMPDIR:-/tmp}/topostake-lighthouse-dockerfile.XXXXXX")
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/trail-lighthouse-dockerfile.XXXXXX")
     cat > "$tmp_file" <<'EOF'
 FROM rust:1.88.0-bullseye AS builder
 RUN apt-get update && apt-get -y upgrade && apt-get install -y cmake libclang-dev
@@ -155,7 +155,7 @@ cmd_package_local() {
     fi
 
     docker image inspect "$LIGHTHOUSE_RUNTIME_IMAGE" >/dev/null 2>&1 || docker pull "$LIGHTHOUSE_RUNTIME_IMAGE"
-    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/topostake-lighthouse-image.XXXXXX")
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/trail-lighthouse-image.XXXXXX")
     cp "$binary_path" "$tmp_dir/lighthouse"
     printf 'FROM %s\n' "$LIGHTHOUSE_RUNTIME_IMAGE" > "$tmp_dir/Dockerfile"
     printf 'LABEL org.opencontainers.image.revision="%s"\n' "$(commit_hash)" >> "$tmp_dir/Dockerfile"

@@ -19,7 +19,7 @@ from frozen_security_report import (  # noqa: E402
     paired_differences,
     validation,
 )
-from run_experiments import expand_runs, load_yaml  # noqa: E402
+from run_experiments import expand_runs, filter_runs, load_yaml  # noqa: E402
 
 
 def synthetic_run(seed: int, padding: int, contribution: float) -> dict[str, object]:
@@ -28,9 +28,10 @@ def synthetic_run(seed: int, padding: int, contribution: float) -> dict[str, obj
         {
             "suite": "test",
             "protocol_version": "frozen-v1",
+            "run_revision": "relay-focal-v2",
             "experiment": "path_padding_end_to_end",
-            "protocol_label": "topostake",
-            "protocol": "topostake",
+            "protocol_label": "trail",
+            "protocol": "trail",
             "padding_identities": padding,
             "seed_value": seed,
             "git_commit_sha": "test-commit",
@@ -61,7 +62,7 @@ class FrozenSecurityReportTests(unittest.TestCase):
     def test_security_configs_expand_to_unique_runs(self) -> None:
         expected = {
             "frozen_v1_security_pilot.yaml": 38,
-            "frozen_v1_security_main.yaml": 1340,
+            "frozen_v1_security_main.yaml": 1760,
         }
         for filename, count in expected.items():
             spec = load_yaml(ROOT / "experiments" / "configs" / filename)
@@ -69,6 +70,22 @@ class FrozenSecurityReportTests(unittest.TestCase):
             self.assertEqual(len(runs), count)
             self.assertEqual(len({run["run_id"] for run in runs}), count)
             self.assertTrue(all(run["protocol_version"] == "frozen-v1" for run in runs))
+
+    def test_scale_sweep_uses_one_calibrated_load_at_all_sizes(self) -> None:
+        spec = load_yaml(ROOT / "experiments" / "configs" / "frozen_v1_security_main.yaml")
+        runs = expand_runs(spec)
+        scale = [run for run in runs if run["experiment"] == "proposer_envelope_scale"]
+        self.assertEqual(len(scale), 180)
+        self.assertEqual({run["node_num"] for run in scale}, {100, 250, 500})
+        self.assertEqual({run["tx_rate"] for run in scale}, {5})
+        self.assertEqual({run["max_epochs"] for run in scale}, {20})
+        self.assertEqual(
+            {run["adversary_placement"] for run in scale},
+            {"random", "high-degree", "high-betweenness"},
+        )
+        node_500 = filter_runs(scale, node_nums=[500])
+        self.assertEqual(len(node_500), 60)
+        self.assertEqual({run["node_num"] for run in node_500}, {500})
 
     def test_padding_comparison_is_paired_by_seed(self) -> None:
         rows = [
@@ -92,6 +109,7 @@ class FrozenSecurityReportTests(unittest.TestCase):
         self.assertTrue(checks["run-completeness"]["passed"])
         self.assertTrue(checks["seed-coverage"]["passed"])
         self.assertTrue(checks["run-revision-consistency"]["passed"])
+        self.assertTrue(checks["git-revision-provenance"]["passed"])
         self.assertTrue(checks["score-dependent-proposer-bound"]["passed"])
         one_seed = {item["name"]: item for item in validation(rows[:1], expected_seeds=2)}
         self.assertFalse(one_seed["seed-coverage"]["passed"])
@@ -100,7 +118,46 @@ class FrozenSecurityReportTests(unittest.TestCase):
         self.assertFalse(checks["score-independent-proposer-cap"]["passed"])
         rows[1]["git_commit_sha"] = "different-commit"
         checks = {item["name"]: item for item in validation(rows, expected_seeds=2)}
+        self.assertTrue(checks["run-revision-consistency"]["passed"])
+        self.assertTrue(checks["git-revision-provenance"]["passed"])
+        rows[1]["run_revision"] = "different-semantic-revision"
+        checks = {item["name"]: item for item in validation(rows, expected_seeds=2)}
         self.assertFalse(checks["run-revision-consistency"]["passed"])
+
+    def test_non_finite_metric_diagnostic_names_run_and_field(self) -> None:
+        row = synthetic_run(0, 0, 10.0)
+        row.update(
+            {
+                "run_id": "diagnostic-run",
+                "node_num": 500,
+                "adversary_placement": "high-degree",
+                "eta": 1.0,
+                "non_finite_fields": "p95_inclusion_latency_s_pooled",
+                "finite_metrics": False,
+            }
+        )
+        checks = {item["name"]: item for item in validation([row], expected_seeds=1)}
+        diagnostic = checks["finite-security-metrics"]
+        self.assertFalse(diagnostic["passed"])
+        self.assertIn("diagnostic-run", diagnostic["detail"])
+        self.assertIn("nodes=500", diagnostic["detail"])
+        self.assertIn("p95_inclusion_latency_s_pooled", diagnostic["detail"])
+
+    def test_scale_runs_require_nonvacuous_evidence(self) -> None:
+        row = synthetic_run(0, 0, 10.0)
+        row.update(
+            {
+                "experiment": "proposer_envelope_scale",
+                "cohort_included_tx_total": 10,
+                "eligible_path_count": 8,
+                "adversary_raw_contribution_total": 1.0,
+            }
+        )
+        checks = {item["name"]: item for item in validation([row], expected_seeds=1)}
+        self.assertTrue(checks["scale-evidence-nonvacuity"]["passed"])
+        row["eligible_path_count"] = 0
+        checks = {item["name"]: item for item in validation([row], expected_seeds=1)}
+        self.assertFalse(checks["scale-evidence-nonvacuity"]["passed"])
 
     def test_focal_relayer_isolation_is_validated(self) -> None:
         row = synthetic_run(0, 0, 10.0)

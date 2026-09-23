@@ -1,14 +1,14 @@
 [package]
-name = "topostake-rs"
+name = "trail-rs"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "topostake"
+name = "trail"
 path = "src/lib.rs"
 
 [[bin]]
-name = "topostake"
+name = "trail"
 path = "src/main.rs"
 
 
