@@ -1,19 +1,17 @@
+# TRAIL paper figures
+
+```bash
+# All maintained figure groups
+python scripts/task.py trail-figures
+
+# Individual groups
+python scripts/task.py trail-security-figures
+python scripts/task.py trail-fairness-figures
+python scripts/task.py trail-participation-figures
+python scripts/task.py trail-outage-figures
+python scripts/task.py trail-devnet-figures
 ```
-# 1. Security
-python scripts/task.py frozen-security-figures
 
-# 2. Fee bonus
-python scripts/task.py frozen-fee-bonus-figures \
-  --config experiments/configs/frozen_v1_fee_bonus_main.yaml
-
-# 3. Organic capture
-python scripts/task.py frozen-organic-capture-figures \
-  --config experiments/configs/frozen_v1_organic_capture_main.yaml
-
-# 4. Sustained outage
-python scripts/task.py frozen-sustained-outage-figures \
-  --config experiments/configs/frozen_v1_sustained_outage_main.yaml
-
-# 5. Devnet
-python scripts/task.py frozen-devnet-figures
-```
+The maintained outputs are stored only in `trail_security`, `trail_fairness`,
+`trail_participation`, `trail_outage`, and `trail_devnet`. Raw and processed
+experiment artifacts remain under `results/` and are not modified by plotting.

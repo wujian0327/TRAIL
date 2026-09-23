@@ -7,6 +7,7 @@ import csv
 import json
 import math
 import os
+import sys
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/trail-matplotlib")
@@ -18,6 +19,10 @@ import matplotlib.pyplot as plt
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "experiments"))
+
+from trail_compat import canonicalize_artifact, resolve_legacy_run_dir  # noqa: E402
+
 OUTPUT_DIR = ROOT / "figures" / "trail_devnet"
 TABLE_PATH = ROOT / "results" / "processed" / "trail_devnet_txslot_seed0.csv"
 SECONDS_PER_SLOT = 3.0
@@ -27,22 +32,23 @@ RUNS = {
     ("Ethereum PoS", 128): ROOT / "results/raw/trail_devnet_high_load_pilot/baseline_ba_n8_load128_seed0",
     ("Ethereum PoS", 256): ROOT / "results/raw/trail_devnet_high_load_pilot/baseline_ba_n8_load256_seed0",
     ("Ethereum PoS", 512): ROOT / "results/raw/trail_devnet_high_load_pilot/baseline_ba_n8_load512_seed0",
-    ("Full TRAIL", 64): ROOT / "results/raw/trail_devnet_load64_128_trail_pilot/topostake_ba_n8_load64_seed0",
-    ("Full TRAIL", 128): ROOT / "results/raw/trail_devnet_load64_128_trail_pilot/topostake_ba_n8_load128_seed0",
-    ("Full TRAIL", 256): ROOT / "results/raw/trail_devnet_load256_trail_pilot/topostake_ba_n8_load256_seed0",
-    ("Full TRAIL", 512): ROOT / "results/raw/trail_devnet_load512_trail_pilot/topostake_ba_n8_load512_seed0",
+    ("Full TRAIL", 64): ROOT / "results/raw/trail_devnet_load64_128_trail_pilot/trail_ba_n8_load64_seed0",
+    ("Full TRAIL", 128): ROOT / "results/raw/trail_devnet_load64_128_trail_pilot/trail_ba_n8_load128_seed0",
+    ("Full TRAIL", 256): ROOT / "results/raw/trail_devnet_load256_trail_pilot/trail_ba_n8_load256_seed0",
+    ("Full TRAIL", 512): ROOT / "results/raw/trail_devnet_load512_trail_pilot/trail_ba_n8_load512_seed0",
 }
 
 
 def load_rows() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for (mechanism, offered), run_dir in RUNS.items():
+    for (mechanism, offered), configured_run_dir in RUNS.items():
+        run_dir = resolve_legacy_run_dir(configured_run_dir)
         with (run_dir / "runner_status.json").open(encoding="utf-8") as handle:
-            status = json.load(handle)
+            status = canonicalize_artifact(json.load(handle))
         with (run_dir / "acceptance.json").open(encoding="utf-8") as handle:
-            acceptance = json.load(handle)
+            acceptance = canonicalize_artifact(json.load(handle))
         with (run_dir / "summary.json").open(encoding="utf-8") as handle:
-            summary = json.load(handle)
+            summary = canonicalize_artifact(json.load(handle))
         if status.get("status") != "ok" or not acceptance.get("passed"):
             raise ValueError(f"invalid run: {run_dir}")
         formal = summary.get("formal_experiment", {})

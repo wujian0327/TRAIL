@@ -25,7 +25,7 @@ def base_summary() -> dict:
         "beacon_after": {"finalized_epoch": 4, "head_slot": 32},
         "peer_graph": {"matches_target": True},
         "blocks": {"records": []},
-        "geth_topostake_status": [
+        "geth_trail_status": [
             {
                 "dynamic_relay_epoch": True,
                 "relay_epoch": 4,
@@ -34,10 +34,10 @@ def base_summary() -> dict:
             }
         ],
         "prometheus": {
-            "topostake_fee_conservation_violation": [sample(0)],
-            "topostake_fee_settlement_amount_wei": [sample(1)],
-            "topostake_epoch_score_scaled": [sample(0)],
-            "topostake_evidence_epoch_invalid_paths": [sample(0)],
+            "trail_fee_conservation_violation": [sample(0)],
+            "trail_fee_settlement_amount_wei": [sample(1)],
+            "trail_epoch_score_scaled": [sample(0)],
+            "trail_evidence_epoch_invalid_paths": [sample(0)],
         },
     }
 
@@ -47,11 +47,11 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
         failures = [item for item in static_checks() if not item.passed]
         self.assertEqual(failures, [])
 
-    def test_baseline_artifact_has_no_topostake_effects(self) -> None:
+    def test_baseline_artifact_has_no_trail_effects(self) -> None:
         failures = [item for item in artifact_checks(base_summary(), "baseline") if not item.passed]
         self.assertEqual(failures, [])
 
-    def test_topostake_artifact_satisfies_frozen_envelope(self) -> None:
+    def test_trail_artifact_satisfies_frozen_envelope(self) -> None:
         summary = base_summary()
         summary["blocks"]["records"] = [
             {
@@ -64,24 +64,24 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
         ]
         summary["prometheus"].update(
             {
-                "topostake_evidence_epoch_valid_paths": [sample(1)],
-                "topostake_epoch_score_scaled": [sample(100)],
-                "topostake_proposer_score_scaled": [sample(100)],
-                "topostake_selection_score_epoch": [
+                "trail_evidence_epoch_valid_paths": [sample(1)],
+                "trail_epoch_score_scaled": [sample(100)],
+                "trail_proposer_score_scaled": [sample(100)],
+                "trail_selection_score_epoch": [
                     sample(2, slot="32", proposer_epoch="4"),
                     sample(2, slot="33", proposer_epoch="4"),
                 ],
-                "topostake_proposer_weight_scaled": [
+                "trail_proposer_weight_scaled": [
                     sample(32_000_000_000_000_000_000, slot="32", proposer_epoch="4", validator_index="0"),
                     sample(32_000_000_000_000_000_000, slot="33", proposer_epoch="4", validator_index="0"),
                 ],
-                "topostake_selected_proposer": [
+                "trail_selected_proposer": [
                     sample(1, slot="32", proposer_epoch="4", validator_index="0"),
                     sample(1, slot="33", proposer_epoch="4", validator_index="0"),
                 ],
             }
         )
-        failures = [item for item in artifact_checks(summary, "topostake") if not item.passed]
+        failures = [item for item in artifact_checks(summary, "trail") if not item.passed]
         self.assertEqual(failures, [])
 
     def test_fee_only_requires_fee_settlement_but_no_bonus(self) -> None:
@@ -97,11 +97,11 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
         ]
         summary["prometheus"].update(
             {
-                "topostake_evidence_epoch_valid_paths": [sample(1)],
-                "topostake_epoch_score_scaled": [sample(1)],
-                "topostake_proposer_score_scaled": [sample(1)],
-                "topostake_selection_score_epoch": [sample(2, proposer_epoch="4")],
-                "topostake_proposer_weight_scaled": [
+                "trail_evidence_epoch_valid_paths": [sample(1)],
+                "trail_epoch_score_scaled": [sample(1)],
+                "trail_proposer_score_scaled": [sample(1)],
+                "trail_selection_score_epoch": [sample(2, proposer_epoch="4")],
+                "trail_proposer_weight_scaled": [
                     sample(
                         32_000_000_000_000_000_000,
                         instance="cl-1",
@@ -110,7 +110,7 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
                         validator_index="0",
                     )
                 ],
-                "topostake_selected_proposer": [
+                "trail_selected_proposer": [
                     sample(1, slot="32", proposer_epoch="4", validator_index="0")
                 ],
             }
@@ -118,7 +118,7 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
         failures = [item for item in artifact_checks(summary, "fee_only") if not item.passed]
         self.assertEqual(failures, [])
 
-        summary["prometheus"]["topostake_fee_settlement_amount_wei"] = [sample(0)]
+        summary["prometheus"]["trail_fee_settlement_amount_wei"] = [sample(0)]
         by_name = {item.name: item for item in artifact_checks(summary, "fee_only")}
         self.assertFalse(by_name["fee-settlement-positive"].passed)
 
@@ -133,13 +133,13 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
                 "irrecoverable_cost_wei": 1,
             }
         ]
-        summary["prometheus"]["topostake_evidence_epoch_valid_paths"] = [sample(1)]
-        summary["prometheus"]["topostake_evidence_epoch_invalid_paths"] = [sample(1)]
+        summary["prometheus"]["trail_evidence_epoch_valid_paths"] = [sample(1)]
+        summary["prometheus"]["trail_evidence_epoch_invalid_paths"] = [sample(1)]
         by_name = {item.name: item for item in artifact_checks(summary, "pathobs")}
         self.assertTrue(by_name["evidence-epoch-not-future"].passed)
         self.assertTrue(by_name["stale-evidence-no-credit"].passed)
 
-        summary["prometheus"]["topostake_evidence_epoch_invalid_paths"] = [sample(0)]
+        summary["prometheus"]["trail_evidence_epoch_invalid_paths"] = [sample(0)]
         by_name = {item.name: item for item in artifact_checks(summary, "pathobs")}
         self.assertFalse(by_name["stale-evidence-no-credit"].passed)
 
@@ -154,7 +154,7 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
                 "irrecoverable_cost_wei": 1,
             }
         ]
-        summary["prometheus"]["topostake_evidence_epoch_valid_paths"] = [sample(1)]
+        summary["prometheus"]["trail_evidence_epoch_valid_paths"] = [sample(1)]
         by_name = {item.name: item for item in artifact_checks(summary, "pathobs")}
         self.assertFalse(by_name["evidence-epoch-not-future"].passed)
 
@@ -168,7 +168,7 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
             "data": {
                 "message": {
                     "body": {
-                        "topostake_evidence_records": [
+                        "trail_evidence_records": [
                             {
                                 "tx_hash": "0xabc",
                                 "epoch": 4,
@@ -213,21 +213,21 @@ class FrozenDevnetAcceptanceTests(unittest.TestCase):
         ]
         summary["prometheus"].update(
             {
-                "topostake_evidence_epoch_valid_paths": [sample(1)],
-                "topostake_epoch_score_scaled": [sample(1)],
-                "topostake_proposer_score_scaled": [sample(1)],
-                "topostake_selection_score_epoch": [sample(2, proposer_epoch="4")],
-                "topostake_proposer_weight_scaled": [
+                "trail_evidence_epoch_valid_paths": [sample(1)],
+                "trail_epoch_score_scaled": [sample(1)],
+                "trail_proposer_score_scaled": [sample(1)],
+                "trail_selection_score_epoch": [sample(2, proposer_epoch="4")],
+                "trail_proposer_weight_scaled": [
                     sample(32_000_000_000_000_000_000, instance="cl-1", slot="32", proposer_epoch="4", validator_index="0"),
                     sample(32_000_000_000_000_000_000, instance="cl-2", slot="32", proposer_epoch="4", validator_index="0"),
                 ],
-                "topostake_selected_proposer": [
+                "trail_selected_proposer": [
                     sample(1, instance="cl-1", slot="32", proposer_epoch="4", validator_index="0"),
                     sample(1, instance="cl-2", slot="32", proposer_epoch="4", validator_index="1"),
                 ],
             }
         )
-        by_name = {item.name: item for item in artifact_checks(summary, "topostake")}
+        by_name = {item.name: item for item in artifact_checks(summary, "trail")}
         self.assertFalse(by_name["cross-node-proposer-consistency"].passed)
 
 

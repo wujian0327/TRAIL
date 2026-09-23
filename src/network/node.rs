@@ -1435,7 +1435,7 @@ mod tests {
             blockchain,
             world_sender,
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
             0,
         );
         let node_sender = node.sender.clone();
@@ -1475,7 +1475,7 @@ mod tests {
             wallet0.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
         );
         let mut node1 = Node::new_with_wallet(
             1,
@@ -1485,7 +1485,7 @@ mod tests {
             wallet1.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
         );
         let mut node2 = Node::new_with_wallet(
             2,
@@ -1495,7 +1495,7 @@ mod tests {
             wallet2.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
         );
         let mut node3 = Node::new_with_wallet(
             3,
@@ -1505,7 +1505,7 @@ mod tests {
             wallet3.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
         );
 
         node0.neighbors.push(Neighbor::new(
@@ -1605,7 +1605,7 @@ mod tests {
         let (_tx, _rx) = tokio::sync::mpsc::channel::<Message>(8);
         let (world_tx, _world_rx) = tokio::sync::mpsc::channel::<Message>(8);
         let bc = Blockchain::new(Block::gen_genesis_block());
-        let mut node = Node::new(0, 0, 0, bc, world_tx, 1000, ConsensusType::TopoStake, 0);
+        let mut node = Node::new(0, 0, 0, bc, world_tx, 1000, ConsensusType::Trail, 0);
 
         assert_eq!(node.get_balance(), 0.0);
 
@@ -1629,7 +1629,7 @@ mod tests {
     fn relay_profiles_change_forwarding_probability_not_delay() {
         let (world_tx, _world_rx) = tokio::sync::mpsc::channel::<Message>(8);
         let bc = Blockchain::new(Block::gen_genesis_block());
-        let mut node = Node::new(0, 0, 0, bc, world_tx, 1000, ConsensusType::TopoStake, 0);
+        let mut node = Node::new(0, 0, 0, bc, world_tx, 1000, ConsensusType::Trail, 0);
         node.set_tx_propagation_delay(123);
 
         node.set_relay_profile(RelayProfile::Active);

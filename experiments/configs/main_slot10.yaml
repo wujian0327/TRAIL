@@ -5,7 +5,7 @@
     "build",
     "--release"
   ],
-  "binary": "target/release/topostake",
+  "binary": "target/release/trail",
   "max_parallel": 1,
   "timeout_seconds": 7200,
   "seeds": [
@@ -29,9 +29,9 @@
     "warmup_epochs": 10,
     "max_tx_per_block": 250,
     "time_scale": 0.05,
-    "topostake_initial_depth": 4,
+    "trail_initial_depth": 4,
     "beta": 0.2,
-    "topostake_saturation_k": 1.0,
+    "trail_saturation_k": 1.0,
     "eta": 0.5,
     "bonus_cap": 1.0,
     "proposer_fee_ratio": 0.7,
@@ -42,7 +42,7 @@
       "name": "performance_load",
       "protocols": [
         "pos",
-        "topostake"
+        "trail"
       ],
       "node_num": [
         100
@@ -62,7 +62,7 @@
       "name": "performance_scale",
       "protocols": [
         "pos",
-        "topostake"
+        "trail"
       ],
       "node_num": [
         50,
@@ -80,7 +80,7 @@
       "name": "topology_robustness",
       "protocols": [
         "pos",
-        "topostake"
+        "trail"
       ],
       "node_num": [
         100
@@ -98,8 +98,8 @@
       "name": "reward_fairness",
       "protocols": [
         "pos",
-        "topostake_eta0",
-        "topostake"
+        "trail_eta0",
+        "trail"
       ],
       "stake_gini": [
         0.2,
@@ -115,7 +115,7 @@
     {
       "name": "real_stake_bound",
       "protocols": [
-        "topostake"
+        "trail"
       ],
       "adversary_stake_fraction": [
         0.05,
@@ -135,7 +135,7 @@
     {
       "name": "path_padding",
       "protocols": [
-        "topostake"
+        "trail"
       ],
       "padding_identities": [
         0,
@@ -145,7 +145,7 @@
         8,
         16
       ],
-      "topostake_initial_depth": [
+      "trail_initial_depth": [
         2,
         4,
         8
@@ -161,7 +161,7 @@
     {
       "name": "transaction_flooding",
       "protocols": [
-        "topostake"
+        "trail"
       ],
       "attack_tx_rate_multiplier": [
         0,
@@ -178,7 +178,7 @@
     {
       "name": "churn_appendix",
       "protocols": [
-        "topostake"
+        "trail"
       ],
       "unstable_fraction": [
         0,

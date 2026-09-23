@@ -16,6 +16,7 @@ import json
 import math
 import os
 import statistics
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -30,6 +31,10 @@ from scipy.stats import t as student_t
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "experiments"))
+
+from trail_compat import canonicalize_artifact  # noqa: E402
+
 RAW_ROOT = (
     ROOT
     / "results"
@@ -129,7 +134,7 @@ REQUIRED_FILES = (
 
 def read_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+        return canonicalize_artifact(json.load(handle))
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -177,7 +182,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None
 
 
 def protocol_for_eta(eta: float) -> str:
-    return {0.0: "topostake_eta0", 0.5: "topostake", 1.0: "topostake_eta1"}[eta]
+    return {0.0: "trail_eta0", 0.5: "trail", 1.0: "trail_eta1"}[eta]
 
 
 def canonical_graph_hash(path: Path) -> str:
@@ -190,7 +195,7 @@ def canonical_config(config: dict[str, Any]) -> dict[str, Any]:
     result["reward_reinvestment_rate"] = result.get("reward_reinvestment_rate", 0.0)
     result.pop("run_id", None)
     result.pop("output_dir", None)
-    result["topostake_config"].pop("eta", None)
+    result["trail_config"].pop("eta", None)
     return result
 
 

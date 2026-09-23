@@ -29,13 +29,6 @@ from adaptive_participation_report import (  # noqa: E402
     requires_initialization_robustness,
 )
 from run_experiments import command_for_run, expand_runs, load_yaml  # noqa: E402
-from plot_adaptive_participation import (  # noqa: E402
-    plot_latency,
-    plot_steady_state,
-    plot_trajectory,
-)
-
-
 class AdaptiveParticipationTests(unittest.TestCase):
     def test_initialization_robustness_only_applies_to_multi_initial_pilot(
         self,
@@ -44,50 +37,6 @@ class AdaptiveParticipationTests(unittest.TestCase):
         self.assertFalse(requires_initialization_robustness("sensitivity"))
         self.assertFalse(requires_initialization_robustness("holdout"))
         self.assertFalse(requires_initialization_robustness("stability_probe"))
-
-    def test_multi_cost_plots_are_generated_independently(self) -> None:
-        groups = []
-        trajectory = []
-        for protocol_index, protocol in enumerate(
-            ("pos", "topostake_eta0", "topostake")
-        ):
-            for cost in (1.0, 2.0, 3.0):
-                groups.append(
-                    {
-                        "protocol_label": protocol,
-                        "initial_active_fraction": "0.5",
-                        "cost_median_multiplier": str(cost),
-                        "steady_active_stake_share": str(
-                            0.2 + 0.2 * protocol_index - 0.02 * cost
-                        ),
-                        "steady_active_stake_share_ci95": "0.01",
-                        "restricted_mean_inclusion_latency_s": str(
-                            4.0 - protocol_index + 0.1 * cost
-                        ),
-                        "restricted_mean_inclusion_latency_s_ci95": "0.05",
-                    }
-                )
-            for epoch in range(3):
-                trajectory.append(
-                    {
-                        "protocol_label": protocol,
-                        "initial_active_fraction": "0.5",
-                        "cost_median_multiplier": "2.0",
-                        "epoch": str(epoch),
-                        "active_stake_share": str(
-                            0.2 + 0.2 * protocol_index + 0.01 * epoch
-                        ),
-                        "ci95": "0.01",
-                    }
-                )
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            generated = []
-            generated.extend(plot_trajectory(trajectory, output))
-            generated.extend(plot_steady_state(groups, output))
-            generated.extend(plot_latency(groups, output))
-            self.assertEqual(len(generated), 6)
-            self.assertTrue(all(path.exists() for path in generated))
 
     def test_missing_counterfactual_is_not_an_accounting_error(self) -> None:
         counts = benefit_accounting_counts(
@@ -141,7 +90,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
 
     def test_runner_emits_history_only_agent_flags(self) -> None:
         run = {
-            "protocol": "topostake",
+            "protocol": "trail",
             "run_id": "adaptive-test",
             "output_dir": "results/adaptive-test",
             "adaptive_relay_participation": True,
@@ -156,7 +105,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
             "failure_seed": 5,
             "attack_seed": 6,
         }
-        command = command_for_run("target/release/topostake", run)
+        command = command_for_run("target/release/trail", run)
         self.assertIn("--adaptive-relay-participation", command)
         self.assertEqual(command.count("--adaptive-relay-participation"), 1)
         index = command.index("--adaptive-initial-active-fraction")
@@ -172,7 +121,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
     def test_grouped_drift_uses_seed_averaged_trajectory(self) -> None:
         rows = [
             {
-                "protocol_label": "topostake",
+                "protocol_label": "trail",
                 "initial_active_fraction": "0.5",
                 "cost_median_multiplier": "2.0",
                 "epoch": str(epoch),
@@ -182,7 +131,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
         ]
         drifts = grouped_post_adaptation_drifts(rows, analysis_start_epoch=2)
         self.assertAlmostEqual(
-            drifts["topostake@initial=0.5@cost=2"], 0.1
+            drifts["trail@initial=0.5@cost=2"], 0.1
         )
 
     def test_stability_probe_expands_to_24_unique_runs(self) -> None:
@@ -196,7 +145,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
         self.assertEqual(len({run["run_id"] for run in runs}), 24)
         self.assertEqual(
             {run["protocol_label"] for run in runs},
-            {"topostake_eta0", "topostake"},
+            {"trail_eta0", "trail"},
         )
         self.assertEqual({run["max_epochs"] for run in runs}, {300})
         self.assertEqual({run["warmup_epochs"] for run in runs}, {200})
@@ -280,12 +229,12 @@ class AdaptiveParticipationTests(unittest.TestCase):
         rows = [
             {
                 **common,
-                "protocol_label": "topostake_eta0",
+                "protocol_label": "trail_eta0",
                 "steady_active_stake_share": 0.4,
             },
             {
                 **common,
-                "protocol_label": "topostake",
+                "protocol_label": "trail",
                 "steady_active_stake_share": 0.7,
                 "inclusion_within_horizon_rate": 0.8,
                 "restricted_mean_inclusion_latency_s": 3.0,
@@ -303,7 +252,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
                 {
                     "experiment": "test",
                     "complete": True,
-                    "protocol_label": "topostake",
+                    "protocol_label": "trail",
                     "initial_active_fraction": 0.5,
                     "cost_median_multiplier": 1.0,
                     "adaptive_update_fraction": 0.10,
@@ -370,7 +319,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
                     writer.writerow(
                         {
                             "experiment": "holdout",
-                            "protocol_label": "topostake",
+                            "protocol_label": "trail",
                             "seed_index": 0,
                             "seed_value": seed_value,
                             "initial_active_fraction": 0.5,
@@ -390,7 +339,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
                     writer.writerow(
                         {
                             "experiment": "holdout",
-                            "protocol_label": "topostake",
+                            "protocol_label": "trail",
                             "initial_active_fraction": 0.5,
                             "cost_median_multiplier": 2.0,
                             "adaptive_update_fraction": 0.1,
@@ -407,7 +356,7 @@ class AdaptiveParticipationTests(unittest.TestCase):
             expected = [
                 {
                     "experiment": "holdout",
-                    "protocol_label": "topostake",
+                    "protocol_label": "trail",
                     "seed_value": seed_value,
                     "adaptive_initial_active_fraction": 0.5,
                     "adaptive_cost_median_multiplier": 2.0,

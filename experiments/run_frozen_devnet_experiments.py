@@ -34,7 +34,7 @@ from run_frozen_devnet_smoke import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PACKAGE = Path("/tmp/ethereum-package")
-VARIANTS = ("baseline", "pathobs", "fee_only", "bonus_only", "topostake")
+VARIANTS = ("baseline", "pathobs", "fee_only", "bonus_only", "trail")
 
 
 @dataclass(frozen=True)
@@ -133,7 +133,7 @@ def generate_args(spec: RunSpec, public_registry: Path, private_registry: Path, 
     run(
         [
             sys.executable,
-            "scripts/topostake_devnet_args.py",
+            "scripts/trail_devnet_args.py",
             "--mode",
             spec.variant,
             "--count",
@@ -200,7 +200,7 @@ def preflight_geth(spec: RunSpec) -> list[dict[str, Any]]:
             last_error = str(exc)
             if "-32601" in last_error or "does not exist" in last_error:
                 raise RuntimeError(
-                    "Geth frozen-v1 preflight failed; rebuild topostake/geth:dev: "
+                    "Geth frozen-v1 preflight failed; rebuild trail/geth:dev: "
                     + last_error
                 ) from exc
             time.sleep(1.0)
@@ -297,7 +297,7 @@ def run_workload(spec: RunSpec, output_root: Path) -> None:
     run(
         [
             sys.executable,
-            "experiments/topostake_devnet_runner.py",
+            "experiments/trail_devnet_runner.py",
             "run",
             "--enclave",
             spec.enclave,
@@ -417,13 +417,13 @@ def collect_formal_prometheus(summary: dict[str, Any]) -> dict[str, Any]:
     if not endpoint:
         return {"error": "missing Prometheus endpoint"}
     queries = {
-        "evidence_verify_seconds_sum": "topostake_inline_evidence_verify_seconds_sum",
-        "evidence_verify_count": "topostake_inline_evidence_verify_seconds_count",
+        "evidence_verify_seconds_sum": "trail_inline_evidence_verify_seconds_sum",
+        "evidence_verify_count": "trail_inline_evidence_verify_seconds_count",
         "evidence_verify_p95_seconds": (
             "histogram_quantile(0.95, sum by (le) "
-            "(topostake_inline_evidence_verify_seconds_bucket))"
+            "(trail_inline_evidence_verify_seconds_bucket))"
         ),
-        "gossip_block_verify_delay_ms_sum": "sum(topostake_gossip_block_verification_delay_milliseconds)",
+        "gossip_block_verify_delay_ms_sum": "sum(trail_gossip_block_verification_delay_milliseconds)",
     }
     result: dict[str, Any] = {"endpoint": endpoint, "queries": queries}
     for name, query in queries.items():
@@ -549,21 +549,21 @@ def summarize_resources(path: Path) -> dict[str, Any]:
         for container in record.get("docker", []):
             observed_containers.add(
                 str(
-                    container.get("TopoStakeService")
+                    container.get("TrailService")
                     or container.get("Name")
                     or container.get("ID")
                     or "unknown"
                 )
             )
-            kind = str(container.get("TopoStakeKind", "")) or client_kind(
-                str(container.get("TopoStakeService", ""))
+            kind = str(container.get("TrailKind", "")) or client_kind(
+                str(container.get("TrailService", ""))
             )
             if kind not in ("el", "cl"):
                 kind = client_kind(str(container.get("Name", "")))
             if kind is None:
                 continue
             service_name = str(
-                container.get("TopoStakeService") or container.get("Name", "")
+                container.get("TrailService") or container.get("Name", "")
             )
             node_index = client_node_index(service_name)
             clients += 1

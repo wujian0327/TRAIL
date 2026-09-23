@@ -5,7 +5,7 @@ use crate::blockchain::{BlockChainError, Blockchain};
 use crate::consensus::minotaur::MinotaurConsensus;
 use crate::consensus::pos::PosConsensus;
 use crate::consensus::pow::PowConsensus;
-use crate::consensus::topostake::{TopoStakeConfig, TopoStakeConsensus};
+use crate::consensus::trail::{TrailConfig, TrailConsensus};
 use crate::consensus::{Consensus, ConsensusMetricsSnapshot, ConsensusType, RandaoSeed, Validator};
 use crate::metrics::{
     self, calculate_hhi, calculate_stake_concentration, AttackOnlyMetrics, EpochMetrics,
@@ -308,7 +308,7 @@ impl WorldState {
         slot_per_epoch: u64,
         pow_difficulty: usize,
         pow_max_threads: usize,
-        topostake_config: TopoStakeConfig,
+        trail_config: TrailConfig,
         base_reward: f64,
         reward_reinvestment_rate: f64,
         node_num: u32,
@@ -336,9 +336,9 @@ impl WorldState {
         };
         let consensus_name = consensus_type.to_string();
         let consensus: Box<dyn Consensus> = match consensus_type {
-            ConsensusType::TopoStake => Box::new(
-                TopoStakeConsensus::new(base_reward, topostake_config.clone())
-                    .expect("invalid TopoStake config"),
+            ConsensusType::Trail => Box::new(
+                TrailConsensus::new(base_reward, trail_config.clone())
+                    .expect("invalid TRAIL config"),
             ),
             ConsensusType::POS => Box::new(PosConsensus::new(base_reward)),
             ConsensusType::POW => Box::new(PowConsensus::new(
@@ -354,16 +354,16 @@ impl WorldState {
         // Initialize metrics files - delete old file and create new one
         let _ = std::fs::create_dir_all(&output_dir);
         let metrics_filename = match consensus_type {
-            ConsensusType::TopoStake => format!(
+            ConsensusType::Trail => format!(
                 "slot_metrics_{}_n_{}_t_{}_{}_D_{}_beta_{}_eta_{}_cap_{}.csv",
                 consensus_name,
                 node_num,
                 trans_num,
                 topology,
-                topostake_config.target_depth,
-                topostake_config.beta,
-                topostake_config.eta,
-                topostake_config.bonus_cap
+                trail_config.target_depth,
+                trail_config.beta,
+                trail_config.eta,
+                trail_config.bonus_cap
             ),
             _ => format!(
                 "slot_metrics_{}_n_{}_t_{}_{}.csv",
@@ -806,7 +806,7 @@ impl WorldState {
 
         let duty_snapshot = self.consensus.metrics_snapshot();
         let proposer_weight = if duty_snapshot.normalized_proposer_weights.is_empty() {
-            TopoStakeConsensus::normalized_stake(&validators)
+            TrailConsensus::normalized_stake(&validators)
                 .get(&miner_validator.address)
                 .copied()
                 .unwrap_or(0.0)
@@ -1182,7 +1182,7 @@ impl WorldState {
         let stake_values: Vec<f64> = validators.iter().map(|v| v.stake).collect();
         let stake_gini = calculate_gini(&stake_values);
         let stake_hhi = calculate_hhi(&stake_values);
-        let normalized_stake = TopoStakeConsensus::normalized_stake(validators);
+        let normalized_stake = TrailConsensus::normalized_stake(validators);
         let proposer_weights = if snapshot.normalized_proposer_weights.is_empty() {
             normalized_stake.clone()
         } else {
@@ -1222,12 +1222,12 @@ impl WorldState {
                 audit.adversary_real_stake_share_sum += adversary_real_stake_share;
             }
         }
-        let eta = snapshot.topostake_eta.unwrap_or(0.0);
-        let bonus_cap = snapshot.topostake_bonus_cap.unwrap_or(0.0);
-        let zeta = snapshot.topostake_bonus_zeta.unwrap_or(1.0);
+        let eta = snapshot.trail_eta.unwrap_or(0.0);
+        let bonus_cap = snapshot.trail_bonus_cap.unwrap_or(0.0);
+        let zeta = snapshot.trail_bonus_zeta.unwrap_or(1.0);
         let a = adversary_real_stake_share;
         let coalition_bonus = if a > 0.0 {
-            TopoStakeConsensus::propagation_bonus(adversary_damped_score_mass / a, bonus_cap, zeta)
+            TrailConsensus::propagation_bonus(adversary_damped_score_mass / a, bonus_cap, zeta)
         } else {
             0.0
         };
@@ -1291,11 +1291,11 @@ impl WorldState {
             invalid_path_count,
             conflicting_receipt_count: conflict_count,
             active_score_epoch: snapshot
-                .topostake_active_score_epoch
+                .trail_active_score_epoch
                 .map(|value| value as i64)
                 .unwrap_or(-1),
             latest_score_epoch: snapshot
-                .topostake_latest_score_epoch
+                .trail_latest_score_epoch
                 .map(|value| value as i64)
                 .unwrap_or(-1),
             total_proposer_reward: reward_report.total_proposer_reward,
@@ -1358,10 +1358,10 @@ impl WorldState {
                 .get(&validator.address)
                 .copied()
                 .unwrap_or(0.0);
-            let saturated = TopoStakeConsensus::saturated_contribution(
+            let saturated = TrailConsensus::saturated_contribution(
                 raw,
                 s_hat,
-                snapshot.topostake_saturation_k.unwrap_or(1.0),
+                snapshot.trail_saturation_k.unwrap_or(1.0),
             );
             let proposer_reward = reward_report
                 .proposer_by_address
@@ -1895,7 +1895,7 @@ impl WorldState {
     ) -> HashMap<String, f64> {
         let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
         let mut raw = HashMap::new();
-        let depth = snapshot.topostake_depth.unwrap_or(1);
+        let depth = snapshot.trail_depth.unwrap_or(1);
         for block in blocks {
             for (idx, tx) in block.body.transactions.iter().enumerate() {
                 let Some(path) = block.body.paths.get(idx) else {
@@ -1913,10 +1913,10 @@ impl WorldState {
                     let relayer = &full_path[position];
                     if validator_set.contains(relayer.as_str()) {
                         let gamma =
-                            TopoStakeConsensus::gamma_for_depth(depth, position, path_length);
-                        let q = TopoStakeConsensus::transaction_credit_weight(
+                            TrailConsensus::gamma_for_depth(depth, position, path_length);
+                        let q = TrailConsensus::transaction_credit_weight(
                             tx.irrecoverable_cost,
-                            snapshot.topostake_score_cost_reference.unwrap_or(1.0),
+                            snapshot.trail_score_cost_reference.unwrap_or(1.0),
                         );
                         *raw.entry(relayer.clone()).or_insert(0.0) += q * gamma;
                     }
@@ -1933,9 +1933,9 @@ impl WorldState {
         snapshot: &ConsensusMetricsSnapshot,
     ) -> AttackOnlyMetrics {
         let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
-        let theta = snapshot.topostake_proposer_fee_ratio.unwrap_or(1.0);
-        let depth = snapshot.topostake_depth.unwrap_or(1);
-        let cost_reference = snapshot.topostake_score_cost_reference.unwrap_or(1.0);
+        let theta = snapshot.trail_proposer_fee_ratio.unwrap_or(1.0);
+        let depth = snapshot.trail_depth.unwrap_or(1);
+        let cost_reference = snapshot.trail_score_cost_reference.unwrap_or(1.0);
         let mut report = AttackOnlyMetrics::default();
 
         for block in blocks {
@@ -1960,7 +1960,7 @@ impl WorldState {
                 }
                 report.attack_certified_path_cost += tx.irrecoverable_cost;
                 let relay_budget = (1.0 - theta) * tx.fee;
-                let cost_weight = TopoStakeConsensus::transaction_credit_weight(
+                let cost_weight = TrailConsensus::transaction_credit_weight(
                     tx.irrecoverable_cost,
                     cost_reference,
                 );
@@ -1971,7 +1971,7 @@ impl WorldState {
                     {
                         continue;
                     }
-                    let gamma = TopoStakeConsensus::gamma_for_depth(depth, position, path_length);
+                    let gamma = TrailConsensus::gamma_for_depth(depth, position, path_length);
                     report.attack_relay_fee_recovery += relay_budget * gamma;
                     report.attack_coalition_raw_contribution += cost_weight * gamma;
                 }
@@ -1988,11 +1988,11 @@ impl WorldState {
     ) -> EpochRewardReport {
         let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
         let mut report = EpochRewardReport::default();
-        let theta = snapshot.topostake_proposer_fee_ratio.unwrap_or(1.0);
-        let depth = snapshot.topostake_depth.unwrap_or(1);
+        let theta = snapshot.trail_proposer_fee_ratio.unwrap_or(1.0);
+        let depth = snapshot.trail_depth.unwrap_or(1);
         for block in blocks {
             let total_fee: f64 = block.body.transactions.iter().map(|tx| tx.fee).sum();
-            let proposer_reward = if snapshot.topostake_depth.is_some() {
+            let proposer_reward = if snapshot.trail_depth.is_some() {
                 self.base_reward + theta * total_fee
             } else {
                 self.base_reward + total_fee
@@ -2003,7 +2003,7 @@ impl WorldState {
                 .or_insert(0.0) += proposer_reward;
             report.total_proposer_reward += proposer_reward;
 
-            if snapshot.topostake_depth.is_none() {
+            if snapshot.trail_depth.is_none() {
                 continue;
             }
             for (idx, tx) in block.body.transactions.iter().enumerate() {
@@ -2029,7 +2029,7 @@ impl WorldState {
                         continue;
                     }
                     let amount = relay_budget
-                        * TopoStakeConsensus::gamma_for_depth(depth, position, path_length);
+                        * TrailConsensus::gamma_for_depth(depth, position, path_length);
                     if amount > 0.0 {
                         paid += amount;
                         *report
@@ -2055,12 +2055,12 @@ impl WorldState {
         snapshot: &ConsensusMetricsSnapshot,
     ) -> OrganicCaptureReport {
         let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
-        let theta = snapshot.topostake_proposer_fee_ratio.unwrap_or(1.0);
-        let depth = snapshot.topostake_depth.unwrap_or(1);
-        let cost_reference = snapshot.topostake_score_cost_reference.unwrap_or(1.0);
+        let theta = snapshot.trail_proposer_fee_ratio.unwrap_or(1.0);
+        let depth = snapshot.trail_depth.unwrap_or(1);
+        let cost_reference = snapshot.trail_score_cost_reference.unwrap_or(1.0);
         let mut report = OrganicCaptureReport::default();
 
-        if snapshot.topostake_depth.is_none() {
+        if snapshot.trail_depth.is_none() {
             return report;
         }
 
@@ -2083,7 +2083,7 @@ impl WorldState {
                 }
                 report.valid_path_count += 1;
                 let relay_budget = (1.0 - theta) * tx.fee;
-                let q = TopoStakeConsensus::transaction_credit_weight(
+                let q = TrailConsensus::transaction_credit_weight(
                     tx.irrecoverable_cost,
                     cost_reference,
                 );
@@ -2092,7 +2092,7 @@ impl WorldState {
                     if !validator_set.contains(relayer.as_str()) {
                         continue;
                     }
-                    let gamma = TopoStakeConsensus::gamma_for_depth(depth, position, path_length);
+                    let gamma = TrailConsensus::gamma_for_depth(depth, position, path_length);
                     let reward = relay_budget * gamma;
                     let contribution = q * gamma;
                     report.relay_reward += reward;
@@ -2630,14 +2630,14 @@ mod tests {
             miner.clone(),
         )
         .unwrap();
-        let config = TopoStakeConfig {
+        let config = TrailConfig {
             proposer_fee_ratio: 0.5,
             score_cost_reference: 1.0,
-            ..TopoStakeConfig::default()
+            ..TrailConfig::default()
         };
         let (mut world, _sender, _receiver) = WorldState::new(
             Block::gen_genesis_block(),
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
             Blockchain::new(Block::gen_genesis_block()),
             1,
             5,
@@ -2651,7 +2651,7 @@ mod tests {
             "ba".to_string(),
             1,
             10,
-            PathBuf::from("/tmp/topostake-organic-capture-test"),
+            PathBuf::from("/tmp/trail-organic-capture-test"),
             "organic-capture-test".to_string(),
             1,
             false,
@@ -2698,7 +2698,7 @@ mod tests {
             5,
             20,
             8,
-            TopoStakeConfig::default(),
+            TrailConfig::default(),
             0.0, // base_reward
             0.0, // reward_reinvestment_rate
             20,
@@ -2738,7 +2738,7 @@ mod tests {
             5,
             20,
             8,
-            TopoStakeConfig::default(),
+            TrailConfig::default(),
             0.0, // base_reward
             0.0, // reward_reinvestment_rate
             20,
@@ -2766,7 +2766,7 @@ mod tests {
             blockchain.clone(),
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
             0,
         );
         let mut node1 = Node::new(
@@ -2776,7 +2776,7 @@ mod tests {
             blockchain,
             world_sender.clone(),
             1000,
-            ConsensusType::TopoStake,
+            ConsensusType::Trail,
             0,
         );
         let node0_sender = node0.sender.clone();

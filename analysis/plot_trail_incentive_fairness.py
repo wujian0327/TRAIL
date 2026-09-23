@@ -16,6 +16,7 @@ import json
 import math
 import os
 import statistics
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -31,6 +32,10 @@ from scipy.stats import t as student_t
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "experiments"))
+
+from trail_compat import canonicalize_artifact  # noqa: E402
+
 ORGANIC_ROOT = (
     ROOT
     / "results"
@@ -54,7 +59,7 @@ EXPECTED_ORGANIC_COMMIT = "479986d382c43a82e2108732bc47a094f0b51124"
 EXPECTED_REINVESTMENT_COMMIT = "d890a7ba2593b233181e8c4d64cea4777b1ec04e"
 EXPECTED_STAKES = (0.1, 0.2, 0.3)
 EXPECTED_PLACEMENTS = ("random", "high-degree")
-EXPECTED_PROTOCOLS = ("pos", "topostake_eta0", "topostake")
+EXPECTED_PROTOCOLS = ("pos", "trail_eta0", "trail")
 EXPECTED_SEEDS = tuple(range(20))
 TOLERANCE = 2e-6
 
@@ -74,13 +79,13 @@ PLACEMENT_STYLE = {
 }
 PROTOCOL_STYLE = {
     "pos": {"label": "PoS", "color": GRAY, "marker": "^", "linestyle": ":"},
-    "topostake_eta0": {
+    "trail_eta0": {
         "label": "Fee-only TRAIL",
         "color": BLUE,
         "marker": "s",
         "linestyle": "--",
     },
-    "topostake": {
+    "trail": {
         "label": "Full TRAIL",
         "color": ORANGE,
         "marker": "o",
@@ -91,7 +96,7 @@ PROTOCOL_STYLE = {
 
 def read_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+        return canonicalize_artifact(json.load(handle))
 
 
 def truthy(value: Any) -> bool:
@@ -685,7 +690,7 @@ def render_figures(
             linestyle=style["linestyle"],
             marker=style["marker"],
             markevery=100,
-            markerfacecolor="white" if protocol != "topostake" else style["color"],
+            markerfacecolor="white" if protocol != "trail" else style["color"],
             markeredgewidth=0.8,
             linewidth=1.2,
             markersize=3.5,

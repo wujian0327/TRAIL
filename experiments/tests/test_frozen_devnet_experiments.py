@@ -42,7 +42,7 @@ def args(**overrides: str | None) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
-def spec(variant: str = "topostake") -> RunSpec:
+def spec(variant: str = "trail") -> RunSpec:
     return RunSpec(
         suite="test",
         variant=variant,
@@ -174,7 +174,7 @@ UUID: 72e82fd99b0f
         specs = specs_from_config(config, args())
         self.assertEqual(len(specs), 10)
         self.assertEqual({item.variant for item in specs}, {
-            "baseline", "pathobs", "fee_only", "bonus_only", "topostake"
+            "baseline", "pathobs", "fee_only", "bonus_only", "trail"
         })
         self.assertEqual({item.load_tx_per_slot for item in specs}, {8, 32})
 
@@ -182,7 +182,7 @@ UUID: 72e82fd99b0f
         config = load_config(ROOT / "experiments/configs/frozen_v1_devnet_main.yaml")
         specs = specs_from_config(
             config,
-            args(variants="baseline,topostake", seeds="9", loads="8"),
+            args(variants="baseline,trail", seeds="9", loads="8"),
         )
         self.assertEqual(len(specs), 2)
         self.assertEqual({item.seed for item in specs}, {9})
@@ -249,7 +249,7 @@ UUID: 72e82fd99b0f
             ]
         )
         self.assertFalse(
-            measurement_quality_checks(spec("topostake"), blocks, resources, prometheus)[
+            measurement_quality_checks(spec("trail"), blocks, resources, prometheus)[
                 "passed"
             ]
         )

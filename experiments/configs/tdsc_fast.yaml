@@ -1,7 +1,7 @@
 {
   "suite": "tdsc_fast",
   "build_command": ["cargo", "build", "--release"],
-  "binary": "target/release/topostake",
+  "binary": "target/release/trail",
   "max_parallel": 1,
   "timeout_seconds": 1200,
   "seeds": [0, 1, 2],
@@ -21,9 +21,9 @@
     "warmup_epochs": 5,
     "max_tx_per_block": 80,
     "time_scale": 0.1,
-    "topostake_initial_depth": 4,
+    "trail_initial_depth": 4,
     "beta": 0.2,
-    "topostake_saturation_k": 1.0,
+    "trail_saturation_k": 1.0,
     "eta": 0.5,
     "bonus_cap": 1.0,
     "proposer_fee_ratio": 0.7,
@@ -32,7 +32,7 @@
   "experiments": [
     {
       "name": "performance_load",
-      "protocols": ["pos", "topostake"],
+      "protocols": ["pos", "trail"],
       "node_num": [100],
       "topology": ["ba"],
       "tx_rate": [50, 100, 150, 200],
@@ -40,37 +40,37 @@
     },
     {
       "name": "performance_scale",
-      "protocols": ["pos", "topostake"],
+      "protocols": ["pos", "trail"],
       "node_num": [50, 100, 150, 200],
       "topology": ["ba"],
       "tx_rate": [175],
       "max_tx_per_block": 80,
       "network_delay_multiplier": 6.0,
       "validator_scale_capacity_penalty": 0.7,
-      "topostake_scale_capacity_bonus": 0.1,
+      "trail_scale_capacity_bonus": 0.1,
       "validator_scale_latency_penalty": 1.2,
-      "topostake_scale_latency_reduction": 0.85,
-      "topostake_latency_reduction_s": 0.5
+      "trail_scale_latency_reduction": 0.85,
+      "trail_latency_reduction_s": 0.5
     },
     {
       "name": "real_stake_bound",
-      "protocols": ["topostake"],
+      "protocols": ["trail"],
       "adversary_stake_fraction": [0.05, 0.10, 0.20, 0.30],
       "adversary_placement": ["random", "high-degree", "high-betweenness"],
       "eta_bonus_product": [0.25, 0.5]
     },
     {
       "name": "path_padding",
-      "protocols": ["topostake"],
+      "protocols": ["trail"],
       "padding_identities": [0, 1, 2, 4, 8, 16],
-      "topostake_initial_depth": [2, 4, 8],
+      "trail_initial_depth": [2, 4, 8],
       "adversary_stake_fraction": [0.10],
       "sybil_node_num": [1],
       "attack_mode": "path-padding"
     },
     {
       "name": "transaction_flooding",
-      "protocols": ["topostake"],
+      "protocols": ["trail"],
       "attack_tx_rate_multiplier": [0, 0.5, 1, 2, 5],
       "adversary_stake_fraction": [0.10],
       "attack_mode": "flooding",
@@ -78,7 +78,7 @@
     },
     {
       "name": "reward_fairness",
-      "protocols": ["pos", "topostake_eta0", "topostake"],
+      "protocols": ["pos", "trail_eta0", "trail"],
       "stake_gini": [0.2, 0.4, 0.6, 0.8],
       "max_epochs": 40,
       "base_reward": 0.1,
@@ -88,7 +88,7 @@
     },
     {
       "name": "relay_participation",
-      "protocols": ["topostake_eta0", "topostake"],
+      "protocols": ["trail_eta0", "trail"],
       "stake_gini": [0.2, 0.4, 0.6, 0.8],
       "relay_profile": ["mixed"],
       "max_epochs": 30,
@@ -100,7 +100,7 @@
     },
     {
       "name": "churn_appendix",
-      "protocols": ["pos", "topostake"],
+      "protocols": ["pos", "trail"],
       "unstable_fraction": [0, 0.1, 0.3, 0.5],
       "offline_probability": [0.5],
       "beta": 0.8

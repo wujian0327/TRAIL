@@ -2,7 +2,7 @@ use clap::Parser;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use topostake::security_eval::{evaluate_padding_grid, PaddingCaseResult};
+use trail::security_eval::{evaluate_padding_grid, PaddingCaseResult};
 
 #[derive(Debug, Parser)]
 #[command(about = "Exhaustively check frozen-v1 fixed-path padding non-amplification")]

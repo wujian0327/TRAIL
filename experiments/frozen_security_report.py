@@ -29,7 +29,7 @@ REFERENCE_FIELDS = {
     "flooding_cost_to_influence": ("attack_tx_rate_multiplier", 0),
     "relay_participation": ("relay_profile", "lazy"),
     "relay_network_stress": ("relay_profile", "lazy"),
-    "score_floor_sensitivity": ("topostake_score_floor_kappa", 1.0),
+    "score_floor_sensitivity": ("trail_score_floor_kappa", 1.0),
 }
 PAIR_METRICS = [
     "adversary_raw_contribution_total",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run baseline, path-observation, and TopoStake frozen-v1 devnet smokes."""
+"""Run baseline, path-observation, and TRAIL frozen-v1 devnet smokes."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def capture(cmd: list[str]) -> str:
 
 def collect_build_provenance() -> dict:
     provenance = {"source_commit": capture(["git", "rev-parse", "HEAD"]), "images": {}}
-    for image in ("topostake/geth:dev", "topostake/lighthouse:dev"):
+    for image in ("trail/geth:dev", "trail/lighthouse:dev"):
         raw = capture(["docker", "image", "inspect", image])
         inspected = json.loads(raw)[0]
         provenance["images"][image] = {
@@ -76,7 +76,7 @@ def ensure_registry(nodes: int) -> tuple[Path, Path]:
             "cargo",
             "run",
             "--bin",
-            "topostake_relay_registry",
+            "trail_relay_registry",
             "--",
             "--count",
             str(nodes),
@@ -102,7 +102,7 @@ def generate_args(
     run(
         [
             sys.executable,
-            "scripts/topostake_devnet_args.py",
+            "scripts/trail_devnet_args.py",
             "--mode",
             mode,
             "--count",
@@ -147,7 +147,7 @@ def enrich_irrecoverable_costs(summary_path: Path) -> None:
         with urllib.request.urlopen(f"{cl_api}/eth/v2/beacon/blocks/{slot}", timeout=15) as response:
             message = json.loads(response.read())["data"]["message"]
         body = message.get("body", {})
-        inline = body.get("topostake_evidence_records") or body.get("topostakeEvidenceRecords") or []
+        inline = body.get("trail_evidence_records") or body.get("trailEvidenceRecords") or []
         costs = {
             (str(item.get("tx_hash", "")).lower(), int(item.get("epoch", 0))): int(
                 item.get("irrecoverable_cost_wei", 0)
@@ -191,14 +191,14 @@ def query_geth_statuses(endpoints: list[str]) -> list[dict]:
         request = urllib.request.Request(
             endpoint,
             data=json.dumps(
-                {"jsonrpc": "2.0", "id": 1, "method": "topostake_status", "params": []}
+                {"jsonrpc": "2.0", "id": 1, "method": "trail_status", "params": []}
             ).encode(),
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.loads(response.read())
         if "error" in payload:
-            raise RuntimeError(f"topostake_status failed on {endpoint}: {payload['error']}")
+            raise RuntimeError(f"trail_status failed on {endpoint}: {payload['error']}")
         statuses.append({"endpoint": endpoint, **payload["result"]})
     return statuses
 
@@ -206,7 +206,7 @@ def query_geth_statuses(endpoints: list[str]) -> list[dict]:
 def collect_geth_statuses(summary_path: Path) -> None:
     summary = json.loads(summary_path.read_text())
     statuses = query_geth_statuses(summary.get("endpoints", {}).get("el_rpcs", []))
-    summary["geth_topostake_status"] = statuses
+    summary["geth_trail_status"] = statuses
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
 
@@ -241,7 +241,7 @@ def run_mode(args: argparse.Namespace, mode: str, public: Path, private: Path) -
             run(
                 [
                     sys.executable,
-                    "experiments/topostake_devnet_runner.py",
+                    "experiments/trail_devnet_runner.py",
                     "run",
                     "--enclave",
                     enclave,
@@ -307,10 +307,10 @@ def main() -> int:
     parser.add_argument(
         "--package",
         type=Path,
-        default=Path(os.environ.get("TOPOSTAKE_ETHEREUM_PACKAGE", "/tmp/ethereum-package")),
+        default=Path(os.environ.get("TRAIL_ETHEREUM_PACKAGE", "/tmp/ethereum-package")),
         help="Local ethpandaops/ethereum-package checkout",
     )
-    parser.add_argument("--modes", default=",".join(MODES), help="Comma-separated subset of baseline,pathobs,topostake")
+    parser.add_argument("--modes", default=",".join(MODES), help="Comma-separated subset of baseline,pathobs,trail")
     parser.add_argument("--nodes", type=int, default=4)
     parser.add_argument("--validators-per-node", type=int, default=1)
     parser.add_argument("--topology", choices=("linear", "ring", "star", "er", "random_regular", "ba"), default="ring")

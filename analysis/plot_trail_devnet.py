@@ -28,19 +28,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "experiments"))
 
 from run_frozen_devnet_experiments import summarize_resources  # noqa: E402
+from trail_compat import LEGACY_PROTOCOL, canonicalize_artifact  # noqa: E402
 
 
 DEFAULT_INPUT = ROOT / "results" / "raw" / "frozen_v1_devnet_main"
 DEFAULT_OUTPUT = ROOT / "figures" / "trail_devnet"
 DEFAULT_TABLE = DEFAULT_OUTPUT / "trail_devnet_high_load_table.tex"
 
-VARIANTS = ("baseline", "pathobs", "fee_only", "bonus_only", "topostake")
-SELECTED_VARIANTS = ("baseline", "topostake")
+VARIANTS = ("baseline", "pathobs", "fee_only", "bonus_only", "trail")
+SELECTED_VARIANTS = ("baseline", "trail")
 LOADS = (8, 32, 64)
 SEEDS = frozenset(range(5))
 OFFERED_LOADS = {8: 8.0 / 3.0, 32: 32.0 / 3.0, 64: 64.0 / 3.0}
 RUN_RE = re.compile(
-    r"^(baseline|pathobs|fee_only|bonus_only|topostake)_ba_n8_load(8|32|64)_seed([0-4])$"
+    rf"^(baseline|pathobs|fee_only|bonus_only|trail|{LEGACY_PROTOCOL})_ba_n8_load(8|32|64)_seed([0-4])$"
 )
 
 GRAY = "#666666"
@@ -66,7 +67,7 @@ class Point:
 
 def read_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+        return canonicalize_artifact(json.load(handle))
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -97,6 +98,8 @@ def load_runs(input_dir: Path) -> list[Run]:
         if match is None:
             raise ValueError(f"unexpected run directory: {run_dir}")
         variant, load, seed = match.groups()
+        if variant == LEGACY_PROTOCOL:
+            variant = "trail"
         summary = read_json(run_dir / "summary.json")
         status = read_json(run_dir / "runner_status.json")
         acceptance = read_json(run_dir / "acceptance.json")
@@ -275,7 +278,7 @@ def plot_metric(
             "marker": "^",
             "markerfacecolor": "white",
         },
-        "topostake": {
+        "trail": {
             "label": "Full TRAIL",
             "color": ORANGE,
             "linestyle": "-",
@@ -367,11 +370,11 @@ def high_load_table(runs: list[Run], path: Path) -> dict[str, tuple[float | None
     rows: list[str] = []
     for label, metric, decimals in metrics:
         pos = mean_for("baseline", metric)
-        trail = mean_for("topostake", metric)
+        trail = mean_for("trail", metric)
         values[label] = (pos, trail)
         rows.append(f"{label} & {pos:.{decimals}f} & {trail:.{decimals}f} \\\\")
     verification = mean_for(
-        "topostake",
+        "trail",
         lambda run: 1000.0
         * float(
             run.summary["formal_experiment"]["prometheus"][

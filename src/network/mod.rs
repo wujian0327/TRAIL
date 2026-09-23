@@ -1,6 +1,6 @@
 use crate::blockchain::block::Block;
 use crate::blockchain::Blockchain;
-use crate::consensus::topostake::TopoStakeConfig;
+use crate::consensus::trail::TrailConfig;
 use crate::consensus::ConsensusType;
 use crate::metrics::FloodingAuditState;
 use crate::network::graph::TopologyType;
@@ -207,7 +207,7 @@ pub struct SimulationConfig {
     /// stake at the following epoch boundary.
     pub reward_reinvestment_rate: f64,
     pub max_tx_per_block: usize,
-    pub topostake_config: TopoStakeConfig,
+    pub trail_config: TrailConfig,
     pub max_epochs: u64,
     /// Initial epochs excluded from run-level steady-state means.
     pub warmup_epochs: u64,
@@ -218,10 +218,10 @@ pub struct SimulationConfig {
     pub time_scale: f64,
     pub network_delay_multiplier: f64,
     pub validator_scale_capacity_penalty: f64,
-    pub topostake_scale_capacity_bonus: f64,
+    pub trail_scale_capacity_bonus: f64,
     pub validator_scale_latency_penalty: f64,
-    pub topostake_scale_latency_reduction: f64,
-    pub topostake_latency_reduction_s: f64,
+    pub trail_scale_latency_reduction: f64,
+    pub trail_latency_reduction_s: f64,
     pub relay_profile: RelayProfile,
     pub relay_background_profile: RelayProfile,
     pub focal_relayer_count: u32,
@@ -253,25 +253,25 @@ impl SimulationConfig {
         {
             self.validator_scale_capacity_penalty = 0.0;
         }
-        if self.topostake_scale_capacity_bonus < 0.0
-            || !self.topostake_scale_capacity_bonus.is_finite()
+        if self.trail_scale_capacity_bonus < 0.0
+            || !self.trail_scale_capacity_bonus.is_finite()
         {
-            self.topostake_scale_capacity_bonus = 0.0;
+            self.trail_scale_capacity_bonus = 0.0;
         }
         if self.validator_scale_latency_penalty < 0.0
             || !self.validator_scale_latency_penalty.is_finite()
         {
             self.validator_scale_latency_penalty = 0.0;
         }
-        if self.topostake_scale_latency_reduction < 0.0
-            || !self.topostake_scale_latency_reduction.is_finite()
+        if self.trail_scale_latency_reduction < 0.0
+            || !self.trail_scale_latency_reduction.is_finite()
         {
-            self.topostake_scale_latency_reduction = 0.0;
+            self.trail_scale_latency_reduction = 0.0;
         }
-        if self.topostake_latency_reduction_s < 0.0
-            || !self.topostake_latency_reduction_s.is_finite()
+        if self.trail_latency_reduction_s < 0.0
+            || !self.trail_latency_reduction_s.is_finite()
         {
-            self.topostake_latency_reduction_s = 0.0;
+            self.trail_latency_reduction_s = 0.0;
         }
         self.unstable_fraction = self.unstable_fraction.clamp(0.0, 1.0);
         self.offline_probability = self.offline_probability.clamp(0.0, 1.0);
@@ -363,7 +363,7 @@ pub async fn start_network(config: SimulationConfig) {
     let max_tx_per_block = effective_max_tx_per_block(&config);
     let confirmation_latency_adjustment_s = confirmation_latency_adjustment_s(&config);
     let wallet_seed = config.wallet_seed;
-    let topostake_config = config.topostake_config.clone();
+    let trail_config = config.trail_config.clone();
     let max_epochs = config.max_epochs;
     let relay_profile = config.relay_profile;
     let initial_relay_profile = if config.focal_relayer_count > 0 {
@@ -393,7 +393,7 @@ pub async fn start_network(config: SimulationConfig) {
         slot_per_epoch,
         pow_difficulty,
         pow_max_threads,
-        topostake_config.clone(),
+        trail_config.clone(),
         base_reward,
         config.reward_reinvestment_rate,
         node_num,
@@ -851,8 +851,8 @@ fn effective_max_tx_per_block(config: &SimulationConfig) -> usize {
     let scale_pressure = scale_ratio.ln();
     let mut capacity =
         base_capacity / (1.0 + config.validator_scale_capacity_penalty * scale_pressure);
-    if config.consensus == ConsensusType::TopoStake {
-        capacity *= 1.0 + config.topostake_scale_capacity_bonus;
+    if config.consensus == ConsensusType::Trail {
+        capacity *= 1.0 + config.trail_scale_capacity_bonus;
     }
     capacity.round().clamp(1.0, base_capacity) as usize
 }
@@ -861,9 +861,9 @@ fn confirmation_latency_adjustment_s(config: &SimulationConfig) -> f64 {
     let scale_ratio = (config.node_num as f64 / 50.0).max(1.0);
     let scale_pressure = scale_ratio.ln() * scale_ratio;
     let mut adjustment = config.validator_scale_latency_penalty * scale_pressure;
-    if config.consensus == ConsensusType::TopoStake {
-        adjustment *= 1.0 - config.topostake_scale_latency_reduction.clamp(0.0, 1.0);
-        adjustment -= config.topostake_latency_reduction_s;
+    if config.consensus == ConsensusType::Trail {
+        adjustment *= 1.0 - config.trail_scale_latency_reduction.clamp(0.0, 1.0);
+        adjustment -= config.trail_latency_reduction_s;
     }
     adjustment
 }

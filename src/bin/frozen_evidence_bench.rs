@@ -5,9 +5,9 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
-use topostake::blockchain::path::{AggregatedSignedPaths, TransactionPaths};
-use topostake::blockchain::transaction::Transaction;
-use topostake::wallet::Wallet;
+use trail::blockchain::path::{AggregatedSignedPaths, TransactionPaths};
+use trail::blockchain::transaction::Transaction;
+use trail::wallet::Wallet;
 
 const PROTOCOL_VERSION: &str = "frozen-v1";
 const DEFAULT_EPOCH: u64 = 7;

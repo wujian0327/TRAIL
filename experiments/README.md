@@ -1,84 +1,60 @@
-# Experiment Layout
+# TRAIL experiment tooling
 
-The root [`README.md`](../README.md) is the canonical reproduction guide. This
-directory contains the experiment specifications and the Python runners that
-support the current frozen-v1 evaluation.
+This directory contains the experiment configurations, runners, validation
+code, and processors used by the maintained TRAIL figures. The repository root
+[`README.md`](../README.md) is the canonical reproduction guide.
 
-## Current suites
+## Maintained experiment groups
 
-- `frozen_v1_security_{pilot,main}.yaml`: security envelope, path manipulation,
-  flooding, and relay-participation stress.
-- `frozen_v1_fee_bonus_{pilot,main}.yaml`: long-horizon fee and proposer-bonus
-  ablation.
-- `frozen_v1_endogenous_participation_pilot.yaml`: reduced-form, paired-seed
-  mean-field participation and heterogeneous-cost sensitivity calibrated from
-  the RQ2 output; this suite does not rerun the Rust simulator.
-- `frozen_v1_adaptive_participation_pilot.yaml`: Rust adaptive-agent pilot in
-  which validators update Active/Lazy relay strategies from completed-window
-  reward and forwarding observations without future proposer information;
-  the second-stage configuration sweeps `1x`, `2x`, and `3x` cost regimes over
-  100 epochs, uses 5% seeded exploration to preserve counterfactual coverage,
-  and evaluates fixed-follow-up transaction cohorts.
-- `frozen_v1_adaptive_participation_stability_probe.yaml`: 24-run targeted
-  probe with a 300-epoch horizon, analysis from epoch 200, slower strategy
-  updates, and representative plus prior boundary conditions.
-- `frozen_v1_adaptive_participation_main.yaml`: pre-specified 180-run holdout
-  with 20 seeds disjoint from pilot development, Fee-only and Full TopoStake
-  at `1x`, `2x`, and `3x` relay cost, plus one PoS reference condition.
-- `frozen_v1_adaptive_participation_sensitivity.yaml`: independent 160-run,
-  20-seed one-factor sensitivity check for the frozen baseline, update rate,
-  hysteresis, and symmetric exploration at the representative `50%`-initial,
-  `2x`-cost condition.
-- `frozen_v1_organic_capture_{pilot,main}.yaml`: organic-traffic capture under
-  favorable placement.
-- `frozen_v1_reinvestment_gini_{pilot,main}.yaml`: paired long-term stake-Gini
-  trajectories under a full-reinvestment upper-bound stress test.
-- `frozen_v1_sustained_outage_{pilot,main}.yaml`: random sustained outages and
-  proposer-side adaptation; the main suite compares `eta={0,0.5,1}` at 10%,
-  20%, and 30% outage stake.
-- `frozen_v1_sustained_outage_eta_pilot.yaml`: five-seed, 20%-stake outage
-  sweep over `eta={0,0.25,0.5,0.75,1}`.
-- `frozen_v1_devnet_{pilot,main}.yaml`: paired real-client Ethereum devnet
-  feasibility and overhead.
-- `frozen_v1_topology_scale_timing_probe.yaml`: six-run BA scalability probe
-  at 100, 500, and 1,000 validators under organic and max-score conditions.
-- `frozen_v1_topology_scale_main.yaml`: 20-seed RQ3 scale-robustness matrix at
-  100, 500, and 1,000 validators.
+- Security: proposer influence/scaling, transaction flooding, and path checks.
+- Participation: adaptive relay participation and inclusion time.
+- Fairness: organic reward concentration and stake reinvestment.
+- Outage resilience: sustained validator outages and score persistence.
+- Devnet: Ethereum PoS and Full TRAIL real-client measurements.
 
-The shared protocol parameters are defined in
-`configs/protocol_frozen_v1.yaml`. `frozen_v1_smoke.yaml` is the fast simulator
-correctness check. The `eth_empirical` and topology-scale profiles are retained
-as optional scalability diagnostics; they are not part of the paper's five
-main experiment groups.
+The final configurations and development pilots remain in `configs/` so that
+existing raw artifacts retain their provenance. `configs/protocol_frozen_v1.yaml`
+contains shared frozen-v1 protocol parameters.
 
 ## Entry points
 
-Run experiments through `scripts/task.py` from the repository root. The usual
-pattern is:
+Run a simulator configuration without adding a dedicated task:
 
 ```bash
-python scripts/task.py frozen-smoke
-python scripts/task.py frozen-topology-scale-timing-probe --dry-run
-python scripts/task.py frozen-topology-scale-timing-probe
-python scripts/task.py frozen-topology-scale-main --dry-run
-python scripts/task.py frozen-topology-scale-main
-python scripts/task.py <suite>-pilot
-python scripts/task.py <suite>-main --dry-run
-python scripts/task.py <suite>-main
-python scripts/task.py <suite>-figures
+python3 scripts/task.py run-config \
+  --config experiments/configs/frozen_v1_security_main.yaml \
+  --dry-run
 ```
 
-Use the exact suite commands and devnet prerequisites listed in the root
-README. Lower-level modules in this directory implement matrix execution,
-acceptance checks, aggregation, and report generation; they are not separate
-experiment definitions.
+Generate all maintained paper figures:
 
-## Outputs
+```bash
+python3 scripts/task.py trail-figures
+```
 
-- `results/raw/<suite>/`: per-run logs, resolved configurations, and metrics.
-- `results/processed/`: acceptance JSON, grouped and paired tables, summaries,
-  and figure inputs.
-- `figures/`: generated PDF and PNG figures.
+Individual figure groups are available as:
 
-Formal matrices are resumable. Use `--force` only when intentionally replacing
-completed simulator runs, and `--resume` for interrupted devnet matrices.
+```bash
+python3 scripts/task.py trail-security-figures
+python3 scripts/task.py trail-participation-figures
+python3 scripts/task.py trail-fairness-figures
+python3 scripts/task.py trail-outage-figures
+python3 scripts/task.py trail-devnet-figures
+```
+
+Use `python3 scripts/task.py --help` for experiment, reporting, smoke-test, and
+devnet task options.
+
+## Layout
+
+- `configs/`: final matrices plus retained pilot/probe provenance.
+- `run_experiments.py`: generic Rust-simulator matrix runner.
+- `trail_devnet_runner.py` and `run_frozen_devnet_*`: devnet execution tools.
+- `trail_*_report.py`: processors still required by maintained figures.
+- `tests/`: tests for active runners, processors, and figure conventions.
+- `results/raw/`: immutable per-run artifacts.
+- `results/processed/`: regenerated tables and reports.
+
+Raw runs are not modified by the reporting and plotting tasks. Use `--force`
+only when intentionally replacing simulator output, and `--resume` for an
+interrupted devnet matrix.

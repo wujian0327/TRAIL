@@ -15,13 +15,13 @@ use std::fmt::{Display, Formatter};
 pub mod minotaur;
 pub mod pos;
 pub mod pow;
-pub mod topostake;
+pub mod trail;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusType {
     POS,
-    #[value(name = "topostake")]
-    TopoStake,
+    #[value(name = "trail")]
+    Trail,
     POW,
     MINOTAUR,
 }
@@ -32,8 +32,8 @@ impl Display for ConsensusType {
             ConsensusType::POS => {
                 write!(f, "pos")
             }
-            ConsensusType::TopoStake => {
-                write!(f, "topostake")
+            ConsensusType::Trail => {
+                write!(f, "trail")
             }
             ConsensusType::POW => {
                 write!(f, "pow")
@@ -89,17 +89,17 @@ pub trait Consensus: Send + Sync {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ConsensusMetricsSnapshot {
-    pub topostake_depth: Option<usize>,
-    pub topostake_beta: Option<f64>,
-    pub topostake_eta: Option<f64>,
-    pub topostake_bonus_cap: Option<f64>,
-    pub topostake_saturation_k: Option<f64>,
-    pub topostake_proposer_fee_ratio: Option<f64>,
-    pub topostake_score_floor_kappa: Option<f64>,
-    pub topostake_bonus_zeta: Option<f64>,
-    pub topostake_score_cost_reference: Option<f64>,
-    pub topostake_active_score_epoch: Option<u64>,
-    pub topostake_latest_score_epoch: Option<u64>,
+    pub trail_depth: Option<usize>,
+    pub trail_beta: Option<f64>,
+    pub trail_eta: Option<f64>,
+    pub trail_bonus_cap: Option<f64>,
+    pub trail_saturation_k: Option<f64>,
+    pub trail_proposer_fee_ratio: Option<f64>,
+    pub trail_score_floor_kappa: Option<f64>,
+    pub trail_bonus_zeta: Option<f64>,
+    pub trail_score_cost_reference: Option<f64>,
+    pub trail_active_score_epoch: Option<u64>,
+    pub trail_latest_score_epoch: Option<u64>,
     pub score_history: HashMap<String, f64>,
     pub latest_score_history: HashMap<String, f64>,
     pub normalized_score: HashMap<String, f64>,

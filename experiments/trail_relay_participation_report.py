@@ -18,12 +18,13 @@ from scipy.stats import t as student_t
 
 from adaptive_participation_report import cohort_inclusion_metrics
 from run_experiments import ROOT
+from trail_compat import canonicalize_artifact
 
 
 MECHANISMS = {
     "pos": "PoS",
-    "topostake_eta0": "Fee-only",
-    "topostake": "Full TRAIL",
+    "trail_eta0": "Fee-only",
+    "trail": "Full TRAIL",
 }
 MECHANISM_ORDER = tuple(MECHANISMS.values())
 COSTS = (1.0, 2.0, 3.0)
@@ -50,7 +51,7 @@ REQUIRED_FILES = (
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return canonicalize_artifact(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError) as exc:
         raise ValueError(f"cannot read JSON {path}: {exc}") from exc
 
@@ -260,12 +261,12 @@ def summarize_run(
 
     config = run_config.get("config", {})
     consensus = str(config.get("consensus", ""))
-    eta = finite(config.get("topostake_config", {}).get("eta", 0.0), "eta")
+    eta = finite(config.get("trail_config", {}).get("eta", 0.0), "eta")
     if mechanism == "PoS" and consensus != "POS":
         problems.append("mechanism_config")
-    if mechanism == "Fee-only" and (consensus != "TopoStake" or eta != 0.0):
+    if mechanism == "Fee-only" and (consensus != "TRAIL" or eta != 0.0):
         problems.append("mechanism_config")
-    if mechanism == "Full TRAIL" and (consensus != "TopoStake" or eta != 0.5):
+    if mechanism == "Full TRAIL" and (consensus != "TRAIL" or eta != 0.5):
         problems.append("mechanism_config")
 
     background_generated = int(summary.get("generated_tx", -1))

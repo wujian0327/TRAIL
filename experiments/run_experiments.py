@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run reproducible TopoStake paper experiments from YAML specs."""
+"""Run reproducible TRAIL paper experiments from YAML specs."""
 
 from __future__ import annotations
 
@@ -37,12 +37,12 @@ DIMENSION_KEYS = [
     "adversary_placement",
     "eta_bonus_product",
     "padding_identities",
-    "topostake_target_depth",
+    "trail_target_depth",
     "beta",
-    "topostake_saturation_k",
-    "topostake_score_cost_reference",
-    "topostake_score_floor_kappa",
-    "topostake_bonus_zeta",
+    "trail_saturation_k",
+    "trail_score_cost_reference",
+    "trail_score_floor_kappa",
+    "trail_bonus_zeta",
     "eta",
     "bonus_cap",
     "proposer_fee_ratio",
@@ -72,27 +72,27 @@ CLI_KEYS = {
     "max_epochs": "--max-epochs",
     "warmup_epochs": "--metrics-warmup-epochs",
     "max_tx_per_block": "--max-tx-per-block",
-    "topostake_target_depth": "--topostake-target-depth",
+    "trail_target_depth": "--trail-target-depth",
     "beta": "--beta",
-    "topostake_saturation_k": "--topostake-saturation-k",
-    "topostake_score_cost_reference": "--topostake-score-cost-reference",
-    "topostake_score_floor_kappa": "--topostake-score-floor-kappa",
-    "topostake_bonus_zeta": "--topostake-bonus-zeta",
+    "trail_saturation_k": "--trail-saturation-k",
+    "trail_score_cost_reference": "--trail-score-cost-reference",
+    "trail_score_floor_kappa": "--trail-score-floor-kappa",
+    "trail_bonus_zeta": "--trail-bonus-zeta",
     "eta": "--eta",
     "bonus_cap": "--bonus-cap",
     "proposer_fee_ratio": "--proposer-fee-ratio",
     "reward_settlement_depth": "--reward-settlement-depth",
-    "topostake_score_activation_delay_epochs": "--topostake-score-activation-delay-epochs",
-    "topostake_max_path_hops": "--topostake-max-path-hops",
-    "topostake_evidence_work_limit": "--topostake-evidence-work-limit",
-    "topostake_challenge_work_limit": "--topostake-challenge-work-limit",
+    "trail_score_activation_delay_epochs": "--trail-score-activation-delay-epochs",
+    "trail_max_path_hops": "--trail-max-path-hops",
+    "trail_evidence_work_limit": "--trail-evidence-work-limit",
+    "trail_challenge_work_limit": "--trail-challenge-work-limit",
     "time_scale": "--time-scale",
     "network_delay_multiplier": "--network-delay-multiplier",
     "validator_scale_capacity_penalty": "--validator-scale-capacity-penalty",
-    "topostake_scale_capacity_bonus": "--topostake-scale-capacity-bonus",
+    "trail_scale_capacity_bonus": "--trail-scale-capacity-bonus",
     "validator_scale_latency_penalty": "--validator-scale-latency-penalty",
-    "topostake_scale_latency_reduction": "--topostake-scale-latency-reduction",
-    "topostake_latency_reduction_s": "--topostake-latency-reduction-s",
+    "trail_scale_latency_reduction": "--trail-scale-latency-reduction",
+    "trail_latency_reduction_s": "--trail-latency-reduction-s",
     "relay_profile": "--relay-profile",
     "relay_background_profile": "--relay-background-profile",
     "focal_relayer_count": "--focal-relayer-count",
@@ -128,10 +128,10 @@ EXPERIMENT_OVERRIDE_KEYS = set(CLI_KEYS) | {
 RUN_ID_KEY_ALIASES = {
     "network_delay_multiplier": "netdelay",
     "validator_scale_capacity_penalty": "capovh",
-    "topostake_scale_capacity_bonus": "topocap",
+    "trail_scale_capacity_bonus": "topocap",
     "validator_scale_latency_penalty": "latovh",
-    "topostake_scale_latency_reduction": "topolat",
-    "topostake_latency_reduction_s": "topolatsec",
+    "trail_scale_latency_reduction": "topolat",
+    "trail_latency_reduction_s": "topolatsec",
 }
 
 
@@ -172,16 +172,16 @@ def seed_bundle(seed_value: int) -> Dict[str, int]:
 
 
 def protocol_cli(protocol_variant: str) -> Dict[str, Any]:
-    if protocol_variant.startswith("topostake_eta"):
-        encoded_eta = protocol_variant.removeprefix("topostake_eta").replace("p", ".")
+    if protocol_variant.startswith("trail_eta"):
+        encoded_eta = protocol_variant.removeprefix("trail_eta").replace("p", ".")
         try:
             eta = float(encoded_eta)
         except ValueError as error:
-            raise ValueError(f"invalid TopoStake eta variant: {protocol_variant}") from error
+            raise ValueError(f"invalid TRAIL eta variant: {protocol_variant}") from error
         if not 0.0 <= eta <= 1.0:
-            raise ValueError(f"TopoStake eta variant outside [0,1]: {protocol_variant}")
+            raise ValueError(f"TRAIL eta variant outside [0,1]: {protocol_variant}")
         return {
-            "protocol": "topostake",
+            "protocol": "trail",
             "protocol_label": protocol_variant,
             "eta": eta,
         }
@@ -190,8 +190,8 @@ def protocol_cli(protocol_variant: str) -> Dict[str, Any]:
 
 def migrate_legacy_keys(values: Dict[str, Any]) -> Dict[str, Any]:
     migrated = dict(values)
-    if "topostake_target_depth" not in migrated and "topostake_initial_depth" in migrated:
-        migrated["topostake_target_depth"] = migrated.pop("topostake_initial_depth")
+    if "trail_target_depth" not in migrated and "trail_initial_depth" in migrated:
+        migrated["trail_target_depth"] = migrated.pop("trail_initial_depth")
     return migrated
 
 
@@ -208,7 +208,7 @@ def expand_runs(spec: Dict[str, Any], only: Iterable[str] | None = None) -> List
         name = experiment["name"]
         if only_set and name not in only_set:
             continue
-        protocols = experiment.get("protocols", [defaults.get("protocol", "topostake")])
+        protocols = experiment.get("protocols", [defaults.get("protocol", "trail")])
         experiment_overrides = {
             key: experiment[key]
             for key in EXPERIMENT_OVERRIDE_KEYS
@@ -406,7 +406,7 @@ def run_one(binary: str, run: Dict[str, Any], timeout: int, force: bool) -> Dict
     try:
         with log_path.open("w") as log_file:
             env = os.environ.copy()
-            env.setdefault("TOPOSTAKE_LOG_LEVEL", "off")
+            env.setdefault("TRAIL_LOG_LEVEL", "off")
             completed = subprocess.run(
                 cmd,
                 cwd=ROOT,
@@ -493,7 +493,7 @@ def main() -> int:
     )
     max_parallel = args.max_parallel or int(spec.get("max_parallel", 1))
     timeout = args.timeout_seconds or int(spec.get("timeout_seconds", 600))
-    binary = spec.get("binary", "target/release/topostake")
+    binary = spec.get("binary", "target/release/trail")
 
     print(f"Loaded {len(runs)} runs from {spec_path.relative_to(ROOT)}")
     if args.dry_run:

@@ -1,3 +1,5 @@
+!figures/
+
 /target
 .idea/*
 .vscode/*
@@ -28,15 +30,15 @@ result
 
 # Vendored Ethereum client forks should be tracked as source, including their
 # JSON fixtures, SVG assets, patches, and GitHub metadata.
-!/ethereum-topostake/
-!/ethereum-topostake/**
-ethereum-topostake/lighthouse/target/
-ethereum-topostake/go-ethereum-topostake/build/bin/
-ethereum-topostake/go-ethereum-topostake/geth
-ethereum-topostake/**/.ai/
-ethereum-topostake/**/.claude/
-ethereum-topostake/**/.config/
-ethereum-topostake/**/.githooks/
-ethereum-topostake/**/.gitea/
+!/ethereum-trail/
+!/ethereum-trail/**
+ethereum-trail/lighthouse/target/
+ethereum-trail/go-ethereum-trail/build/bin/
+ethereum-trail/go-ethereum-trail/geth
+ethereum-trail/**/.ai/
+ethereum-trail/**/.claude/
+ethereum-trail/**/.config/
+ethereum-trail/**/.githooks/
+ethereum-trail/**/.gitea/
 /bin/
 /geth

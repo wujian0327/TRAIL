@@ -105,7 +105,7 @@ def calibration_runs(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
     runs = []
     for seed_value in map(int, spec["seeds"]):
         run = base_run(spec, seed_value)
-        run.update(protocol_cli(spec["outage"].get("calibration_protocol", "topostake")))
+        run.update(protocol_cli(spec["outage"].get("calibration_protocol", "trail")))
         run.update(
             experiment="outage_calibration",
             max_epochs=warmup,
@@ -206,7 +206,7 @@ def main() -> int:
 
     spec_path = (ROOT / args.config).resolve()
     spec = load_yaml(spec_path)
-    binary = spec.get("binary", "target/release/topostake")
+    binary = spec.get("binary", "target/release/trail")
     timeout = args.timeout_seconds or int(spec.get("timeout_seconds", 1200))
     max_parallel = args.max_parallel or int(spec.get("max_parallel", 2))
     calibrations = calibration_runs(spec)

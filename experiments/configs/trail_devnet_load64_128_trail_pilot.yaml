@@ -4,7 +4,7 @@
   "nodes": [8],
   "loads_tx_per_slot": [64, 128],
   "topologies": ["ba"],
-  "variants": ["topostake"],
+  "variants": ["trail"],
   "seeds": [0],
   "validators_per_node": 1,
   "seconds_per_slot": 3,

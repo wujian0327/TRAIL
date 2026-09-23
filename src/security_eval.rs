@@ -4,7 +4,7 @@
 //! reward formulas on controlled inputs so an experiment can hold the path and
 //! coalition positions fixed while varying only consecutive identity padding.
 
-use crate::consensus::topostake::TopoStakeConsensus;
+use crate::consensus::trail::TrailConsensus;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -24,7 +24,7 @@ pub struct PaddingCaseResult {
 fn credit(depth: usize, path_length: usize, positions: &[usize]) -> f64 {
     positions
         .iter()
-        .map(|position| TopoStakeConsensus::gamma_for_depth(depth, *position, path_length))
+        .map(|position| TrailConsensus::gamma_for_depth(depth, *position, path_length))
         .sum()
 }
 

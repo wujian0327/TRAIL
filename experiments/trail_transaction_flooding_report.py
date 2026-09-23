@@ -268,7 +268,7 @@ def main() -> int:
     valid_rows = [row for row in rows if row["valid"]]
     pairs = paired_violations(valid_rows)
     fee = float(spec["defaults"]["transaction_fee"])
-    g_ref = float(spec["defaults"]["topostake_score_cost_reference"])
+    g_ref = float(spec["defaults"]["trail_score_cost_reference"])
     invariants = invariant_report(valid_rows, fee, g_ref)
 
     groups: list[dict[str, Any]] = []

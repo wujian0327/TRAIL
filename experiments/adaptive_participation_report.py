@@ -16,7 +16,7 @@ from typing import Any, Iterable
 from run_experiments import PROCESSED_ROOT, ROOT, expand_runs, load_yaml
 
 
-PROTOCOLS = ("pos", "topostake_eta0", "topostake")
+PROTOCOLS = ("pos", "trail_eta0", "trail")
 T95 = {
     2: 12.706,
     3: 4.303,
@@ -160,7 +160,7 @@ def grouped_post_adaptation_drifts(
         protocol = str(row.get("protocol_label", ""))
         if (
             epoch < analysis_start_epoch
-            or protocol not in {"topostake_eta0", "topostake"}
+            or protocol not in {"trail_eta0", "trail"}
         ):
             continue
         key = (
@@ -759,10 +759,10 @@ def paired_rows(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     }
     output = []
     for experiment, seed, initial, cost, protocol in sorted(index):
-        if protocol != "topostake":
+        if protocol != "trail":
             continue
         full = index[(experiment, seed, initial, cost, protocol)]
-        fee = index.get((experiment, seed, initial, cost, "topostake_eta0"))
+        fee = index.get((experiment, seed, initial, cost, "trail_eta0"))
         if fee is None:
             continue
         output.append(
@@ -886,10 +886,10 @@ def main() -> int:
     utility_rows = [
         row
         for row in complete
-        if row["protocol_label"] in {"topostake_eta0", "topostake"}
+        if row["protocol_label"] in {"trail_eta0", "trail"}
     ]
     initialization_spreads = {}
-    for protocol in ("topostake_eta0", "topostake"):
+    for protocol in ("trail_eta0", "trail"):
         costs = sorted(
             {
                 number(row["cost_median_multiplier"])
@@ -928,7 +928,7 @@ def main() -> int:
     ) + sum(len(hashes) != 1 for hashes in paired_profile_hashes.values())
     counterfactual_coverage_by_protocol = {}
     unavailable_updates_by_protocol = {}
-    for protocol in ("topostake_eta0", "topostake"):
+    for protocol in ("trail_eta0", "trail"):
         protocol_rows = [
             row for row in utility_rows if row["protocol_label"] == protocol
         ]
