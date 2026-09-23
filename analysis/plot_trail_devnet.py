@@ -346,10 +346,9 @@ def high_load_table(runs: list[Run], path: Path) -> dict[str, tuple[float | None
             2,
         ),
         (
-            "Network/node (MiB/run)",
-            lambda run: (
-                resource_value(run, "per_node_network_rx_delta_mean_bytes")
-                + resource_value(run, "per_node_network_tx_delta_mean_bytes")
+            "Outbound traffic/node (MiB/run)",
+            lambda run: resource_value(
+                run, "per_node_network_tx_delta_mean_bytes"
             )
             / 1048576.0,
             2,

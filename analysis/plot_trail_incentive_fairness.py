@@ -621,9 +621,10 @@ def render_figures(
                 label="_nolegend_",
                 zorder=2,
             )
-    axis.plot(xlim, xlim, color=GRAY, linestyle=":", linewidth=1.0, zorder=1)
-    axis.set_xlim(4.5, 35.5)
-    axis.set_ylim(bottom=0.0)
+    score_xlim = (10.0, 35.5)
+    axis.plot(score_xlim, score_xlim, color=GRAY, linestyle=":", linewidth=1.0, zorder=1)
+    axis.set_xlim(*score_xlim)
+    axis.set_ylim(0.0, 85.0)
     axis.set_xlabel("Coalition stake (%)")
     axis.set_ylabel("Coalition share (%)")
     handles = [
@@ -650,9 +651,10 @@ def render_figures(
         facecolor="white",
         edgecolor="#D0D0D0",
         borderpad=0.3,
+        labelspacing=0.25,
         columnspacing=0.8,
         handletextpad=0.45,
-        loc="best",
+        loc="upper left",
     )
     fig.subplots_adjust(left=0.14, right=0.97, bottom=0.20, top=0.97)
     outputs.extend(save(fig, "trail_score_proposer_shares", output))

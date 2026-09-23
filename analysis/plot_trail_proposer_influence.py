@@ -43,8 +43,8 @@ ETA_COLORS = {0.25: BLUE, 0.5: RED, 1.0: GREEN}
 EXPECTED_ETAS = set(ETA_COLORS)
 PLACEMENT_MARKERS = {
     "random": ("o", "Random"),
-    "high-degree": ("s", "Degree"),
-    "high-betweenness": ("^", "Betweenness"),
+    "high-degree": ("s", "High-degree"),
+    "high-betweenness": ("^", "high-betweenness"),
 }
 
 # The formal matrix has 20 independent seeds per scenario (19 degrees of
