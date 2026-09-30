@@ -12,9 +12,8 @@ The repository contains:
 ## Environment
 
 ```bash
-git clone -b codex/frozen-v1-security-eval \
-  https://github.com/wujian0327/pog-rs.git
-cd pog-rs
+git clone https://github.com/wujian0327/TRAIL.git
+cd TRAIL
 
 rustup update stable
 python -m venv .venv
@@ -110,6 +109,12 @@ python scripts/task.py frozen-devnet-main \
 Use `--resume` for completed partial matrices and `--stop-on-failure` for a
 fail-fast run. Detailed client and acceptance semantics are documented in
 `docs/FROZEN_V1_DEVNET.md`.
+
+## Experiment data
+
+The raw and processed experiment results used by the paper are archived on
+[Zenodo (DOI: 10.5281/zenodo.23034970)](https://doi.org/10.5281/zenodo.23034970).
+The archive includes SHA-256 checksums for verifying downloaded files.
 
 ## Artifact layout
 

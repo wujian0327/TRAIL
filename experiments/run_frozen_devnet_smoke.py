@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import platform
 import json
 import os
 import subprocess
@@ -50,8 +52,79 @@ def capture(cmd: list[str]) -> str:
     return completed.stdout.strip()
 
 
-def collect_build_provenance() -> dict:
-    provenance = {"source_commit": capture(["git", "rev-parse", "HEAD"]), "images": {}}
+def _capture_optional(cmd: list[str], cwd: Path = ROOT) -> str:
+    completed = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=command_env(),
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return completed.stdout.strip()
+
+
+def _git_state(path: Path) -> dict:
+    commit = _capture_optional(["git", "rev-parse", "HEAD"], path)
+    status = _capture_optional(["git", "status", "--short"], path)
+    diff = subprocess.run(
+        ["git", "diff", "--binary", "HEAD"],
+        cwd=path,
+        env=command_env(),
+        check=False,
+        stdout=subprocess.PIPE,
+    ).stdout
+    root_text = _capture_optional(["git", "rev-parse", "--show-toplevel"], path)
+    git_root = Path(root_text) if root_text else path
+    untracked_text = _capture_optional(
+        ["git", "ls-files", "--others", "--exclude-standard"], path
+    )
+    untracked = []
+    untracked_digest = hashlib.sha256()
+    for name in sorted(line for line in untracked_text.splitlines() if line):
+        candidate = git_root / name
+        if candidate.is_file():
+            payload = candidate.read_bytes()
+            untracked.append({"path": name, "sha256": hashlib.sha256(payload).hexdigest()})
+            untracked_digest.update(name.encode() + b"\0" + payload + b"\0")
+    digest = hashlib.sha256(
+        status.encode() + b"\0" + diff + b"\0" + untracked_digest.digest()
+    ).hexdigest()
+    return {
+        "path": str(path.resolve()),
+        "commit": commit,
+        "status_short": status,
+        "tracked_diff_sha256": hashlib.sha256(diff).hexdigest(),
+        "untracked_files": untracked,
+        "state_fingerprint_sha256": digest,
+    }
+
+
+def collect_build_provenance(package: Path | None = None) -> dict:
+    package = package or Path("/home/wujian/ethereum-package")
+    provenance = {
+        "source_commit": capture(["git", "rev-parse", "HEAD"]),
+        "source": _git_state(ROOT),
+        "ethereum_package": _git_state(package) if (package / ".git").exists() else {
+            "path": str(package.resolve()),
+            "error": "not a git checkout",
+        },
+        "geth_source": _git_state(ROOT / "ethereum-trail" / "go-ethereum-trail"),
+        "lighthouse_source": _git_state(ROOT / "ethereum-trail" / "lighthouse"),
+        "host": {
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "cpu_model": _capture_optional(["bash", "-lc", "lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -1"]),
+            "logical_cpus": os.cpu_count(),
+            "memory": _capture_optional(["bash", "-lc", "free -h | sed -n '2p'"]),
+        },
+        "tools": {
+            "docker": _capture_optional(["docker", "version", "--format", "{{.Server.Version}}"]),
+            "kurtosis": _capture_optional(["kurtosis", "version"]),
+        },
+        "images": {},
+    }
     for image in ("trail/geth:dev", "trail/lighthouse:dev"):
         raw = capture(["docker", "image", "inspect", image])
         inspected = json.loads(raw)[0]
@@ -62,7 +135,6 @@ def collect_build_provenance() -> dict:
             "labels": inspected.get("Config", {}).get("Labels") or {},
         }
     return provenance
-
 
 def ensure_registry(nodes: int) -> tuple[Path, Path]:
     public = ROOT / "results" / "processed" / f"frozen_v1_relay_registry_n{nodes}.json"

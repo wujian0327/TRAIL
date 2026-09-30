@@ -1,5 +1,3 @@
-!figures/
-
 /target
 .idea/*
 .vscode/*
@@ -27,6 +25,7 @@ back/*
 *.patch
 results
 result
+/trail-artifact/
 
 # Vendored Ethereum client forks should be tracked as source, including their
 # JSON fixtures, SVG assets, patches, and GitHub metadata.
