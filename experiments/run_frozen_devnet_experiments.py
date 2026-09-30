@@ -53,6 +53,9 @@ class RunSpec:
     resource_interval: float
     receipt_timeout: int
     finality_timeout: int
+    send_concurrency: int = 0
+    receipt_concurrency: int = 0
+    prometheus_scrape_interval: float = 15.0
 
     @property
     def run_id(self) -> str:
@@ -113,6 +116,9 @@ def specs_from_config(config: dict[str, Any], args: argparse.Namespace) -> list[
             resource_interval=float(config["resource_sample_interval_seconds"]),
             receipt_timeout=int(config["receipt_timeout_seconds"]),
             finality_timeout=int(config["finality_timeout_seconds"]),
+            send_concurrency=int(config.get("send_concurrency", 0)),
+            receipt_concurrency=int(config.get("receipt_concurrency", 0)),
+            prometheus_scrape_interval=float(config.get("prometheus_scrape_interval_seconds", 15.0)),
         )
         for variant, node_count, load, topology, seed in itertools.product(
             variants, nodes, loads, topologies, seeds
@@ -143,6 +149,8 @@ def generate_args(spec: RunSpec, public_registry: Path, private_registry: Path, 
             "--maxpeers",
             str(max(8, spec.nodes)),
             "--enable-observability",
+            "--prometheus-scrape-interval-seconds",
+            str(spec.prometheus_scrape_interval),
             "--label",
             spec.run_id,
             "--public-registry",
@@ -322,9 +330,9 @@ def run_workload(spec: RunSpec, output_root: Path) -> None:
             "--sender-count",
             "0",
             "--send-concurrency",
-            "0",
+            str(spec.send_concurrency),
             "--receipt-concurrency",
-            "0",
+            str(spec.receipt_concurrency),
             "--receipt-timeout",
             str(spec.receipt_timeout),
             "--wait-receipts-after-send",
@@ -332,6 +340,8 @@ def run_workload(spec: RunSpec, output_root: Path) -> None:
             str(spec.seconds_per_slot),
             "--slots-per-epoch",
             str(spec.slots_per_epoch),
+            "--measurement-slots",
+            str(spec.slots_per_epoch * spec.measurement_epochs),
             "--warmup-finality-epochs",
             str(spec.warmup_epochs),
             "--wait-finality",
@@ -359,32 +369,16 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 def collect_block_sizes(summary: dict[str, Any]) -> dict[str, Any]:
-    cl_apis = summary.get("endpoints", {}).get("cl_apis", [])
-    blocks = summary.get("blocks", {})
-    if not cl_apis or not blocks:
+    audit_rows = summary.get("blocks", {}).get("audit_rows", [])
+    if not audit_rows:
         return {"encoding": "unavailable", "samples": []}
-    endpoint = str(cl_apis[0]).rstrip("/")
-    samples = []
-    encodings = set()
-    for slot in range(int(blocks.get("start_slot", 0)), int(blocks.get("end_slot", -1)) + 1):
-        request = urllib.request.Request(
-            f"{endpoint}/eth/v2/beacon/blocks/{slot}",
-            headers={"Accept": "application/octet-stream"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                payload = response.read()
-                content_type = response.headers.get("Content-Type", "")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                continue
-            raise
-        encoding = "ssz" if "octet-stream" in content_type else "http-response"
-        encodings.add(encoding)
-        samples.append({"slot": slot, "bytes": len(payload), "encoding": encoding})
+    samples = [
+        {"slot": int(row["slot"]), "bytes": int(row["block_ssz_bytes"]), "encoding": "ssz"}
+        for row in audit_rows
+    ]
     sizes = [float(item["bytes"]) for item in samples]
     return {
-        "encoding": encodings.pop() if len(encodings) == 1 else "mixed",
+        "encoding": "ssz",
         "samples": samples,
         "count": len(sizes),
         "mean_bytes": sum(sizes) / len(sizes) if sizes else 0.0,
@@ -393,16 +387,21 @@ def collect_block_sizes(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def prometheus_query(endpoint: str, query: str) -> list[dict[str, Any]]:
-    url = f"{endpoint.rstrip('/')}/api/v1/query?{urllib.parse.urlencode({'query': query})}"
+def prometheus_query(
+    endpoint: str, query: str, at: float | None = None
+) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"query": query}
+    if at is not None:
+        params["time"] = f"{at:.6f}"
+    url = f"{endpoint.rstrip('/')}/api/v1/query?{urllib.parse.urlencode(params)}"
     with urllib.request.urlopen(url, timeout=15) as response:
         payload = json.loads(response.read())
     return payload.get("data", {}).get("result", [])
 
 
-def prometheus_sum(endpoint: str, query: str) -> float:
+def prometheus_sum(endpoint: str, query: str, at: float | None = None) -> float:
     total = 0.0
-    for sample in prometheus_query(endpoint, query):
+    for sample in prometheus_query(endpoint, query, at):
         try:
             value = float(sample.get("value", [None, 0])[1])
             if math.isfinite(value):
@@ -412,31 +411,83 @@ def prometheus_sum(endpoint: str, query: str) -> float:
     return total
 
 
+def prometheus_histogram_delta(
+    endpoint: str, metric: str, start_unix: float, end_unix: float
+) -> tuple[list[tuple[float, float]], float]:
+    query = f"sum by (le) ({metric}_bucket)"
+    boundaries: dict[float, list[float]] = {}
+    for index, at in enumerate((start_unix, end_unix)):
+        for sample in prometheus_query(endpoint, query, at):
+            label = sample.get("metric", {}).get("le")
+            boundary = math.inf if label == "+Inf" else float(label)
+            boundaries.setdefault(boundary, [0.0, 0.0])[index] = float(
+                sample.get("value", [None, 0])[1]
+            )
+    buckets = sorted(
+        (boundary, max(0.0, values[1] - values[0]))
+        for boundary, values in boundaries.items()
+    )
+    if not buckets or buckets[-1][1] <= 0:
+        return buckets, 0.0
+    target = 0.95 * buckets[-1][1]
+    previous_boundary = 0.0
+    previous_count = 0.0
+    for boundary, count in buckets:
+        if count >= target:
+            if math.isinf(boundary):
+                return buckets, previous_boundary
+            width_count = count - previous_count
+            fraction = (target - previous_count) / width_count if width_count else 0.0
+            return buckets, previous_boundary + fraction * (boundary - previous_boundary)
+        previous_boundary, previous_count = boundary, count
+    return buckets, 0.0
+
+
 def collect_formal_prometheus(summary: dict[str, Any]) -> dict[str, Any]:
     endpoint = summary.get("endpoints", {}).get("prometheus")
     if not endpoint:
         return {"error": "missing Prometheus endpoint"}
-    queries = {
+    window = summary.get("workload", {}).get("measurement_window", {})
+    start_unix = float(window.get("start_unix", 0.0))
+    end_unix = float(window.get("end_unix", 0.0))
+    if not (start_unix and end_unix > start_unix):
+        return {"error": "missing formal measurement window"}
+    counters = {
         "evidence_verify_seconds_sum": "trail_inline_evidence_verify_seconds_sum",
         "evidence_verify_count": "trail_inline_evidence_verify_seconds_count",
-        "evidence_verify_p95_seconds": (
-            "histogram_quantile(0.95, sum by (le) "
-            "(trail_inline_evidence_verify_seconds_bucket))"
-        ),
-        "gossip_block_verify_delay_ms_sum": "sum(trail_gossip_block_verification_delay_milliseconds)",
+        "gossip_block_verify_delay_ms_sum": "trail_gossip_block_verification_delay_milliseconds",
     }
-    result: dict[str, Any] = {"endpoint": endpoint, "queries": queries}
-    for name, query in queries.items():
+    result: dict[str, Any] = {
+        "endpoint": endpoint,
+        "start_unix": start_unix,
+        "end_unix": end_unix,
+        "method": "Prometheus instant-query counter deltas at formal window boundaries",
+        "p95_method": "histogram bucket delta with linear interpolation",
+    }
+    for name, query in counters.items():
         try:
-            result[name] = prometheus_sum(str(endpoint), query)
+            before = prometheus_sum(str(endpoint), query, start_unix)
+            after = prometheus_sum(str(endpoint), query, end_unix)
+            result[name] = max(0.0, after - before)
         except Exception as exc:
             result[name] = None
             result[f"{name}_error"] = str(exc)
+    try:
+        buckets, p95 = prometheus_histogram_delta(
+            str(endpoint), "trail_inline_evidence_verify_seconds", start_unix, end_unix
+        )
+        result["evidence_verify_bucket_deltas"] = [
+            {"le": "+Inf" if math.isinf(boundary) else boundary, "count": count}
+            for boundary, count in buckets
+        ]
+        result["evidence_verify_p95_seconds"] = p95
+    except Exception as exc:
+        result["evidence_verify_p95_seconds"] = None
+        result["evidence_verify_p95_seconds_error"] = str(exc)
     count = float(result.get("evidence_verify_count") or 0.0)
     total = float(result.get("evidence_verify_seconds_sum") or 0.0)
     result["evidence_verify_mean_seconds"] = total / count if count else 0.0
     return result
-
 
 def measurement_quality_checks(
     spec: RunSpec,
@@ -523,7 +574,9 @@ def client_node_index(name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def summarize_resources(path: Path) -> dict[str, Any]:
+def summarize_resources(
+    path: Path, start_unix: float | None = None, end_unix: float | None = None
+) -> dict[str, Any]:
     if not path.exists():
         return {"error": "resource JSONL missing", "samples": 0}
     aggregates = []
@@ -535,8 +588,13 @@ def summarize_resources(path: Path) -> dict[str, Any]:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
+        timestamp = float(record.get("ts", 0.0))
+        if start_unix is not None and timestamp < start_unix:
+            continue
+        if end_unix is not None and timestamp >= end_unix:
+            continue
         row = {
-            "ts": float(record.get("ts", 0.0)),
+            "ts": timestamp,
             "cpu_percent": 0.0,
             "memory_bytes": 0.0,
             "network_rx_bytes": 0.0,
@@ -627,19 +685,25 @@ def summarize_resources(path: Path) -> dict[str, Any]:
         )
         node_rx = [sample["network_rx_bytes"] for sample in samples]
         node_tx = [sample["network_tx_bytes"] for sample in samples]
-        per_node_rx_delta.append(max(0.0, max(node_rx) - min(node_rx)))
-        per_node_tx_delta.append(max(0.0, max(node_tx) - min(node_tx)))
+        per_node_rx_delta.append(max(0.0, node_rx[-1] - node_rx[0]))
+        per_node_tx_delta.append(max(0.0, node_tx[-1] - node_tx[0]))
 
     def mean(values: list[float]) -> float:
         return sum(values) / len(values) if values else 0.0
 
+    sample_times = [row["ts"] for row in aggregates]
     return {
         "samples": len(aggregates),
+        "requested_start_unix": start_unix,
+        "requested_end_unix": end_unix,
+        "first_sample_unix": min(sample_times),
+        "last_sample_unix": max(sample_times),
+        "sample_span_seconds": max(sample_times) - min(sample_times),
         "cpu_mean_percent": sum(cpu) / len(cpu) if cpu else 0.0,
         "cpu_p95_percent": percentile(cpu, 95),
         "memory_max_bytes": max(memory, default=0.0),
-        "network_rx_delta_bytes": max(0.0, max(rx, default=0.0) - min(rx, default=0.0)),
-        "network_tx_delta_bytes": max(0.0, max(tx, default=0.0) - min(tx, default=0.0)),
+        "network_rx_delta_bytes": max(0.0, rx[-1] - rx[0]),
+        "network_tx_delta_bytes": max(0.0, tx[-1] - tx[0]),
         "el_cpu_mean_percent": (
             sum(row["el_cpu_percent"] for row in aggregates) / len(aggregates)
             if aggregates
@@ -770,6 +834,7 @@ def execute_run(
     )
     monitor = None
     monitor_log = None
+    status = "failed"
     error = ""
     try:
         args_file = run_dir / "kurtosis_args.yaml"
@@ -808,8 +873,13 @@ def execute_run(
             mode=spec.variant,
             artifact=str(summary_path),
         )
+        window = summary.get("workload", {}).get("measurement_window", {})
+        start_unix = float(window.get("start_unix", 0.0))
+        end_unix = float(window.get("end_unix", 0.0))
         block_sizes = collect_block_sizes(summary)
-        resources = summarize_resources(run_dir / "resources.jsonl")
+        resources = summarize_resources(
+            run_dir / "resources.jsonl", start_unix, end_unix
+        )
         prometheus = collect_formal_prometheus(summary)
         measurement_quality = measurement_quality_checks(
             spec, block_sizes, resources, prometheus
@@ -892,7 +962,7 @@ def main() -> int:
     if not args.package.exists():
         parser.error(f"ethereum-package not found: {args.package}")
 
-    provenance = collect_build_provenance()
+    provenance = collect_build_provenance(args.package)
     args.output_root.mkdir(parents=True, exist_ok=True)
     manifest = {
         "config_path": str(args.config),

@@ -17,7 +17,7 @@ PYTHON = sys.executable
 TRAIL_FIGURE_SCRIPTS = {
     "trail-devnet-figures": (
         "analysis/plot_trail_devnet.py",
-        "analysis/plot_trail_devnet_txslot_pilot.py",
+        "analysis/plot_trail_devnet_txslot.py",
     ),
     "trail-fairness-figures": ("analysis/plot_trail_incentive_fairness.py",),
     "trail-outage-figures": ("analysis/plot_trail_outage_resilience.py",),

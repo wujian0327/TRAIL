@@ -1,19 +1,22 @@
 {
-  "suite": "trail_devnet_high_load_pilot",
+  "suite": "trail_devnet_txslot_main",
   "protocol_version": "frozen-v1",
   "nodes": [8],
-  "loads_tx_per_slot": [128, 256, 512, 1024],
+  "loads_tx_per_slot": [64, 128, 256],
   "topologies": ["ba"],
   "variants": ["baseline", "trail"],
-  "seeds": [0],
+  "seeds": [0, 1, 2, 3, 4],
   "validators_per_node": 1,
   "seconds_per_slot": 3,
   "slots_per_epoch": 8,
   "warmup_epochs": 5,
   "measurement_epochs": 5,
-  "resource_sample_interval_seconds": 2.0,
+  "resource_sample_interval_seconds": 1.0,
+  "prometheus_scrape_interval_seconds": 2.0,
+  "send_concurrency": 64,
+  "receipt_concurrency": 64,
   "receipt_timeout_seconds": 1200,
   "finality_timeout_seconds": 1800,
-  "randomize_order": false,
-  "order_seed": 20260915
+  "randomize_order": true,
+  "order_seed": 20260925
 }

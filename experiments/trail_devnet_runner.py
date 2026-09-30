@@ -394,6 +394,7 @@ def run_workload(
     *,
     phase: str = "measurement",
     tx_count: int | None = None,
+    schedule_start_unix: float | None = None,
 ) -> Dict[str, Any]:
     from eth_account import Account
 
@@ -408,7 +409,10 @@ def run_workload(
     nonce_w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     nonces = [nonce_w3.eth.get_transaction_count(account.address, "pending") for account in accounts]
     chain_id = nonce_w3.eth.chain_id
-    first_schedule_monotonic = time.monotonic()
+    schedule_delay = 0.0
+    if schedule_start_unix is not None:
+        schedule_delay = max(0.0, schedule_start_unix - time.time())
+    first_schedule_monotonic = time.monotonic() + schedule_delay
     last_receipt_monotonic = None
     send_workers = max(1, args.send_concurrency or len(endpoints.el_rpcs))
     receipt_workers = max(1, args.receipt_concurrency or len(endpoints.el_rpcs))
@@ -444,7 +448,7 @@ def run_workload(
         )
         return tx_record
 
-    futures = []
+    future_to_record: Dict[Any, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=send_workers) as executor:
         for index in range(tx_count):
             sender_index = index % len(accounts)
@@ -462,9 +466,13 @@ def run_workload(
             sleep_seconds = target_monotonic - time.monotonic()
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
-            futures.append(executor.submit(send_one, tx_record))
-        for future in as_completed(futures):
-            future.result()
+            future = executor.submit(send_one, tx_record)
+            future_to_record[future] = tx_record
+        for future in as_completed(future_to_record):
+            try:
+                future.result()
+            except Exception as exc:
+                future_to_record[future]["send_error"] = str(exc)
 
     txs.sort(key=lambda tx: tx["index"])
     first_send_monotonic = min((tx["send_monotonic"] for tx in txs if "send_monotonic" in tx), default=None)
@@ -482,14 +490,24 @@ def run_workload(
 
     if args.wait_receipts_after_send:
         with ThreadPoolExecutor(max_workers=receipt_workers) as executor:
-            receipt_futures = [executor.submit(wait_receipt, tx_record) for tx_record in txs]
+            receipt_futures = {
+                executor.submit(wait_receipt, tx_record): tx_record
+                for tx_record in txs
+                if tx_record.get("tx_hash")
+            }
             for future in as_completed(receipt_futures):
-                receipt_record = future.result()
+                try:
+                    receipt_record = future.result()
+                except Exception as exc:
+                    receipt_futures[future]["receipt_error"] = str(exc)
+                    continue
                 receipt_monotonic = receipt_record.get("receipt_monotonic")
                 if receipt_monotonic is not None:
                     last_receipt_monotonic = max(last_receipt_monotonic or receipt_monotonic, receipt_monotonic)
     else:
         for tx_record in txs:
+            if not tx_record.get("tx_hash"):
+                continue
             receipt_record = wait_receipt(tx_record)
             receipt_monotonic = receipt_record.get("receipt_monotonic")
             if receipt_monotonic is not None:
@@ -552,7 +570,10 @@ def run_workload(
         "seconds_per_slot": seconds_per_slot,
         "phase": phase,
         "tx_count": tx_count,
+        "send_success_count": sum(1 for tx in txs if tx.get("tx_hash")),
+        "send_failure_count": sum(1 for tx in txs if not tx.get("tx_hash")),
         "success_count": success_count,
+        "schedule_start_unix": schedule_start_unix or 0.0,
         "send_interval_seconds": args.tx_interval_seconds,
         "send_concurrency": send_workers,
         "receipt_concurrency": receipt_workers,
@@ -748,6 +769,207 @@ def collect_blocks(
     }
 
 
+def decoded_bytes(value: Any, expected: int | None = None) -> bytes:
+    if isinstance(value, list):
+        raw = bytes(int(item) for item in value)
+    elif isinstance(value, str):
+        text = value.removeprefix("0x")
+        raw = bytes.fromhex(text) if text else b""
+    else:
+        raw = b""
+    if expected is not None and len(raw) != expected:
+        raise ValueError(f"expected {expected} bytes, got {len(raw)}")
+    return raw
+
+
+def execution_transaction_hash(raw_transaction: str) -> str:
+    value = Web3.keccak(decoded_bytes(raw_transaction)).hex()
+    return value if value.startswith("0x") else "0x" + value
+
+
+def normalized_hash(value: Any) -> str:
+    text = str(value or "").lower()
+    if not text:
+        return ""
+    return text if text.startswith("0x") else "0x" + text
+
+
+def trail_record_ssz(record: Dict[str, Any]) -> bytes:
+    path = [int(value) for value in record.get("relay_path", [])]
+    fixed_size = 32 + 8 + 8 + 8 + 4 + 48
+    fixed = b"".join(
+        [
+            decoded_bytes(record.get("tx_hash", ""), 32),
+            int(record.get("epoch", 0)).to_bytes(8, "little"),
+            int(record.get("priority_fee_wei", 0)).to_bytes(8, "little"),
+            int(record.get("irrecoverable_cost_wei", 0)).to_bytes(8, "little"),
+            fixed_size.to_bytes(4, "little"),
+            decoded_bytes(record.get("aggregate_signature", ""), 48),
+        ]
+    )
+    return fixed + b"".join(value.to_bytes(8, "little") for value in path)
+
+
+def trail_evidence_list_ssz(records: List[Dict[str, Any]]) -> bytes:
+    encoded = [trail_record_ssz(record) for record in records]
+    cursor = 4 * len(encoded)
+    offsets = []
+    for item in encoded:
+        offsets.append(cursor.to_bytes(4, "little"))
+        cursor += len(item)
+    return b"".join(offsets + encoded)
+
+
+def collect_window_blocks(
+    cl_api: str,
+    start_slot: int,
+    end_slot: int,
+    slots_per_epoch: int,
+    measurement_txs: List[Dict[str, Any]],
+    ssz_dir: Path,
+) -> Dict[str, Any]:
+    """Collect canonical blocks in the half-open interval [start_slot, end_slot)."""
+    measurement_by_hash = {
+        normalized_hash(tx.get("tx_hash")): tx
+        for tx in measurement_txs
+        if tx.get("tx_hash")
+    }
+    records: List[Dict[str, Any]] = []
+    audit_rows: List[Dict[str, Any]] = []
+    missed_slots: List[int] = []
+    ssz_dir.mkdir(parents=True, exist_ok=True)
+    endpoint = cl_api.rstrip("/")
+    for slot in range(start_slot, end_slot):
+        response = requests.get(f"{endpoint}/eth/v2/beacon/blocks/{slot}", timeout=20)
+        if response.status_code == 404:
+            missed_slots.append(slot)
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        message = payload["data"]["message"]
+        body = message.get("body", {})
+        proposer = int(message["proposer_index"])
+        header = requests.get(
+            f"{endpoint}/eth/v1/beacon/headers/{slot}", timeout=20
+        )
+        header.raise_for_status()
+        block_root = str(header.json()["data"]["root"])
+        execution_payload = body.get("execution_payload") or body.get("executionPayload") or {}
+        raw_transactions = execution_payload.get("transactions", [])
+        transaction_hashes = [execution_transaction_hash(raw) for raw in raw_transactions]
+        transaction_set = {value.lower() for value in transaction_hashes}
+        measurement_hashes = transaction_set.intersection(measurement_by_hash)
+        inline_records = body.get("trail_evidence_records") or body.get("trailEvidenceRecords") or []
+        slot_records: List[Dict[str, Any]] = []
+        for record_index, record in enumerate(inline_records):
+            path = [int(value) for value in record.get("relay_path", [])]
+            evidence_epoch = int(record.get("epoch", 0))
+            inclusion_epoch = slot // slots_per_epoch
+            signature = decoded_bytes(record.get("aggregate_signature", ""), 48)
+            row = {
+                "slot": slot,
+                "block_root": block_root,
+                "proposer_index": proposer,
+                "record_index": record_index,
+                "tx_hash": normalized_hash(record.get("tx_hash")),
+                "epoch": evidence_epoch,
+                "inclusion_epoch": inclusion_epoch,
+                "credit_eligible": evidence_epoch == inclusion_epoch and bool(path),
+                "priority_fee_wei": int(record.get("priority_fee_wei", 0)),
+                "irrecoverable_cost_wei": int(record.get("irrecoverable_cost_wei", 0)),
+                "path": path,
+                "path_len": len(path),
+                "hop_count": max(0, len(path) - 1),
+                "aggregate_signature_len": len(signature),
+                "aggregate_signature_hex": signature.hex(),
+            }
+            records.append(row)
+            slot_records.append(row)
+        all_evidence_tx_hashes = {
+            row["tx_hash"]
+            for row in slot_records
+            if row["tx_hash"] in transaction_set
+        }
+        evidence_tx_hashes = {
+            row["tx_hash"]
+            for row in slot_records
+            if row["credit_eligible"] and row["tx_hash"] in transaction_set
+        }
+        legal_empty_hashes = {
+            tx_hash
+            for tx_hash in measurement_hashes
+            if int(measurement_by_hash[tx_hash].get("origin", -1)) == proposer
+            and tx_hash not in all_evidence_tx_hashes
+        }
+        evidence_payload = trail_evidence_list_ssz(inline_records)
+        ssz_response = requests.get(
+            f"{endpoint}/eth/v2/beacon/blocks/{slot}",
+            headers={"Accept": "application/octet-stream"},
+            timeout=20,
+        )
+        ssz_response.raise_for_status()
+        block_ssz = ssz_response.content
+        (ssz_dir / f"slot_{slot}.ssz").write_bytes(block_ssz)
+        evidence_occurrences = block_ssz.count(evidence_payload) if evidence_payload else 0
+        hop_histogram = Counter(str(row["hop_count"]) for row in slot_records)
+        identity_count = sum(row["path_len"] for row in slot_records)
+        record_count = len(slot_records)
+        audit_rows.append(
+            {
+                "slot": slot,
+                "block_root": block_root,
+                "proposer_index": proposer,
+                "block_transaction_count": len(transaction_hashes),
+                "measurement_transaction_count": len(measurement_hashes),
+                "evidence_record_count": record_count,
+                "valid_evidence_unique_transaction_count": len(evidence_tx_hashes),
+                "missing_evidence_transaction_count": max(0, len(transaction_hashes) - len(all_evidence_tx_hashes)),
+                "legal_empty_path_transaction_count": len(legal_empty_hashes),
+                "expired_evidence_count": sum(1 for row in slot_records if row["epoch"] < row["inclusion_epoch"]),
+                "scoring_eligible_evidence_count": sum(1 for row in slot_records if row["credit_eligible"]),
+                "path_identity_count": identity_count,
+                "path_hop_mean": (sum(row["hop_count"] for row in slot_records) / record_count) if record_count else 0.0,
+                "path_hop_max": max((row["hop_count"] for row in slot_records), default=0),
+                "path_hop_histogram": dict(sorted(hop_histogram.items())),
+                "block_ssz_bytes": len(block_ssz),
+                "evidence_ssz_bytes": len(evidence_payload),
+                "evidence_ssz_occurrences_in_block": evidence_occurrences,
+                "evidence_list_offset_bytes": 4 * record_count,
+                "record_tx_hash_bytes": 32 * record_count,
+                "record_epoch_bytes": 8 * record_count,
+                "record_fee_fields_bytes": 16 * record_count,
+                "record_path_offset_bytes": 4 * record_count,
+                "record_signature_bytes": 48 * record_count,
+                "record_identity_bytes": 8 * identity_count,
+                "unique_aggregate_signatures": len({row["aggregate_signature_hex"] for row in slot_records}),
+                "transaction_hashes": transaction_hashes,
+                "measurement_transaction_hashes": sorted(measurement_hashes),
+                "legal_empty_transaction_hashes": sorted(legal_empty_hashes),
+            }
+        )
+    path_histogram = Counter(str(record["path_len"]) for record in records)
+    relay_counts = Counter()
+    for record in records:
+        for relay in record["path"][1:-1]:
+            relay_counts[str(relay)] += 1
+    return {
+        "start_slot": start_slot,
+        "end_slot": end_slot,
+        "interval": "half-open",
+        "missed_slots": len(missed_slots),
+        "missed_slot_list": missed_slots,
+        "record_count": len(records),
+        "nonzero_fee_records": sum(1 for record in records if record["priority_fee_wei"] > 0),
+        "priority_fee_sum_wei": sum(record["priority_fee_wei"] for record in records),
+        "irrecoverable_cost_sum_wei": sum(record["irrecoverable_cost_wei"] for record in records),
+        "path_length_histogram": dict(sorted(path_histogram.items())),
+        "path_length": path_length_summary(records),
+        "relay_counts": dict(sorted(relay_counts.items(), key=lambda item: int(item[0]))),
+        "records": records,
+        "audit_rows": audit_rows,
+    }
+
+
 def collect_prometheus(prometheus: str | None) -> Dict[str, Any]:
     if not prometheus:
         return {}
@@ -774,6 +996,7 @@ def write_records_csv(path: Path, records: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "slot",
+        "block_root",
         "proposer_index",
         "record_index",
         "tx_hash",
@@ -781,9 +1004,12 @@ def write_records_csv(path: Path, records: List[Dict[str, Any]]) -> None:
         "inclusion_epoch",
         "credit_eligible",
         "priority_fee_wei",
+        "irrecoverable_cost_wei",
         "path_len",
+        "hop_count",
         "path",
         "aggregate_signature_len",
+        "aggregate_signature_hex",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -800,6 +1026,18 @@ def save_result(output_dir: Path, result: Dict[str, Any]) -> None:
     block_records = result.get("blocks", {}).get("records", [])
     if block_records:
         write_records_csv(output_dir / "block_records.csv", block_records)
+    audit_rows = result.get("blocks", {}).get("audit_rows", [])
+    if audit_rows:
+        fieldnames = sorted({key for row in audit_rows for key in row})
+        with (output_dir / "block_audit.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in audit_rows:
+                serialized = dict(row)
+                for key, value in list(serialized.items()):
+                    if isinstance(value, (list, dict)):
+                        serialized[key] = json.dumps(value, sort_keys=True, separators=(",", ":"))
+                writer.writerow(serialized)
 
 
 def wait_for_finality(cl_api: str, start_finalized_epoch: int, min_advance: int, timeout_seconds: int) -> Dict[str, int]:
@@ -851,8 +1089,52 @@ def command_run(args: argparse.Namespace) -> Dict[str, Any]:
                 args.warmup_finality_epochs,
                 args.finality_timeout_seconds,
             )
-    measurement_before = beacon_head(endpoints.cl_apis[0])
-    workload = run_workload(args, endpoints, phase="measurement")
+    genesis = beacon_genesis(endpoints.cl_apis[0])
+    planning_head = beacon_head(endpoints.cl_apis[0])
+    measurement_start_slot = planning_head["head_slot"] + 2
+    measurement_end_slot = measurement_start_slot + args.measurement_slots
+    measurement_start_unix = genesis["genesis_time"] + measurement_start_slot * args.seconds_per_slot
+    measurement_end_unix = genesis["genesis_time"] + measurement_end_slot * args.seconds_per_slot
+    measurement_before = {
+        **planning_head,
+        "start_slot": measurement_start_slot,
+        "end_slot": measurement_end_slot,
+        "start_unix": measurement_start_unix,
+        "end_unix": measurement_end_unix,
+    }
+    workload = run_workload(
+        args,
+        endpoints,
+        phase="measurement",
+        schedule_start_unix=float(measurement_start_unix),
+    )
+    window_txs = [
+        tx
+        for tx in workload.get("txs", [])
+        if tx.get("status") == 1
+        and measurement_start_slot <= int(tx.get("included_slot", -1)) < measurement_end_slot
+    ]
+    sent_in_window = [
+        tx
+        for tx in workload.get("txs", [])
+        if measurement_start_unix <= float(tx.get("send_unix", -1)) < measurement_end_unix
+    ]
+    workload["measurement_window"] = {
+        "start_slot": measurement_start_slot,
+        "end_slot": measurement_end_slot,
+        "interval": "half-open",
+        "start_unix": measurement_start_unix,
+        "end_unix": measurement_end_unix,
+        "duration_seconds": measurement_end_unix - measurement_start_unix,
+        "target_transaction_count": args.tx_count,
+        "sent_in_window_count": len(sent_in_window),
+        "included_in_window_count": len(window_txs),
+        "throughput_tx_per_slot": len(window_txs) / max(1, args.measurement_slots),
+        "throughput_tx_per_second": len(window_txs) / max(1, measurement_end_unix - measurement_start_unix),
+    }
+    workload["final_inclusion_ratio"] = workload.get("success_count", 0) / max(1, args.tx_count)
+    workload["unfinished_count"] = max(0, args.tx_count - int(workload.get("success_count", 0)))
+    workload["observation_cutoff_unix"] = time.time()
     if args.wait_finality:
         after_finality = wait_for_finality(
             endpoints.cl_apis[0],
@@ -863,11 +1145,13 @@ def command_run(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         after_finality = beacon_head(endpoints.cl_apis[0])
     after = beacon_head(endpoints.cl_apis[0])
-    blocks = collect_blocks(
+    blocks = collect_window_blocks(
         endpoints.cl_apis[0],
-        max(0, measurement_before["head_slot"] - args.pre_scan_slots),
-        after["head_slot"],
+        measurement_start_slot,
+        measurement_end_slot,
         args.slots_per_epoch,
+        workload.get("txs", []),
+        args.output_root / args.run_id / "blocks_ssz",
     )
     result = {
         "run_id": args.run_id,
@@ -992,6 +1276,7 @@ def main() -> None:
     run.add_argument("--wait-receipts-after-send", action="store_true")
     run.add_argument("--seconds-per-slot", type=int, default=3)
     run.add_argument("--slots-per-epoch", type=int, default=8)
+    run.add_argument("--measurement-slots", type=int, default=40)
     run.add_argument("--warmup-tx-count", type=int, default=0)
     run.add_argument("--warmup-finality-epochs", type=int, default=0)
     run.add_argument("--wait-finality", action="store_true")

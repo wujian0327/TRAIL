@@ -114,7 +114,7 @@ def write_args(args: argparse.Namespace) -> None:
             f"    count: {args.count}",
             f"    validator_count: {args.validator_count}",
             "    prometheus_config:",
-            "      scrape_interval: 15s",
+            f"      scrape_interval: {args.prometheus_scrape_interval_seconds:g}s",
             "      labels:",
             f"        experiment: {args.label}",
             "",
@@ -205,6 +205,12 @@ def main() -> None:
     parser.add_argument("--eta-scaled", type=int, default=500_000_000)
     parser.add_argument("--disable-fee-settlement", action="store_true")
     parser.add_argument("--enable-observability", action="store_true")
+    parser.add_argument(
+        "--prometheus-scrape-interval-seconds",
+        type=float,
+        default=15.0,
+        help="Prometheus scrape interval used for window-delta measurements",
+    )
     parser.add_argument("--label", default="trail-devnet-8node-overhead")
     parser.add_argument("--public-registry", type=Path, default=DEFAULT_PUBLIC_REGISTRY)
     parser.add_argument("--private-registry", type=Path, default=DEFAULT_PRIVATE_REGISTRY)
