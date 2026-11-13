@@ -408,6 +408,27 @@ class AdaptiveParticipationTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["restricted_mean_inclusion_latency_s"], 6.0)
         self.assertAlmostEqual(metrics["timeout_adjusted_p95_latency_s"], 9.6)
 
+    def test_duplicate_generation_does_not_reset_the_cohort_clock(self) -> None:
+        generated = [
+            {"tx_hash":"duplicate","created_epoch":"2","created_slot":"2"},
+            {"tx_hash":"duplicate","created_epoch":"2","created_slot":"0"},
+            {"tx_hash":"before_warmup","created_epoch":"1","created_slot":"4"},
+            {"tx_hash":"before_warmup","created_epoch":"2","created_slot":"0"},
+            {"tx_hash":"missing","created_epoch":"2","created_slot":"4"},
+            {"tx_hash":"late","created_epoch":"2","created_slot":"0"},
+            {"tx_hash":"late","created_epoch":"2","created_slot":"2"},
+        ]
+        inclusion = [
+            {"tx_hash":"duplicate","included_slot":"13","latency_s":"0.5"},
+            {"tx_hash":"before_warmup","included_slot":"12","latency_s":"1"},
+            {"tx_hash":"late","included_slot":"21","latency_s":"4.5"},
+        ]
+        metrics = cohort_inclusion_metrics(generated,inclusion,warmup_epochs=2,
+            max_epochs=10,slots_per_epoch=5,slot_duration_s=.5,followup_epochs=2)
+        self.assertEqual(metrics['cohort_generated_tx'],3)
+        self.assertEqual(metrics['cohort_included_tx'],1)
+        self.assertAlmostEqual(metrics['restricted_mean_inclusion_latency_s'],(1.5+5+5)/3)
+
 
 if __name__ == "__main__":
     unittest.main()

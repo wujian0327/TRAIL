@@ -192,6 +192,8 @@ def cohort_inclusion_metrics(
     Transactions not included within the follow-up horizon receive the horizon
     value.  This prevents survivor-only inclusion latency from looking
     artificially small when forwarding is weak.
+    Each hash enters at its first logged generation; later generation copies
+    cannot restart its clock or bring a pre-warm-up transaction into the cohort.
     """
 
     slots_per_epoch = max(slots_per_epoch, 1)
@@ -199,7 +201,7 @@ def cohort_inclusion_metrics(
     final_slot = max(max_epochs * slots_per_epoch - 1, 0)
     earliest_slot = max(warmup_epochs, 0) * slots_per_epoch
     latest_slot = final_slot - followup_slots
-    generated_by_hash: dict[str, int] = {}
+    first_generation: dict[str, int] = {}
     for row in generated:
         tx_hash = str(row.get("tx_hash", "")).strip()
         if not tx_hash:
@@ -208,19 +210,19 @@ def cohort_inclusion_metrics(
             int(number(row.get("created_epoch"))) * slots_per_epoch
             + int(number(row.get("created_slot")))
         )
-        if earliest_slot <= created_slot <= latest_slot:
-            generated_by_hash.setdefault(tx_hash, created_slot)
+        first_generation[tx_hash] = min(created_slot, first_generation.get(tx_hash, created_slot))
+    generated_by_hash = {tx_hash:created_slot for tx_hash,created_slot in first_generation.items()
+                         if earliest_slot <= created_slot <= latest_slot}
 
-    included_by_hash: dict[str, tuple[int, float]] = {}
+    included_by_hash: dict[str, int] = {}
     for row in inclusion:
         tx_hash = str(row.get("tx_hash", "")).strip()
         if tx_hash not in generated_by_hash:
             continue
         included_slot = int(number(row.get("included_slot")))
-        latency_s = max(number(row.get("latency_s")), 0.0)
         prior = included_by_hash.get(tx_hash)
-        if prior is None or included_slot < prior[0]:
-            included_by_hash[tx_hash] = (included_slot, latency_s)
+        if prior is None or included_slot < prior:
+            included_by_hash[tx_hash] = included_slot
 
     horizon_s = followup_slots * max(slot_duration_s, 0.0)
     bounded_latencies = []
@@ -230,10 +232,12 @@ def cohort_inclusion_metrics(
         inclusion_sample = included_by_hash.get(tx_hash)
         if (
             inclusion_sample is not None
-            and inclusion_sample[0] - created_slot <= followup_slots
+            and 0 <= inclusion_sample - created_slot <= followup_slots
         ):
             included_count += 1
-            latency_s = min(inclusion_sample[1], horizon_s)
+            # A duplicate generation can overwrite the birth metadata carried
+            # by the included copy. The cohort clock starts at first submission.
+            latency_s = min((inclusion_sample-created_slot)*max(slot_duration_s,0.0), horizon_s)
             bounded_latencies.append(latency_s)
             completed_latencies.append(latency_s)
         else:

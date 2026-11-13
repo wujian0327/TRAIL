@@ -35,9 +35,11 @@ by this first stage.
 `Transaction::with_fee` currently creates an equal-size distributable fee and
 irrecoverable cost. The originator therefore pays twice the supplied
 `transaction_fee`: one part is split by `theta`, and one part backs score and is
-burned. Experiments that need unequal values should construct transactions with
-`Transaction::with_costs` after the workload generator receives separate CLI
-parameters in the next migration stage.
+burned. `--irrecoverable-cost` overrides the latter independently; transaction
+generation and the fee ledger then charge `F + g`. Omitting the option preserves
+the historical `g = F` convention. `--initial-liquid-balance` sets an independent
+spendable balance for each node without changing its economic stake. The fixed-g
+fee-participation pilot uses both options to avoid funding-constrained demand.
 
 ## Compatibility
 

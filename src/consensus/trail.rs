@@ -5,6 +5,7 @@ use crate::blockchain::Blockchain;
 use crate::consensus::{
     BalanceDelta, Consensus, ConsensusMetricsSnapshot, Validator, ValidatorError,
 };
+use clap::ValueEnum;
 use log::{debug, info};
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
@@ -14,8 +15,24 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const FROZEN_V1_CONFIG_JSON: &str =
     include_str!("../../experiments/configs/protocol_frozen_v1.yaml");
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum RewardPolicy {
+    #[default]
+    Trail,
+    Ersoy,
+}
+
+fn default_ersoy_c() -> f64 {
+    0.25
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrailConfig {
+    #[serde(default)]
+    pub reward_policy: RewardPolicy,
+    #[serde(default = "default_ersoy_c")]
+    pub ersoy_c: f64,
     pub protocol_version: String,
     pub target_depth: usize,
     pub beta: f64,
@@ -42,6 +59,12 @@ impl Default for TrailConfig {
 
 impl TrailConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if !(self.ersoy_c > 0.0 && self.ersoy_c < 1.0) {
+            return Err("ersoy_c must satisfy 0 < C < 1".to_string());
+        }
+        if self.reward_policy == RewardPolicy::Ersoy && self.eta != 0.0 {
+            return Err("Ersoy fee sharing requires eta = 0 (stake-only election)".to_string());
+        }
         if self.protocol_version.trim().is_empty() {
             return Err("protocol_version must not be empty".to_string());
         }
@@ -306,6 +329,9 @@ impl TrailConsensus {
     }
 
     pub fn compute_block_rewards(&self, block: &Block, validators: &[Validator]) -> RewardPlan {
+        if self.config.reward_policy == RewardPolicy::Ersoy {
+            return self.compute_ersoy_rewards(block);
+        }
         let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
         let total_fee: f64 = block.body.transactions.iter().map(|tx| tx.fee).sum();
         let proposer_reward = self.base_reward + self.config.proposer_fee_ratio * total_fee;
@@ -358,6 +384,62 @@ impl TrailConsensus {
             burned_relay_fee,
             total_fee,
         }
+    }
+
+    /// The client v0 pays F. The reward path is v1..vk, including the proposer.
+    /// Ersoy et al. (CVCBT 2018), Theorem 1 and Fig. 1; the routing protocol is
+    /// deliberately not reproduced in this shared-propagation PoS adaptation.
+    pub fn ersoy_fee_share(fee: f64, c: f64, position: usize, k: usize) -> f64 {
+        if position == 0 || position > k || k == 0 {
+            return 0.0;
+        }
+        let remainder = fee * (1.0 - c).powi(position as i32 - 1);
+        if position == k {
+            remainder
+        } else {
+            c * remainder
+        }
+    }
+
+    fn compute_ersoy_rewards(&self, block: &Block) -> RewardPlan {
+        let mut plan = RewardPlan {
+            proposer_reward: self.base_reward,
+            total_fee: block.body.transactions.iter().map(|tx| tx.fee).sum(),
+            ..RewardPlan::default()
+        };
+        for (idx, tx) in block.body.transactions.iter().enumerate() {
+            let Some(path) = block.body.paths.get(idx) else {
+                plan.burned_relay_fee += tx.fee;
+                continue;
+            };
+            if !self.valid_path_record(path, tx, &block.header.miner, block.header.epoch) {
+                plan.burned_relay_fee += tx.fee;
+                continue;
+            }
+            let full_path = path.full_path(block.header.miner.clone());
+            let k = full_path.len().saturating_sub(1);
+            // A proposer-originated transaction has no relay; the proposer
+            // receives the entire fee, as with a direct client-to-proposer path.
+            if k == 0 {
+                plan.proposer_reward += tx.fee;
+                continue;
+            }
+            for (position, address) in full_path.iter().enumerate().skip(1) {
+                let amount = Self::ersoy_fee_share(tx.fee, self.config.ersoy_c, position, k);
+                if position == k {
+                    plan.proposer_reward += amount;
+                } else {
+                    plan.relay_reward += amount;
+                    plan.rewards
+                        .push(BalanceDelta::new(address.clone(), amount));
+                }
+            }
+        }
+        plan.rewards.insert(
+            0,
+            BalanceDelta::new(block.header.miner.clone(), plan.proposer_reward),
+        );
+        plan
     }
 
     fn select_with_frozen_weights(
@@ -543,6 +625,9 @@ impl TrailConsensus {
 }
 
 impl Consensus for TrailConsensus {
+    fn block_reward_plan(&self, block: &Block, validators: &[Validator]) -> Option<RewardPlan> {
+        Some(self.compute_block_rewards(block, validators))
+    }
     fn name(&self) -> &'static str {
         "TRAIL"
     }
@@ -587,6 +672,8 @@ impl Consensus for TrailConsensus {
 
     fn metrics_snapshot(&self) -> ConsensusMetricsSnapshot {
         ConsensusMetricsSnapshot {
+            reward_policy: Some(self.config.reward_policy),
+            ersoy_c: Some(self.config.ersoy_c),
             trail_depth: Some(self.config.target_depth),
             trail_beta: Some(self.config.beta),
             trail_eta: Some(self.config.eta),
@@ -686,6 +773,121 @@ mod tests {
         TrailConfig {
             reward_settlement_depth: 0,
             ..TrailConfig::default()
+        }
+    }
+
+    #[test]
+    fn ersoy_hand_calculated_vectors_and_fee_conservation() {
+        let shares: Vec<f64> = (1..=3)
+            .map(|i| TrailConsensus::ersoy_fee_share(1.0, 0.25, i, 3))
+            .collect();
+        assert_eq!(shares, vec![0.25, 0.1875, 0.5625]);
+        assert_eq!(TrailConsensus::ersoy_fee_share(1.0, 0.25, 1, 1), 1.0);
+        for c in [0.1, 0.25, 0.4] {
+            for k in 1..=16 {
+                let total: f64 = (1..=k)
+                    .map(|i| TrailConsensus::ersoy_fee_share(0.001, c, i, k))
+                    .sum();
+                assert!((total - 0.001).abs() < 1e-15);
+            }
+        }
+    }
+
+    #[test]
+    fn ersoy_settlement_excludes_originator_and_matches_reward_plan() {
+        let origin = Wallet::new();
+        let relay = Wallet::new();
+        let miner = Wallet::new();
+        let (block, validators) = block_with_path(&origin, &relay, &miner, 1.0);
+        let config = TrailConfig {
+            reward_policy: RewardPolicy::Ersoy,
+            eta: 0.0,
+            ..test_config()
+        };
+        let mut consensus = TrailConsensus::new(0.1, config).unwrap();
+        let plan = consensus.block_reward_plan(&block, &validators).unwrap();
+        assert!((plan.proposer_reward - 0.85).abs() < 1e-12);
+        assert!((plan.relay_reward - 0.25).abs() < 1e-12);
+        assert_eq!(plan.burned_relay_fee, 0.0);
+        assert!(!plan.rewards.iter().any(|r| r.address == origin.address));
+        assert_eq!(
+            consensus.distribute_rewards(&block, &validators, HashMap::new()),
+            plan.rewards
+        );
+        let mut invalid = block.clone();
+        invalid.body.paths.clear();
+        let invalid_plan = consensus.compute_block_rewards(&invalid, &validators);
+        assert_eq!(invalid_plan.proposer_reward, 0.1);
+        assert_eq!(invalid_plan.relay_reward, 0.0);
+        assert_eq!(invalid_plan.burned_relay_fee, 1.0);
+    }
+
+    #[test]
+    fn ersoy_direct_and_proposer_originated_transactions_pay_only_proposer() {
+        let origin = Wallet::new();
+        let miner = Wallet::new();
+        let config = TrailConfig {
+            reward_policy: RewardPolicy::Ersoy,
+            eta: 0.0,
+            ..test_config()
+        };
+        let consensus = TrailConsensus::new(0.1, config).unwrap();
+        for source in [&origin, &miner] {
+            let tx = Transaction::with_fee("receiver".into(), 0, 1.0, source.clone());
+            let mut paths = TransactionPaths::new_with_epoch(tx.clone(), 0);
+            if source.address != miner.address {
+                assert!(paths.append_outgoing_hop(miner.address.clone(), source.clone()));
+                assert!(paths.complete_pending_hop(miner.clone()));
+            }
+            let body = Body::new(
+                vec![tx],
+                vec![AggregatedSignedPaths::from_transaction_paths(paths)],
+            );
+            let block = Block::new(
+                1,
+                0,
+                0,
+                Block::gen_genesis_block().header.hash,
+                body,
+                miner.clone(),
+            )
+            .unwrap();
+            let plan = consensus.compute_block_rewards(&block, &validators(&[&origin, &miner]));
+            assert!((plan.proposer_reward - 1.1).abs() < 1e-12);
+            assert_eq!(plan.relay_reward, 0.0);
+            assert_eq!(plan.burned_relay_fee, 0.0);
+        }
+    }
+
+    #[test]
+    fn ersoy_proposer_weights_ignore_contribution_scores() {
+        let config = TrailConfig {
+            reward_policy: RewardPolicy::Ersoy,
+            eta: 0.0,
+            ..test_config()
+        };
+        let mut consensus = TrailConsensus::new(0.1, config.clone()).unwrap();
+        let validators = vec![
+            Validator::new("a".into(), 1.0, 1.0),
+            Validator::new("b".into(), 3.0, 1.0),
+        ];
+        consensus.active_score_history.insert("a".into(), 1e6);
+        consensus.freeze_proposer_weights(&validators);
+        assert_eq!(consensus.frozen_proposer_weights["a"], 0.25);
+        assert_eq!(consensus.frozen_proposer_weights["b"], 0.75);
+        assert!(TrailConfig {
+            eta: 0.5,
+            ..config.clone()
+        }
+        .validate()
+        .is_err());
+        for c in [0.0, 1.0, f64::NAN] {
+            assert!(TrailConfig {
+                ersoy_c: c,
+                ..config.clone()
+            }
+            .validate()
+            .is_err());
         }
     }
 
@@ -871,9 +1073,7 @@ mod tests {
             TrailConsensus::transaction_credit_weight(0.0, reference),
             0.0
         );
-        assert!(
-            (TrailConsensus::transaction_credit_weight(2.5, reference) - 0.25).abs() < 1e-12
-        );
+        assert!((TrailConsensus::transaction_credit_weight(2.5, reference) - 0.25).abs() < 1e-12);
         assert_eq!(
             TrailConsensus::transaction_credit_weight(20.0, reference),
             1.0

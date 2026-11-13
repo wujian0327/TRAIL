@@ -43,7 +43,9 @@ pub struct Node {
     pub offline_until_epoch: Option<u64>,
     pub offline_probability: f64,
     pub sync_in_progress: bool,
-    pub transaction_fee: f64,      // 交易手续费
+    pub transaction_fee: f64, // 交易手续费
+    pub irrecoverable_cost: Option<f64>,
+    pub initial_liquid_balance: Option<f64>,
     pub balance: f64,              // 账户余额
     pub max_tx_per_block: usize,   // 每个区块最大交易数量
     pub consensus: ConsensusType,  // 共识算法类型
@@ -120,6 +122,8 @@ impl Node {
             offline_probability: 0.1,
             sync_in_progress: false,
             transaction_fee: 0.0,
+            irrecoverable_cost: None,
+            initial_liquid_balance: None,
             balance: 0.0,
             max_tx_per_block,
             consensus,
@@ -163,6 +167,8 @@ impl Node {
             offline_probability: 0.1,
             sync_in_progress: false,
             transaction_fee: 0.0,
+            irrecoverable_cost: None,
+            initial_liquid_balance: None,
             balance: 0.0,
             max_tx_per_block,
             consensus,
@@ -227,6 +233,8 @@ impl Node {
             offline_probability: 0.1,
             sync_in_progress: false,
             transaction_fee: 0.0,
+            irrecoverable_cost: None,
+            initial_liquid_balance: None,
             balance: 0.0,
             max_tx_per_block,
             consensus,
@@ -416,6 +424,20 @@ impl Node {
 
     pub fn set_transaction_fee(&mut self, fee: f64) {
         self.transaction_fee = fee;
+    }
+
+    pub fn set_irrecoverable_cost(&mut self, cost: Option<f64>) {
+        self.irrecoverable_cost = cost;
+        for sybil in &mut self.sybil_nodes {
+            sybil.set_irrecoverable_cost(cost);
+        }
+    }
+
+    pub fn set_initial_liquid_balance(&mut self, balance: Option<f64>) {
+        self.initial_liquid_balance = balance;
+        for sybil in &mut self.sybil_nodes {
+            sybil.set_initial_liquid_balance(balance);
+        }
     }
 
     pub fn set_balance(&mut self, balance: f64) {
@@ -768,7 +790,9 @@ impl Node {
                     self_generated_attack,
                 } => {
                     // 检查余额是否充足
-                    let total_transaction_cost = 2.0 * self.transaction_fee;
+                    let irrecoverable_cost =
+                        self.irrecoverable_cost.unwrap_or(self.transaction_fee);
+                    let total_transaction_cost = self.transaction_fee + irrecoverable_cost;
                     if !self.deduct_balance(total_transaction_cost) {
                         warn!(
                             "Node[{}] insufficient balance: {} < {}",
@@ -786,10 +810,11 @@ impl Node {
                         ))
                         .await;
 
-                    let mut transaction = Transaction::with_fee_and_attack_marker(
+                    let mut transaction = Transaction::with_costs_and_attack_marker(
                         to,
                         0,
                         self.transaction_fee,
+                        irrecoverable_cost,
                         self.wallet.clone(),
                         self_generated_attack,
                     );
@@ -939,7 +964,7 @@ impl Node {
                         .copied()
                         .unwrap_or(self.balance); // 如果没有在 stake_map 中找到，保持当前 balance
 
-                    self.set_balance(my_stake);
+                    self.set_balance(self.initial_liquid_balance.unwrap_or(my_stake));
 
                     info!(
                         "Node[{}] with address[{}] becomes validator with stake {} and pow power {}",
@@ -1623,6 +1648,63 @@ mod tests {
 
         assert!(!node.deduct_balance(10.0));
         assert_eq!(node.get_balance(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn generated_transaction_charges_independent_cost_without_changing_stake() {
+        for (cost, expected_g, expected_charge) in
+            [(None, 0.001, 0.002), (Some(0.0001), 0.0001, 0.0011)]
+        {
+            let (world_tx, mut world_rx) = tokio::sync::mpsc::channel(16);
+            let bc = Blockchain::new(Block::gen_genesis_block());
+            let mut node = Node::new(0, 0, 0, bc, world_tx, 100, ConsensusType::Trail, 77);
+            node.set_transaction_fee(0.001);
+            node.set_irrecoverable_cost(cost);
+            node.set_initial_liquid_balance(Some(1.0));
+            let cache = node.transaction_paths_cache.clone();
+            let sender = node.sender.clone();
+            let stakes = HashMap::from([(node.get_address(), 0.01)]);
+            let handle = tokio::spawn(async move {
+                node.run().await;
+            });
+            sender
+                .send(Message::new_become_validator_msg(stakes))
+                .await
+                .unwrap();
+            sender
+                .send(Message::new_generate_transaction_path_msg(
+                    "receiver".into(),
+                ))
+                .await
+                .unwrap();
+            let mut saw_stake = false;
+            let mut saw_charge = false;
+            loop {
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), world_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                match message {
+                    Message::ReceiveBecomeValidator(validator) => {
+                        assert_eq!(validator.stake, 0.01);
+                        saw_stake = true;
+                    }
+                    Message::UpdateAccountBalance { new_balance, .. } => {
+                        assert!((new_balance - (1.0 - expected_charge)).abs() < 1e-12);
+                        saw_charge = true;
+                    }
+                    Message::RecordGeneratedTransaction { .. } => break,
+                    _ => {}
+                }
+            }
+            assert!(saw_stake && saw_charge);
+            let cache = cache.read().await;
+            let transaction = &cache.values().next().unwrap().transaction;
+            assert_eq!(transaction.fee, 0.001);
+            assert_eq!(transaction.irrecoverable_cost, expected_g);
+            handle.abort();
+        }
     }
 
     #[test]

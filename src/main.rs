@@ -4,7 +4,7 @@ use simplelog::{
     ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
 };
 use std::fs::File;
-use trail::consensus::trail::TrailConfig;
+use trail::consensus::trail::{RewardPolicy, TrailConfig};
 use trail::consensus::ConsensusType;
 use trail::network;
 use trail::network::graph::TopologyType;
@@ -94,6 +94,14 @@ struct Args {
     #[clap(long, default_value = "0.00001")]
     transaction_fee: f64,
 
+    /// Irrecoverable transaction cost; omitted preserves the historical g = fee convention
+    #[arg(long)]
+    irrecoverable_cost: Option<f64>,
+
+    /// Initial spendable balance, independent of economic stake
+    #[arg(long)]
+    initial_liquid_balance: Option<f64>,
+
     /// 图拓扑生成种子 (Graph topology generation seed)
     /// 用于固定网络拓扑结构，便于可重复实验
     #[clap(long, default_value = "888")]
@@ -136,6 +144,14 @@ struct Args {
     /// TRAIL EMA update coefficient beta
     #[clap(long)]
     beta: Option<f64>,
+
+    /// Transaction-fee rule under the shared PoS propagation model
+    #[arg(long, value_enum, default_value_t = RewardPolicy::Trail)]
+    reward_policy: RewardPolicy,
+
+    /// Ersoy geometric fee-share parameter, 0 < C < 1
+    #[arg(long, default_value_t = 0.25)]
+    ersoy_c: f64,
 
     /// Frozen TRAIL target depth D
     #[clap(long)]
@@ -332,6 +348,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logger()?;
 
     let mut trail_config = TrailConfig::default();
+    trail_config.reward_policy = args.reward_policy;
+    trail_config.ersoy_c = args.ersoy_c;
+    if args.reward_policy == RewardPolicy::Ersoy {
+        if args.consensus != ConsensusType::Trail {
+            return Err("--reward-policy ersoy requires --consensus trail".into());
+        }
+        trail_config.eta = 0.0;
+    }
     if let Some(value) = args.trail_target_depth {
         trail_config.target_depth = value;
     }
@@ -398,6 +422,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         topology: args.topology,
         gini: args.gini,
         transaction_fee: args.transaction_fee,
+        irrecoverable_cost: args.irrecoverable_cost,
+        initial_liquid_balance: args.initial_liquid_balance,
         graph_seed: args.graph_seed,
         wallet_seed: args.wallet_seed,
         workload_seed: args.workload_seed,

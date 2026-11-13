@@ -1,0 +1,143 @@
+{
+  "suite": "trail_fee_only_duration_500_v2",
+  "protocol_version": "frozen-v1",
+  "acceptance_profile": "ersoy-participation",
+  "build_command": [
+    "cargo",
+    "build",
+    "--release"
+  ],
+  "binary": "target/release/trail",
+  "max_parallel": 4,
+  "timeout_seconds": 7200,
+  "seeds": [
+    203,
+    209
+  ],
+  "defaults": {
+    "run_revision": "fee-only-duration500-v2",
+    "node_num": 100,
+    "sybil_node_num": 0,
+    "fake_node_num": 0,
+    "unstable_node_num": 0,
+    "topology": "ba",
+    "tx_rate": 20,
+    "stake_gini": 0.6,
+    "transaction_fee": 0.0001,
+    "base_reward": 0.1,
+    "reward_reinvestment_rate": 0.0,
+    "slot_duration": 1,
+    "slot_per_epoch": 5,
+    "max_epochs": 500,
+    "warmup_epochs": 100,
+    "max_tx_per_block": 80,
+    "time_scale": 0.05,
+    "trail_target_depth": 4,
+    "beta": 0.8,
+    "trail_saturation_k": 1.0,
+    "trail_score_cost_reference": "1e-05",
+    "trail_score_floor_kappa": 1.0,
+    "trail_bonus_zeta": 1.0,
+    "eta": 0.0,
+    "bonus_cap": 1.0,
+    "proposer_fee_ratio": 0.25,
+    "reward_settlement_depth": 2,
+    "trail_score_activation_delay_epochs": 2,
+    "trail_max_path_hops": 16,
+    "trail_evidence_work_limit": 4096,
+    "trail_challenge_work_limit": 1024,
+    "relay_profile": "active",
+    "adaptive_relay_participation": true,
+    "adaptive_cost_reference": 1.4055695425812074e-07,
+    "adaptive_cost_log_sigma": 0.75,
+    "adaptive_warmup_epochs": 5,
+    "adaptive_update_interval_epochs": 5,
+    "adaptive_update_fraction": 0.1,
+    "adaptive_benefit_ema_alpha": 0.25,
+    "adaptive_switching_hysteresis": 0.1,
+    "adaptive_exploration_fraction": 0.05,
+    "adaptive_followup_epochs": 10,
+    "ersoy_c": 0.25,
+    "irrecoverable_cost": 0.0001,
+    "initial_liquid_balance": 10.0
+  },
+  "experiments": [
+    {
+      "name": "relay_participation",
+      "protocols": [
+        "trail_eta0"
+      ],
+      "adaptive_initial_active_fraction": [
+        0.5
+      ],
+      "adaptive_cost_median_multiplier": [
+        5.0
+      ],
+      "transaction_fee": [
+        0.005,
+        0.01
+      ]
+    }
+  ],
+  "behavior_estimator": "ema_premiums_v2",
+  "fee_points_by_cost": {
+    "5": [
+      0.005,
+      0.01
+    ]
+  },
+  "study_note": "Selected-seed duration diagnostic only: seeds203/209, Fee-only eta=0 theta=0.25, F=0.005/0.01, cost5x. Rerun to500epochs with all economic and behavioral parameters unchanged. Compare windows100-199,200-299,300-399,400-499. Verify original prefix reproduction; do not assume checkpoint continuation. Preserve the existing ten-seed figures.",
+  "reused_runs": 4,
+  "analysis_seeds": [
+    203,
+    209
+  ],
+  "total_analysis_runs": 8,
+  "postprocess_output": "results/processed/trail_fee_only_duration_500_v2",
+  "frozen_inputs": {
+    "experiments/run_experiments.py": "b165cae009ca6070f5c7db3562433366daf8bb5431891c82251ac802bbeacf7e",
+    "experiments/run_fee_cost_probe.py": "2241e71b7370cdcd352b2267552be9d08e39a87371ef36ebb26efcbd049adb76",
+    "experiments/run_fee_participation.py": "8fce622a615447d2428f6f510ca386b21d8f8aabbdf4520e1d1a087349c92526",
+    "experiments/adaptive_participation_report.py": "534673ebdeb66a0177ebeee4e59586e0d8e514a1706fce996be27c37063e7e99",
+    "experiments/adaptive_estimator_audit.py": "63ddb7b002b467edb5813592019c5ad32df4c9e41e896cf9e5f25147a81d8f14",
+    "experiments/ersoy_participation_report.py": "c580ab7e55357ac3a91bbc266acf369c853fea070a820f7f9c525a2395e93eb0",
+    "experiments/fee_participation_report.py": "89b47f5030844821a3d583f4488873d447ea49bbe90663b63b50a240aa831a61",
+    "experiments/trail_compat.py": "0f5b9c5c87d0897a5c27d954ec209bc44e1aef5dbe27377916944f3061e1037b",
+    "experiments/fee_only_duration_diagnostics.py": "67de7d4ae4d830659c0216561dc1f6804961e998159391d53874f9526cdb005b",
+    "experiments/fee_only_duration_postprocess.py": "8716914161767260c9b58eac5fc58eece9f96ea130316078f29e5c9818e687f0",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/run_config.json": "047ed3db98b27938474a88f9717ade4ad44102d14a09645c879373ad072a372a",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/adaptive_relay_metrics.csv": "db8cfac0ce82de08e3a1fb4d3a5be5d3eca5bd9a8e2dcb7dc3a317824e856cad",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/node_epoch_metrics.csv": "272997183f63d594d1d58882f72ae019406bf6babd44be3874d68ff79db35dda",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/generation_samples.csv": "a4f34b66b637474500bc25d58e6410e300c3a22ddf6e1eb0327035fefdf918fb",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/graph.json": "3703cafed14f6127495bf96af1ea7aa0f59a345fae3fdbeb909337ac1308065c",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/experiment_meta.json": "b73b739b583f18fde331cda95b4a2837f66460fa28f963a9f8740ba58eb66788",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/run_summary.json": "04afd0d24fa01b9924654b1fd1a84ab22e3c2a8bdccaf2f537f9b2c5f67c12a0",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/runner_status.json": "aa3a02df8c37afa671de04e494872293a38802036d32c37aa5997a2c99f78e12",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/run_config.json": "400fd2984ce81d00f57ed0cb95e0519f67c5fef9e4168158c4b233900494c029",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/adaptive_relay_metrics.csv": "2b50a3d68c3ed34ff2e3adc7a21a627ef7617ec9e8c36ae3d62e568f4a1451c7",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/node_epoch_metrics.csv": "7a46b8ee3af3b7c063ac2660ba39fdb8860fbec6396c689635b788246de7c655",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/generation_samples.csv": "78a8bd957624f89f3bac0d9dd8abc11557f3423cfc3a045f88b02d2c0ca29134",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/graph.json": "e50a10800296303ce7d6b182440e518f54a23300e873e3a3c05d1f3cae965417",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/experiment_meta.json": "ed2358196e6dd63946f3c58caf0d0d38aea47f3dc60c1e8e93453da5f39a1ef2",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/run_summary.json": "d4cd0fd12d4cedd2a7842ad8d658576956b8ec0151f9cf1aadac7d0126c208dd",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p005/runner_status.json": "e40772fbb4b68c56538b31b73692728590170f1ee44254680ee2b0fbd8c19469",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/run_config.json": "873007d3925434f6c6c7880a8c8c7eb1b86b159f1b145434b5d688d17ebaed6f",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/adaptive_relay_metrics.csv": "fb10e17782448ccd6f342240f66d865cad69f70399ae9d03f251faae428ac5b1",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/node_epoch_metrics.csv": "bd477223ee02295a8556d6fc05ad9104045ae2244ef0580930ae8f6df011a9f8",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/generation_samples.csv": "153372057aaa8f0332e04aef4f53f523e2f259f31d53620a2bf394b622d08356",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/graph.json": "30ff34ffed3490a409c0d0afbd4dd23f552cd11735e1960c7841e7c2bfc62287",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/experiment_meta.json": "72acf5d649753371fb18e87e6b1ede77e2e7f71ca647c6d8b8fb02b1d13d55f8",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/run_summary.json": "5923dbc73448e24e484687c4c72201880221ede9ee53fbec16b8caafd2992ca8",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed1_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/runner_status.json": "54fa698c47a49eeb733489c9353bbf93a5e8d0ff8fc58a264157de40fdde387f",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/run_config.json": "c4a2446061bbcb1c89aca7d536693044070c096d34677920a62aebb79936187a",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/adaptive_relay_metrics.csv": "5d7d8d3335ea14dfba35446351f4e47da81e4a35c0ba12b5b97fd04ca6d99e25",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/node_epoch_metrics.csv": "687701d5404526d956e6fab9f92ca8eb609743f143eee4e2ca59f7d5712311b0",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/generation_samples.csv": "a9c0f5365b2b382fac176997dba58d04b787d681c4553f5dd559d904f88aa724",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/graph.json": "4c8635fd0027f18343faeed382f1bcd0ab923759e1350cda960c0bc72846198f",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/experiment_meta.json": "25d6163a47e5e5c2c23f22b02234cd2b5cf721241a9c18f560cb9e0a003ecb13",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/run_summary.json": "4e3329c5bb0712af7ba715f9d36d04ff9ee22e6ad48e1ab010b6828cd5c51288",
+    "results/raw/trail_four_mechanisms_extra8_v2_cost5/relay_participation/relay-participation_trail-eta0_frozen-v1_seed7_revision-four-figure-extra8-v2_adaptive-initial-active-fraction-0p5_adaptive-cost-median-multiplier-5p0_transaction-fee-0p01/runner_status.json": "9ae076981404ae42ca8b24a2027e83587ba7c5ced76bf55dc773cdfd594f6aa4",
+    "target/release/trail": "489797bf87a01165d8582bed315a95ab9a4326117d43b1b254dba313ecc1a164",
+    "results/processed/trail_four_mechanisms_10seeds_v2/source_runs.csv": "5d79046c80c843bed5e09c44ca000a7ba7b0d663fd7dc7cded92b39a9d1fd892"
+  }
+}

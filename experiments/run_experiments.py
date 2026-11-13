@@ -39,6 +39,7 @@ DIMENSION_KEYS = [
     "padding_identities",
     "trail_target_depth",
     "beta",
+    "ersoy_c",
     "trail_saturation_k",
     "trail_score_cost_reference",
     "trail_score_floor_kappa",
@@ -54,6 +55,7 @@ DIMENSION_KEYS = [
     "outage_validator_ids",
     "outage_common_slot_randomness",
     "attack_mode",
+    "transaction_fee",
 ]
 
 CLI_KEYS = {
@@ -65,6 +67,8 @@ CLI_KEYS = {
     "topology": "--topology",
     "stake_gini": "--gini",
     "transaction_fee": "--transaction-fee",
+    "irrecoverable_cost": "--irrecoverable-cost",
+    "initial_liquid_balance": "--initial-liquid-balance",
     "base_reward": "--base-reward",
     "reward_reinvestment_rate": "--reward-reinvestment-rate",
     "slot_duration": "--slot-duration",
@@ -74,6 +78,8 @@ CLI_KEYS = {
     "max_tx_per_block": "--max-tx-per-block",
     "trail_target_depth": "--trail-target-depth",
     "beta": "--beta",
+    "reward_policy": "--reward-policy",
+    "ersoy_c": "--ersoy-c",
     "trail_saturation_k": "--trail-saturation-k",
     "trail_score_cost_reference": "--trail-score-cost-reference",
     "trail_score_floor_kappa": "--trail-score-floor-kappa",
@@ -172,6 +178,14 @@ def seed_bundle(seed_value: int) -> Dict[str, int]:
 
 
 def protocol_cli(protocol_variant: str) -> Dict[str, Any]:
+    if protocol_variant == "pos":
+        return {"protocol": "pos", "protocol_label": "pos", "eta": 0.0}
+    if protocol_variant == "ersoy_fee":
+        return {"protocol": "trail", "protocol_label": protocol_variant,
+                "reward_policy": "ersoy", "eta": 0.0}
+    if protocol_variant == "trail_no_ema":
+        return {"protocol": "trail", "protocol_label": protocol_variant,
+                "reward_policy": "trail", "beta": 1.0}
     if protocol_variant.startswith("trail_eta"):
         encoded_eta = protocol_variant.removeprefix("trail_eta").replace("p", ".")
         try:

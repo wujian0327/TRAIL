@@ -196,6 +196,10 @@ pub struct SimulationConfig {
     pub topology: TopologyType,
     pub gini: f64,
     pub transaction_fee: f64,
+    #[serde(default)]
+    pub irrecoverable_cost: Option<f64>,
+    #[serde(default)]
+    pub initial_liquid_balance: Option<f64>,
     pub graph_seed: u64,
     pub wallet_seed: u64,
     pub workload_seed: u64,
@@ -235,7 +239,21 @@ pub struct SimulationConfig {
 }
 
 impl SimulationConfig {
+    pub fn effective_irrecoverable_cost(&self) -> f64 {
+        self.irrecoverable_cost.unwrap_or(self.transaction_fee)
+    }
+
     pub fn resolved(mut self) -> Self {
+        assert!(self.transaction_fee.is_finite() && self.transaction_fee >= 0.0);
+        for value in [self.irrecoverable_cost, self.initial_liquid_balance]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                value.is_finite() && value >= 0.0,
+                "transaction cost and initial liquid balance must be finite and nonnegative"
+            );
+        }
         if self.run_id.trim().is_empty() {
             self.run_id = format!("run-{}", crate::tools::get_timestamp());
         }
@@ -253,9 +271,7 @@ impl SimulationConfig {
         {
             self.validator_scale_capacity_penalty = 0.0;
         }
-        if self.trail_scale_capacity_bonus < 0.0
-            || !self.trail_scale_capacity_bonus.is_finite()
-        {
+        if self.trail_scale_capacity_bonus < 0.0 || !self.trail_scale_capacity_bonus.is_finite() {
             self.trail_scale_capacity_bonus = 0.0;
         }
         if self.validator_scale_latency_penalty < 0.0
@@ -268,9 +284,7 @@ impl SimulationConfig {
         {
             self.trail_scale_latency_reduction = 0.0;
         }
-        if self.trail_latency_reduction_s < 0.0
-            || !self.trail_latency_reduction_s.is_finite()
-        {
+        if self.trail_latency_reduction_s < 0.0 || !self.trail_latency_reduction_s.is_finite() {
             self.trail_latency_reduction_s = 0.0;
         }
         self.unstable_fraction = self.unstable_fraction.clamp(0.0, 1.0);
@@ -442,6 +456,8 @@ pub async fn start_network(config: SimulationConfig) {
                 );
                 node.set_failure_seed(config.failure_seed);
                 node.set_transaction_fee(transaction_fee);
+                node.set_irrecoverable_cost(config.irrecoverable_cost);
+                node.set_initial_liquid_balance(config.initial_liquid_balance);
                 node.set_hash_power(hash_power);
                 node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
                 node.simple_print();
@@ -461,6 +477,8 @@ pub async fn start_network(config: SimulationConfig) {
                 );
                 node.set_failure_seed(config.failure_seed);
                 node.set_transaction_fee(transaction_fee);
+                node.set_irrecoverable_cost(config.irrecoverable_cost);
+                node.set_initial_liquid_balance(config.initial_liquid_balance);
                 node.set_hash_power(hash_power);
                 node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
                 node.simple_print();
@@ -481,6 +499,8 @@ pub async fn start_network(config: SimulationConfig) {
                 node.set_node_type(NodeType::Unstable);
                 node.set_offline_probability(offline_probability);
                 node.set_transaction_fee(transaction_fee);
+                node.set_irrecoverable_cost(config.irrecoverable_cost);
+                node.set_initial_liquid_balance(config.initial_liquid_balance);
                 node.set_hash_power(hash_power);
                 node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
                 node.simple_print();
@@ -718,6 +738,12 @@ pub async fn start_network(config: SimulationConfig) {
     world.node_degrees = node_degrees.clone();
     world.node_betweenness = node_betweenness.clone();
     world.configure_adaptive_relay(config.adaptive_relay.clone(), config.failure_seed);
+    if let Some(balance) = config.initial_liquid_balance {
+        let mut balances = world.account_balances.write().await;
+        for address in world.nodes_index.keys() {
+            balances.insert(address.clone(), balance);
+        }
+    }
     info!(
         "Selected {} adversarial validators with target stake fraction {:.3}",
         adversarial_nodes.len(),
@@ -818,6 +844,7 @@ pub async fn start_network(config: SimulationConfig) {
         fee_spent,
         flooding_audit,
         transaction_fee,
+        config.effective_irrecoverable_cost(),
         adversarial_nodes.clone(),
         config.attack_mode,
         config.attack_tx_rate_multiplier,
@@ -884,6 +911,7 @@ struct TransactionGenerator {
     fee_spent: Arc<Mutex<HashMap<String, f64>>>,
     flooding_audit: Arc<Mutex<FloodingAuditState>>,
     transaction_fee: f64,
+    irrecoverable_cost: f64,
     adversarial_nodes: HashSet<String>,
     attack_mode: AttackMode,
     attack_tx_rate_multiplier: f64,
@@ -903,6 +931,7 @@ impl TransactionGenerator {
         fee_spent: Arc<Mutex<HashMap<String, f64>>>,
         flooding_audit: Arc<Mutex<FloodingAuditState>>,
         transaction_fee: f64,
+        irrecoverable_cost: f64,
         adversarial_nodes: HashSet<String>,
         attack_mode: AttackMode,
         attack_tx_rate_multiplier: f64,
@@ -923,6 +952,7 @@ impl TransactionGenerator {
             fee_spent,
             flooding_audit,
             transaction_fee,
+            irrecoverable_cost,
             adversarial_nodes,
             attack_mode,
             attack_tx_rate_multiplier,
@@ -1026,13 +1056,13 @@ impl TransactionGenerator {
             if adversarial_only {
                 audit.attack.attack_tx_submitted += 1;
                 audit.attack.attack_fee_paid += self.transaction_fee;
-                audit.attack.attack_irrecoverable_cost_paid += self.transaction_fee;
+                audit.attack.attack_irrecoverable_cost_paid += self.irrecoverable_cost;
             }
         }
         if let Ok(mut ledger) = self.fee_spent.lock() {
-            // `with_fee` models an equal-size distributable fee and irrecoverable
-            // protocol cost. Both are paid by the transaction originator.
-            *ledger.entry(from).or_insert(0.0) += 2.0 * self.transaction_fee;
+            // The originator pays the distributable fee and the separately
+            // configured irrecoverable cost. Without an override this is 2F.
+            *ledger.entry(from).or_insert(0.0) += self.transaction_fee + self.irrecoverable_cost;
         }
     }
 }

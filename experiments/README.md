@@ -8,6 +8,8 @@ code, and processors used by the maintained TRAIL figures. The repository root
 
 - Security: proposer influence/scaling, transaction flooding, and path checks.
 - Participation: adaptive relay participation and inclusion time.
+- Ersoy comparison: shared-PoS fee-sharing baseline, parameter sensitivity,
+  and score-smoothing ablation; see [setup and metric definitions](../docs/ERSOY_PARTICIPATION.md).
 - Fairness: organic reward concentration and stake reinvestment.
 - Outage resilience: sustained validator outages and score persistence.
 - Devnet: Ethereum PoS and Full TRAIL real-client measurements.

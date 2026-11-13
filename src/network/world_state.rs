@@ -5,7 +5,7 @@ use crate::blockchain::{BlockChainError, Blockchain};
 use crate::consensus::minotaur::MinotaurConsensus;
 use crate::consensus::pos::PosConsensus;
 use crate::consensus::pow::PowConsensus;
-use crate::consensus::trail::{TrailConfig, TrailConsensus};
+use crate::consensus::trail::{RewardPolicy, TrailConfig, TrailConsensus};
 use crate::consensus::{Consensus, ConsensusMetricsSnapshot, ConsensusType, RandaoSeed, Validator};
 use crate::metrics::{
     self, calculate_hhi, calculate_stake_concentration, AttackOnlyMetrics, EpochMetrics,
@@ -53,6 +53,7 @@ pub struct WorldState {
     adaptive_relay_config: AdaptiveRelayConfig,
     adaptive_relay_costs: HashMap<String, f64>,
     adaptive_benefit_ema: Option<f64>,
+    adaptive_benefit_estimator: AdaptiveBenefitEstimator,
     adaptive_observation_window: AdaptiveObservationWindow,
     adaptive_update_round: u64,
     adaptive_failure_seed: u64,
@@ -162,36 +163,93 @@ struct AdaptiveObservationWindow {
     lazy: AdaptiveGroupObservation,
 }
 
+const ADAPTIVE_BENEFIT_ESTIMATOR_VERSION: &str = "ema_premiums_v2";
+
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveBenefitObservation {
+    reward_premium: f64,
+    work_premium: f64,
+}
+
+impl AdaptiveBenefitObservation {
+    fn benefit_per_forward(&self) -> Option<f64> {
+        if !self.reward_premium.is_finite()
+            || !self.work_premium.is_finite()
+            || self.work_premium <= 0.0
+        {
+            return None;
+        }
+        let benefit = self.reward_premium / self.work_premium;
+        benefit.is_finite().then_some(benefit)
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct AdaptiveBenefitEstimator {
+    premiums_ema: Option<AdaptiveBenefitObservation>,
+}
+
+impl AdaptiveBenefitEstimator {
+    fn smoothed_benefit(&self) -> Option<f64> {
+        self.premiums_ema?.benefit_per_forward()
+    }
+
+    fn observe(
+        &mut self,
+        observation: Option<AdaptiveBenefitObservation>,
+        alpha: f64,
+    ) -> Option<f64> {
+        // Forget old evidence on every scheduled observation, including missing
+        // ones. An invalid observation never authorizes an income-based switch.
+        if let Some(previous) = self.premiums_ema.as_mut() {
+            previous.reward_premium *= 1.0 - alpha;
+            previous.work_premium *= 1.0 - alpha;
+        }
+        let observation = observation.filter(|value| value.benefit_per_forward().is_some())?;
+        match self.premiums_ema.as_mut() {
+            Some(previous) => {
+                previous.reward_premium += alpha * observation.reward_premium;
+                previous.work_premium += alpha * observation.work_premium;
+            }
+            None => self.premiums_ema = Some(observation),
+        }
+        // Smooth premiums before dividing. This is a work-premium-weighted
+        // history of benefit ratios, so tiny denominators receive tiny weight.
+        // Negative reward evidence is retained rather than clipped.
+        self.smoothed_benefit()
+    }
+}
+
 impl AdaptiveObservationWindow {
-    fn observed_benefit_per_forward(&self) -> Option<f64> {
+    fn benefit_observation(&self) -> Option<AdaptiveBenefitObservation> {
         let reward_premium =
             self.active.expected_reward_per_stake()? - self.lazy.expected_reward_per_stake()?;
         let work_premium = self.active.forwards_per_stake()? - self.lazy.forwards_per_stake()?;
-        if work_premium > 0.0 && reward_premium.is_finite() {
-            Some(reward_premium / work_premium)
-        } else {
-            None
-        }
+        let observation = AdaptiveBenefitObservation {
+            reward_premium,
+            work_premium,
+        };
+        observation.benefit_per_forward()?;
+        Some(observation)
+    }
+
+    fn observed_benefit_per_forward(&self) -> Option<f64> {
+        self.benefit_observation()?.benefit_per_forward()
     }
 }
 
 fn adaptive_target_profile(
     active: bool,
-    benefit: f64,
+    benefit: Option<f64>,
     cost: f64,
     hysteresis: f64,
     explore_opposite: bool,
 ) -> RelayProfile {
-    let best_response = if active {
-        if benefit < cost * (1.0 - hysteresis) {
-            RelayProfile::Lazy
-        } else {
-            RelayProfile::Active
-        }
-    } else if benefit > cost * (1.0 + hysteresis) {
-        RelayProfile::Active
-    } else {
-        RelayProfile::Lazy
+    let best_response = match benefit {
+        Some(value) if active && value < cost * (1.0 - hysteresis) => RelayProfile::Lazy,
+        Some(value) if !active && value > cost * (1.0 + hysteresis) => RelayProfile::Active,
+        _ if active => RelayProfile::Active,
+        _ => RelayProfile::Lazy,
     };
     if explore_opposite {
         match best_response {
@@ -442,6 +500,7 @@ impl WorldState {
                 adaptive_relay_config: AdaptiveRelayConfig::default(),
                 adaptive_relay_costs: HashMap::new(),
                 adaptive_benefit_ema: None,
+                adaptive_benefit_estimator: AdaptiveBenefitEstimator::default(),
                 adaptive_observation_window: AdaptiveObservationWindow::default(),
                 adaptive_update_round: 0,
                 adaptive_failure_seed: 0,
@@ -512,6 +571,7 @@ impl WorldState {
         self.adaptive_failure_seed = failure_seed;
         self.adaptive_relay_costs.clear();
         self.adaptive_benefit_ema = None;
+        self.adaptive_benefit_estimator = AdaptiveBenefitEstimator::default();
         self.adaptive_observation_window = AdaptiveObservationWindow::default();
         self.adaptive_update_round = 0;
         if !self.adaptive_relay_config.enabled {
@@ -1496,6 +1556,9 @@ impl WorldState {
                 "lazy" => &mut epoch_window.lazy,
                 _ => continue,
             };
+            // Common history-only mean-field estimator for all fee policies.
+            // For Ersoy this averages path-dependent proposer fees; realized
+            // proposer income is recorded separately for model diagnostics.
             let expected_proposer_reward = rewards.total_proposer_reward
                 * proposer_weights
                     .get(&validator.address)
@@ -1535,6 +1598,7 @@ impl WorldState {
                 epoch,
                 false,
                 None,
+                None,
                 0,
                 0,
                 0,
@@ -1548,19 +1612,17 @@ impl WorldState {
 
         let window = std::mem::take(&mut self.adaptive_observation_window);
         let observed_benefit = window.observed_benefit_per_forward();
-        if let Some(observed) = observed_benefit {
-            let alpha = self.adaptive_relay_config.benefit_ema_alpha;
-            self.adaptive_benefit_ema = Some(match self.adaptive_benefit_ema {
-                Some(previous) => alpha * observed + (1.0 - alpha) * previous,
-                None => observed,
-            });
-        }
+        let decision_benefit = self.adaptive_benefit_estimator.observe(
+            window.benefit_observation(),
+            self.adaptive_relay_config.benefit_ema_alpha,
+        );
+        self.adaptive_benefit_ema = self.adaptive_benefit_estimator.smoothed_benefit();
 
         let mut switched_active = 0usize;
         let mut switched_lazy = 0usize;
         let mut exploratory_decisions = 0usize;
         let mut reconsidered_validators = 0usize;
-        if let Some(benefit) = self.adaptive_benefit_ema {
+        {
             let mut candidates: Vec<String> = self.adaptive_relay_costs.keys().cloned().collect();
             candidates.sort_by(|left, right| {
                 self.nodes_index
@@ -1595,8 +1657,13 @@ impl WorldState {
                 if explore_opposite {
                     exploratory_decisions += 1;
                 }
-                let target =
-                    adaptive_target_profile(active, benefit, cost, hysteresis, explore_opposite);
+                let target = adaptive_target_profile(
+                    active,
+                    decision_benefit,
+                    cost,
+                    hysteresis,
+                    explore_opposite,
+                );
                 if active == (target == RelayProfile::Active) {
                     continue;
                 }
@@ -1621,6 +1688,7 @@ impl WorldState {
             epoch,
             true,
             observed_benefit,
+            decision_benefit,
             switched_active,
             switched_lazy,
             exploratory_decisions,
@@ -1670,6 +1738,7 @@ impl WorldState {
         epoch: u64,
         update_applied: bool,
         observed_benefit: Option<f64>,
+        decision_benefit: Option<f64>,
         switched_active: usize,
         switched_lazy: usize,
         exploratory_decisions: usize,
@@ -1698,6 +1767,21 @@ impl WorldState {
             .adaptive_benefit_ema
             .map(|value| format!("{value:.17e}"))
             .unwrap_or_default();
+        let decision = decision_benefit
+            .map(|value| format!("{value:.17e}"))
+            .unwrap_or_default();
+        let observation_valid = update_applied && observed_benefit.is_some();
+        let reward_premium_ema = self
+            .adaptive_benefit_estimator
+            .premiums_ema
+            .map(|value| format!("{:.17e}", value.reward_premium))
+            .unwrap_or_default();
+        let work_premium_ema = self
+            .adaptive_benefit_estimator
+            .premiums_ema
+            .map(|value| format!("{:.17e}", value.work_premium))
+            .unwrap_or_default();
+        let estimator = ADAPTIVE_BENEFIT_ESTIMATOR_VERSION;
         let active_reward = window
             .and_then(|value| value.active.expected_reward_per_stake())
             .map(|value| format!("{value:.17e}"))
@@ -1718,12 +1802,12 @@ impl WorldState {
             if file.metadata().map(|metadata| metadata.len()).unwrap_or(0) == 0 {
                 let _ = writeln!(
                     file,
-                    "epoch,window_epochs,update_applied,active_fraction,active_stake_share,observed_benefit_per_forward,smoothed_benefit_per_forward,active_expected_reward_per_stake,lazy_expected_reward_per_stake,active_forward_attempts_per_stake,lazy_forward_attempts_per_stake,switched_to_active,switched_to_lazy,exploratory_decisions,reconsidered_validators,mean_cost_per_forward"
+                    "epoch,window_epochs,update_applied,active_fraction,active_stake_share,observed_benefit_per_forward,smoothed_benefit_per_forward,active_expected_reward_per_stake,lazy_expected_reward_per_stake,active_forward_attempts_per_stake,lazy_forward_attempts_per_stake,switched_to_active,switched_to_lazy,exploratory_decisions,reconsidered_validators,mean_cost_per_forward,benefit_estimator,benefit_observation_valid,decision_benefit_per_forward,reward_premium_ema,work_premium_ema"
                 );
             }
             let _ = writeln!(
                 file,
-                "{epoch},{window_epochs},{update_applied},{active_fraction:.9},{active_stake_share:.9},{observed},{smoothed},{active_reward},{lazy_reward},{active_work},{lazy_work},{switched_active},{switched_lazy},{exploratory_decisions},{reconsidered_validators},{mean_cost:.17e}"
+                "{epoch},{window_epochs},{update_applied},{active_fraction:.9},{active_stake_share:.9},{observed},{smoothed},{active_reward},{lazy_reward},{active_work},{lazy_work},{switched_active},{switched_lazy},{exploratory_decisions},{reconsidered_validators},{mean_cost:.17e},{estimator},{observation_valid},{decision},{reward_premium_ema},{work_premium_ema}"
             );
             let _ = file.flush();
         }
@@ -1912,8 +1996,7 @@ impl WorldState {
                 for position in 1..path_length {
                     let relayer = &full_path[position];
                     if validator_set.contains(relayer.as_str()) {
-                        let gamma =
-                            TrailConsensus::gamma_for_depth(depth, position, path_length);
+                        let gamma = TrailConsensus::gamma_for_depth(depth, position, path_length);
                         let q = TrailConsensus::transaction_credit_weight(
                             tx.irrecoverable_cost,
                             snapshot.trail_score_cost_reference.unwrap_or(1.0),
@@ -1945,7 +2028,30 @@ impl WorldState {
                 }
                 report.attack_tx_included += 1;
                 if self.adversarial_nodes.contains(&block.header.miner) {
-                    report.attack_proposer_fee_recovery += theta * tx.fee;
+                    let fee_share = if snapshot.reward_policy == Some(RewardPolicy::Ersoy) {
+                        block
+                            .body
+                            .paths
+                            .get(idx)
+                            .filter(|_| block.verify_path_evidence(idx))
+                            .map(|path| {
+                                let k = path
+                                    .full_path(block.header.miner.clone())
+                                    .len()
+                                    .saturating_sub(1)
+                                    .max(1);
+                                TrailConsensus::ersoy_fee_share(
+                                    tx.fee,
+                                    snapshot.ersoy_c.unwrap_or(0.25),
+                                    k,
+                                    k,
+                                )
+                            })
+                            .unwrap_or(0.0)
+                    } else {
+                        theta * tx.fee
+                    };
+                    report.attack_proposer_fee_recovery += fee_share;
                 }
                 let Some(path) = block.body.paths.get(idx) else {
                     continue;
@@ -1972,7 +2078,17 @@ impl WorldState {
                         continue;
                     }
                     let gamma = TrailConsensus::gamma_for_depth(depth, position, path_length);
-                    report.attack_relay_fee_recovery += relay_budget * gamma;
+                    report.attack_relay_fee_recovery +=
+                        if snapshot.reward_policy == Some(RewardPolicy::Ersoy) {
+                            TrailConsensus::ersoy_fee_share(
+                                tx.fee,
+                                snapshot.ersoy_c.unwrap_or(0.25),
+                                position,
+                                path_length,
+                            )
+                        } else {
+                            relay_budget * gamma
+                        };
                     report.attack_coalition_raw_contribution += cost_weight * gamma;
                 }
             }
@@ -1984,62 +2100,32 @@ impl WorldState {
         &self,
         blocks: &[Block],
         validators: &[Validator],
-        snapshot: &ConsensusMetricsSnapshot,
+        _snapshot: &ConsensusMetricsSnapshot,
     ) -> EpochRewardReport {
-        let validator_set: HashSet<&str> = validators.iter().map(|v| v.address.as_str()).collect();
         let mut report = EpochRewardReport::default();
-        let theta = snapshot.trail_proposer_fee_ratio.unwrap_or(1.0);
-        let depth = snapshot.trail_depth.unwrap_or(1);
         for block in blocks {
-            let total_fee: f64 = block.body.transactions.iter().map(|tx| tx.fee).sum();
-            let proposer_reward = if snapshot.trail_depth.is_some() {
-                self.base_reward + theta * total_fee
+            if let Some(plan) = self.consensus.block_reward_plan(block, validators) {
+                *report
+                    .proposer_by_address
+                    .entry(block.header.miner.clone())
+                    .or_insert(0.0) += plan.proposer_reward;
+                report.total_proposer_reward += plan.proposer_reward;
+                report.total_relay_reward += plan.relay_reward;
+                report.burned_relay_fee += plan.burned_relay_fee;
+                for delta in plan.rewards {
+                    if delta.address != block.header.miner {
+                        *report.relay_by_address.entry(delta.address).or_insert(0.0) +=
+                            delta.amount;
+                    }
+                }
             } else {
-                self.base_reward + total_fee
-            };
-            *report
-                .proposer_by_address
-                .entry(block.header.miner.clone())
-                .or_insert(0.0) += proposer_reward;
-            report.total_proposer_reward += proposer_reward;
-
-            if snapshot.trail_depth.is_none() {
-                continue;
-            }
-            for (idx, tx) in block.body.transactions.iter().enumerate() {
-                let relay_budget = (1.0 - theta) * tx.fee;
-                let Some(path) = block.body.paths.get(idx) else {
-                    report.burned_relay_fee += relay_budget;
-                    continue;
-                };
-                if !block.verify_path_evidence(idx) {
-                    report.burned_relay_fee += relay_budget;
-                    continue;
-                }
-                let full_path = path.full_path(block.header.miner.clone());
-                let path_length = full_path.len().saturating_sub(1);
-                if path_length < 2 {
-                    report.burned_relay_fee += relay_budget;
-                    continue;
-                }
-                let mut paid = 0.0;
-                for position in 1..path_length {
-                    let relayer = &full_path[position];
-                    if !validator_set.contains(relayer.as_str()) {
-                        continue;
-                    }
-                    let amount = relay_budget
-                        * TrailConsensus::gamma_for_depth(depth, position, path_length);
-                    if amount > 0.0 {
-                        paid += amount;
-                        *report
-                            .relay_by_address
-                            .entry(relayer.clone())
-                            .or_insert(0.0) += amount;
-                    }
-                }
-                report.total_relay_reward += paid;
-                report.burned_relay_fee += (relay_budget - paid).max(0.0);
+                let proposer_reward =
+                    self.base_reward + block.body.transactions.iter().map(|tx| tx.fee).sum::<f64>();
+                *report
+                    .proposer_by_address
+                    .entry(block.header.miner.clone())
+                    .or_insert(0.0) += proposer_reward;
+                report.total_proposer_reward += proposer_reward;
             }
         }
         report
@@ -2093,7 +2179,16 @@ impl WorldState {
                         continue;
                     }
                     let gamma = TrailConsensus::gamma_for_depth(depth, position, path_length);
-                    let reward = relay_budget * gamma;
+                    let reward = if snapshot.reward_policy == Some(RewardPolicy::Ersoy) {
+                        TrailConsensus::ersoy_fee_share(
+                            tx.fee,
+                            snapshot.ersoy_c.unwrap_or(0.25),
+                            position,
+                            path_length,
+                        )
+                    } else {
+                        relay_budget * gamma
+                    };
                     let contribution = q * gamma;
                     report.relay_reward += reward;
                     report.raw_contribution += contribution;
@@ -2552,15 +2647,15 @@ mod tests {
     #[test]
     fn adaptive_best_response_respects_hysteresis() {
         assert_eq!(
-            adaptive_target_profile(false, 1.2, 1.0, 0.05, false),
+            adaptive_target_profile(false, Some(1.2), 1.0, 0.05, false),
             RelayProfile::Active
         );
         assert_eq!(
-            adaptive_target_profile(true, 0.8, 1.0, 0.05, false),
+            adaptive_target_profile(true, Some(0.8), 1.0, 0.05, false),
             RelayProfile::Lazy
         );
         assert_eq!(
-            adaptive_target_profile(true, 1.0, 1.0, 0.05, false),
+            adaptive_target_profile(true, Some(1.0), 1.0, 0.05, false),
             RelayProfile::Active
         );
     }
@@ -2568,12 +2663,125 @@ mod tests {
     #[test]
     fn adaptive_exploration_tries_opposite_best_response() {
         assert_eq!(
-            adaptive_target_profile(false, 1.2, 1.0, 0.05, true),
+            adaptive_target_profile(false, Some(1.2), 1.0, 0.05, true),
             RelayProfile::Lazy
         );
         assert_eq!(
-            adaptive_target_profile(true, 0.8, 1.0, 0.05, true),
+            adaptive_target_profile(true, Some(0.8), 1.0, 0.05, true),
             RelayProfile::Active
+        );
+    }
+
+    #[test]
+    fn adaptive_premium_ema_downweights_a_tiny_work_difference() {
+        let mut estimator = AdaptiveBenefitEstimator::default();
+        let first = AdaptiveBenefitObservation {
+            reward_premium: 10.0,
+            work_premium: 100.0,
+        };
+        assert_eq!(estimator.observe(Some(first), 0.25), Some(0.1));
+        let weak = AdaptiveBenefitObservation {
+            reward_premium: -0.1,
+            work_premium: 0.001,
+        };
+        let benefit = estimator.observe(Some(weak), 0.25).unwrap();
+        // An EMA of ratios would jump to -24.925 on this observation.
+        assert!((benefit - 7.475 / 75.00025).abs() < 1e-12);
+        assert!(benefit > 0.09);
+    }
+
+    #[test]
+    fn adaptive_missing_observation_cannot_authorize_a_stale_decision() {
+        let mut estimator = AdaptiveBenefitEstimator::default();
+        estimator.observe(
+            Some(AdaptiveBenefitObservation {
+                reward_premium: -2.0,
+                work_premium: 10.0,
+            }),
+            0.25,
+        );
+        assert_eq!(estimator.observe(None, 0.25), None);
+        let decayed = estimator.premiums_ema.unwrap();
+        assert_eq!(decayed.reward_premium, -1.5);
+        assert_eq!(decayed.work_premium, 7.5);
+        assert_eq!(estimator.smoothed_benefit(), Some(-0.2));
+        assert_eq!(
+            adaptive_target_profile(true, None, 1.0, 0.1, false),
+            RelayProfile::Active
+        );
+        assert_eq!(
+            adaptive_target_profile(false, None, 1.0, 0.1, false),
+            RelayProfile::Lazy
+        );
+    }
+
+    #[test]
+    fn adaptive_missing_group_can_be_restored_by_exploration() {
+        assert_eq!(
+            adaptive_target_profile(true, None, 1.0, 0.1, true),
+            RelayProfile::Lazy
+        );
+        assert_eq!(
+            adaptive_target_profile(false, None, 1.0, 0.1, true),
+            RelayProfile::Active
+        );
+    }
+
+    #[test]
+    fn adaptive_estimator_preserves_supported_negative_rewards() {
+        let mut estimator = AdaptiveBenefitEstimator::default();
+        let benefit = estimator.observe(
+            Some(AdaptiveBenefitObservation {
+                reward_premium: -2.0,
+                work_premium: 10.0,
+            }),
+            0.25,
+        );
+        assert_eq!(benefit, Some(-0.2));
+        assert_eq!(
+            adaptive_target_profile(true, benefit, 1.0, 0.1, false),
+            RelayProfile::Lazy
+        );
+    }
+
+    #[test]
+    fn adaptive_estimator_rejects_nonpositive_or_nonfinite_work() {
+        for work_premium in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            let mut estimator = AdaptiveBenefitEstimator::default();
+            assert!(estimator
+                .observe(
+                    Some(AdaptiveBenefitObservation {
+                        reward_premium: 1.0,
+                        work_premium,
+                    }),
+                    0.25,
+                )
+                .is_none());
+            assert!(estimator.premiums_ema.is_none());
+        }
+    }
+
+    #[test]
+    fn adaptive_estimator_alpha_one_recovers_after_missing_evidence() {
+        let mut estimator = AdaptiveBenefitEstimator::default();
+        estimator.observe(
+            Some(AdaptiveBenefitObservation {
+                reward_premium: -2.0,
+                work_premium: 10.0,
+            }),
+            1.0,
+        );
+        assert_eq!(estimator.observe(None, 1.0), None);
+        assert_eq!(estimator.smoothed_benefit(), None);
+        assert_eq!(
+            estimator.observe(
+                Some(AdaptiveBenefitObservation {
+                    reward_premium: 3.0,
+                    work_premium: 10.0,
+                }),
+                1.0,
+            ),
+            Some(0.3)
         );
     }
 

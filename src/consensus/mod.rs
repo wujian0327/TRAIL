@@ -46,6 +46,14 @@ impl Display for ConsensusType {
 }
 
 pub trait Consensus: Send + Sync {
+    /// Same non-mutating reward plan for settlement, accounting and behavior.
+    fn block_reward_plan(
+        &self,
+        _block: &Block,
+        _validators: &[Validator],
+    ) -> Option<trail::RewardPlan> {
+        None
+    }
     fn name(&self) -> &'static str;
     fn select_proposer(
         &mut self,
@@ -89,6 +97,8 @@ pub trait Consensus: Send + Sync {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ConsensusMetricsSnapshot {
+    pub reward_policy: Option<trail::RewardPolicy>,
+    pub ersoy_c: Option<f64>,
     pub trail_depth: Option<usize>,
     pub trail_beta: Option<f64>,
     pub trail_eta: Option<f64>,
