@@ -10,6 +10,38 @@
 今日试验与诊断的原始日志、图表和冻结文件已整体移入该备份目录的 `experiment_results/`，
 原位置已移除；1589个文件逐项SHA256核对通过。昨日10seed四图及其280次运行原始数据保留在原目录。
 
+## 已完成：20seed补跑，seed210–219（2026-11-14 05:29）
+
+用户确认在已有seed200–209基础上补跑210–219，形成20seed完整结果。
+新增280次：四种机制 × 每seed七个场景 × 十个seed；每次200epochs，
+参与均值仍取100–199，纳入时间仍采用50逻辑秒完整随访。
+七个场景为成本5倍下五个fee（0.0001/0.0005/0.001/0.005/0.01），
+以及F=0.001下成本1倍和2倍。Full使用η=0.5、θ=0.25；Ersoy的C=0.25；
+g=0.0001、初始支付余额10、经济stake不再投资，全部沿用原10seed配置。
+
+计划为 `results/batches/participation-20seeds-v2-plan/config.yaml`，
+运行状态为 `results/batches/participation-20seeds-v2/manifest.json`。
+使用原归档二进制 `489797bf87a0...`、8组并发。合并时保留原280次运行，
+不排除seed209，也不以其后来复跑值替换主数据；合计560次运行。
+新输出单独保存到 `results/processed/trail_four_mechanisms_20seeds_v2/`，
+其中 `paper_figures/` 采用 `figures/trail_participation` 的PDF/300dpi PNG格式。
+
+新增280/280次成功，无失败；全部560次运行联合审计通过，核对22400个决策窗口、
+111440个节点权益份额、56000个成本缩放记录和240个交易纳入随访队列。
+保留原280条运行索引及原始数值。20seed均值与逐点95% Student-t区间使用df=19。
+常用目录 `figures/trail_participationV2/` 已同步为完整20seed四图；生成脚本默认读取20seed数据，
+旧10seed图在更新前另行备份，原10seed结果目录继续保留。
+
+随后按用户要求，常用目录中的b图更新为统一排除seed209、212后的18seed敏感性预览，
+四种机制在全部fee点使用相同的18个seed，重算均值及df=17的95%区间，图例与坐标文字保持原样。
+a、c、d仍为完整20seed结果，原始560次运行及完整20seed统计继续保留。
+复现当前b图：`python3 analysis/plot_trail_relay_participation_v2.py --panels b --exclude-seed 209 --exclude-seed 212`。
+省略排除选项可重画完整20seed结果；当前导出范围记录于结果目录的 `publication_export.json`。
+
+Git提交后来源标签发生变化。跨批次合并仍逐个核对实际可执行文件哈希，
+并用历史源码归档与新批次源码快照证明26个源码/依赖/启动器文件逐项一致；
+两组Git来源均记录到审计文件。合并入口为 `experiments/four_mechanism_20seed_report.py`。
+
 ## 已完成：3倍成本敏感性对照（2026-11-13）
 
 按用户要求，只新增Full与Ersoy、seed210、F=0.0001/0.01、成本3倍的4次80epoch运行。

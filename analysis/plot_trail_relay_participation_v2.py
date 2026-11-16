@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Export the original 10-seed four-panel study in trail_participation's style.
+"""Export the 10/20-seed four-panel study in trail_participation's style.
 
 Read reviewed means and pointwise 95% Student-t intervals from plot_data.csv.
 An explicit Fee-only exclusion option provides a labeled panel-b sensitivity
 preview, recomputing that series from the remaining seed rows at every fee.
+The shared exclusion option uses the same seed subset for all mechanisms while
+preserving figure text for layout previews; record exclusions alongside exports.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from scipy.stats import t as student_t
 
 plt = original.plt
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "results/processed/trail_four_mechanisms_10seeds_v2/plot_data.csv"
+DATA = ROOT / "results/processed/trail_four_mechanisms_20seeds_v2/plot_data.csv"
 OUTPUT = ROOT / "figures/trail_participationV2"
 PROTOCOLS = {
     "pos": "PoS",
@@ -34,15 +36,18 @@ STYLES = {
 
 
 def render(data_file: Path, output: Path, *, panels: str = "abcd",
-           fee_only_excluded_seeds: tuple[int, ...] = ()) -> list[Path]:
+           fee_only_excluded_seeds: tuple[int, ...] = (),
+           excluded_seeds: tuple[int, ...] = ()) -> list[Path]:
     with data_file.open(newline="", encoding="utf-8") as handle:
         data = list(csv.DictReader(handle))
     seeds = sorted({int(row["seed"]) for row in data if row["kind"] == "seed"})
-    if seeds != list(range(200, 210)):
-        raise ValueError(f"expected original study seeds 200-209, got {seeds}")
+    if len(seeds) not in (10, 20) or seeds != list(range(200, 200 + len(seeds))):
+        raise ValueError(f"expected study seeds 200-209 or 200-219, got {seeds}")
     excluded = set(fee_only_excluded_seeds)
-    if not excluded.issubset(seeds) or len(seeds) - len(excluded) < 2:
-        raise ValueError("exclusions must be study seeds and leave at least two seeds")
+    shared_excluded = set(excluded_seeds)
+    for selection in [shared_excluded, excluded | shared_excluded]:
+        if not selection.issubset(seeds) or len(seeds) - len(selection) < 2:
+            raise ValueError("exclusions must be study seeds and leave at least two seeds")
     if not panels or set(panels) - set("abcd"):
         raise ValueError("panels must select a, b, c, or d")
     if excluded and "b" not in panels:
@@ -68,22 +73,24 @@ def render(data_file: Path, output: Path, *, panels: str = "abcd",
             means = [float(row["y"]) for row in points]
             cis = [float(row["ci95"]) for row in points]
             series_label = label
-            if panel == "b" and protocol == "trail_eta0" and excluded:
+            curve_excluded = shared_excluded | (excluded if panel == "b" and protocol == "trail_eta0" else set())
+            if curve_excluded:
                 means, cis = [], []
                 for value in x:
                     samples = {
                         int(row["seed"]): float(row["y"]) for row in data
                         if row["panel"] == panel and row["kind"] == "seed"
                         and row["protocol"] == protocol and float(row["x"]) == value
-                        and int(row["seed"]) not in excluded
+                        and int(row["seed"]) not in curve_excluded
                     }
-                    if set(samples) != set(seeds) - excluded:
-                        raise ValueError(f"Fee-only at {value}: incomplete paired seed set")
+                    if set(samples) != set(seeds) - curve_excluded:
+                        raise ValueError(f"{panel}/{protocol} at {value}: incomplete paired seed set")
                     n = len(samples)
                     means.append(statistics.mean(samples.values()))
                     cis.append(float(student_t.ppf(0.975, n-1))
                                * statistics.stdev(samples.values()) / math.sqrt(n))
-                series_label = f"Fee-only ({len(seeds)-len(excluded)} seeds)"
+                if panel == "b" and protocol == "trail_eta0" and excluded:
+                    series_label = f"Fee-only ({len(seeds)-len(curve_excluded)} seeds)"
             if not all(math.isfinite(value) for value in x + means + cis) or min(cis) < 0:
                 raise ValueError(f"{panel}/{protocol}: invalid plot values")
             style = STYLES[label]
@@ -139,9 +146,12 @@ def main() -> None:
     parser.add_argument("--panels", default="abcd", help="Panels to export, e.g. b or abcd")
     parser.add_argument("--fee-only-exclude-seed", type=int, action="append", default=[],
                         help="Panel-b sensitivity preview; omit this seed at every Fee-only fee")
+    parser.add_argument("--exclude-seed", type=int, action="append", default=[],
+                        help="Sensitivity preview; omit this seed from all mechanisms and preserve figure text")
     args = parser.parse_args()
     for path in render(args.data, args.output_dir, panels=args.panels,
-                       fee_only_excluded_seeds=tuple(args.fee_only_exclude_seed)):
+                       fee_only_excluded_seeds=tuple(args.fee_only_exclude_seed),
+                       excluded_seeds=tuple(args.exclude_seed)):
         print(path)
 
 

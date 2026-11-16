@@ -8,6 +8,7 @@ import json
 import math
 import shutil
 import statistics
+import tarfile
 import zipfile
 
 from run_experiments import ROOT
@@ -21,7 +22,42 @@ def read_csv(path):
         return list(csv.DictReader(handle))
 
 
-def main(baseline_suite=None, destination_name='trail_four_figures_v2', extra_suite=None, seed_values=None):
+def extra_suite_plan(extra_suite, extra_suites, new_seeds):
+    """Require disjoint, complete additional seed coverage before reading runs."""
+    sources = dict(extra_suites or {})
+    if extra_suite:
+        assert not sources, 'Use either extra_suite or extra_suites.'
+        sources[extra_suite] = list(new_seeds)
+    assigned = [seed for seeds in sources.values() for seed in seeds]
+    assert len(assigned) == len(set(assigned)), 'Additional seed groups overlap.'
+    assert set(assigned) == set(new_seeds), 'Additional seed groups are incomplete.'
+    return sources
+
+
+def verify_source_equivalence(proof_path, binary_sha256):
+    """Verify archived bytes instead of treating different Git labels as equal."""
+    proof_path = ROOT / proof_path
+    proof = json.loads(proof_path.read_text())
+    assert proof['binary_sha256'] == binary_sha256
+    assert hashlib.sha256((ROOT / proof['binary']).read_bytes()).hexdigest() == binary_sha256
+    archive_path = ROOT / proof['historical_source_archive']
+    assert hashlib.sha256(archive_path.read_bytes()).hexdigest() == proof['historical_source_archive_sha256']
+    snapshot = ROOT / proof['current_source_snapshot']
+    expected = proof['source_sha256']
+    actual_names = {str(p.relative_to(snapshot)) for p in (snapshot/'src').rglob('*.rs')}
+    actual_names.update(['Cargo.toml', 'Cargo.lock', 'experiments/run_experiments.py'])
+    assert actual_names == set(expected), 'Simulator source inventory differs.'
+    with tarfile.open(archive_path) as archive:
+        for name, digest in expected.items():
+            assert hashlib.sha256(archive.extractfile(name).read()).hexdigest() == digest, name
+            assert hashlib.sha256((snapshot/name).read_bytes()).hexdigest() == digest, name
+    return dict(proof=str(proof_path.relative_to(ROOT)) if proof_path.is_relative_to(ROOT) else str(proof_path),
+                proof_sha256=hashlib.sha256(proof_path.read_bytes()).hexdigest(),
+                matching_source_files=len(expected), binary_sha256=binary_sha256)
+
+
+def main(baseline_suite=None, destination_name='trail_four_figures_v2', extra_suite=None, seed_values=None,
+         extra_suites=None, source_equivalence_proof=None):
     destination = ROOT/'results/processed'/destination_name
     fee_root = ROOT/'results/processed/trail_full_theta025_cost5_estimator_v2'
     cost_root = ROOT/'results/processed/trail_cost_participation_estimator_v2'
@@ -60,14 +96,15 @@ def main(baseline_suite=None, destination_name='trail_four_figures_v2', extra_su
             if cost==5:
                 fee_rows.extend(baseline_rows)
             source_csvs.append(baseline_root/'runs.csv')
-    if extra_suite:
+    additional_sources = extra_suite_plan(extra_suite, extra_suites, new_seeds)
+    for additional_suite, additional_seeds in additional_sources.items():
         assert baseline_suite and new_seeds
         for cost in costs:
-            extra_root = ROOT/'results/processed'/f'{extra_suite}_cost{cost:g}'
+            extra_root = ROOT/'results/processed'/f'{additional_suite}_cost{cost:g}'
             extra_rows = read_csv(extra_root/'runs.csv')
-            assert len(extra_rows)==len(protocols)*len(new_seeds)*(len(fees) if cost==5 else 1)
+            assert len(extra_rows)==len(protocols)*len(additional_seeds)*(len(fees) if cost==5 else 1)
             assert {r['protocol'] for r in extra_rows}==set(protocols)
-            assert {int(r['seed']) for r in extra_rows}==set(new_seeds)
+            assert {int(r['seed']) for r in extra_rows}==set(additional_seeds)
             for row in extra_rows:
                 assert float(row['cost_multiplier'])==cost
                 assert float(row['transaction_fee']) in (fees if cost==5 else [.001])
@@ -76,8 +113,6 @@ def main(baseline_suite=None, destination_name='trail_four_figures_v2', extra_su
             if cost==5:
                 fee_rows.extend(extra_rows)
             source_csvs.append(extra_root/'runs.csv')
-    else:
-        assert not new_seeds
     mechanism_labels = dict(trail='Full TRAIL',ersoy_fee='Ersoy (C=0.25)',pos='PoS',trail_eta0='Fee-only')
     cases, fee_keys, cost_keys = {}, [], []
     for rows,keys in [(fee_rows,fee_keys),(cost_rows,cost_keys)]:
@@ -102,7 +137,11 @@ def main(baseline_suite=None, destination_name='trail_four_figures_v2', extra_su
     assert set(cases)==expected_cases
     assert len(fee_keys)==len(set(fee_keys))==len(fees)*len(protocols)*len(seeds)
     assert len(cost_keys)==len(set(cost_keys))==len(costs)*len(protocols)*len(seeds)
-    assert len({(r['git_commit_sha'],r['git_source_diff_sha256']) for r in cases.values()})==1
+    git_provenance = sorted({(r['git_commit_sha'],r['git_source_diff_sha256']) for r in cases.values()})
+    equivalence = None
+    if len(git_provenance) != 1:
+        assert source_equivalence_proof, 'Different Git metadata requires verified source/binary equivalence.'
+        equivalence = verify_source_equivalence(source_equivalence_proof, fee_audit['binary_sha256'])
     assert {k[1] for k in fee_keys}==set(fees) and {k[2] for k in fee_keys}=={5}
     assert {k[1] for k in cost_keys}=={.001} and {k[2] for k in cost_keys}==set(costs)
     reference_keys = [k for k in cost_keys if k[2]==5]
@@ -111,6 +150,7 @@ def main(baseline_suite=None, destination_name='trail_four_figures_v2', extra_su
     maximum_stake_error, stake_checks = 0.0, 0
     raw_hashes = {}
     for key,run in cases.items():
+        verify_binary(run)
         raw = ROOT/run['raw_source']
         config_path = raw/'run_config.json'
         config = json.loads(config_path.read_text())['config']
@@ -284,6 +324,8 @@ def main(baseline_suite=None, destination_name='trail_four_figures_v2', extra_su
     audit = dict(unique_runs=len(cases),epoch_reference_runs=len(reference_keys),fee_runs=len(fee_rows),cost_and_inclusion_runs=len(cost_rows),
         binary_sha256=fee_audit['binary_sha256'],source_csv_sha256={
             str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in source_csvs},
+        git_provenance=[dict(git_commit_sha=commit,git_source_diff_sha256=diff) for commit,diff in git_provenance],
+        source_equivalence=equivalence,
         node_stake_identity_checks=stake_checks,max_stake_share_abs_error=maximum_stake_error,
         normalized_node_cost_checks=normalized_cost_checks,estimator_checks=estimator_checks,
         transaction_latency_checks=latency_checks,raw_source_hashes=raw_hashes,
