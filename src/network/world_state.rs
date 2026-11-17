@@ -11,6 +11,9 @@ use crate::metrics::{
     self, calculate_hhi, calculate_stake_concentration, AttackOnlyMetrics, EpochMetrics,
     FloodingAuditState, NodeEpochMetrics, RunSummary, SlotMetrics,
 };
+use crate::network::coalition::{
+    choose_path, coalition_gamma, CoalitionExperiment, EpochEconomics, SelectionAudit,
+};
 use crate::network::message::Message;
 use crate::network::{calculate_gini, AdaptiveRelayConfig, RelayProfile};
 use crate::tools;
@@ -48,6 +51,7 @@ pub struct WorldState {
     pub nodes_sender: HashMap<String, Sender<Message>>,
     pub node_wallets: HashMap<String, Wallet>,
     pub node_mempools: HashMap<String, Arc<RwLock<HashMap<String, Arc<TransactionPaths>>>>>,
+    pub coalition_experiment: Option<CoalitionExperiment>,
     pub node_relay_profiles: HashMap<String, String>,
     pub node_relay_forward_counters: HashMap<String, Arc<AtomicU64>>,
     adaptive_relay_config: AdaptiveRelayConfig,
@@ -495,6 +499,7 @@ impl WorldState {
                 nodes_sender,
                 node_wallets: HashMap::new(),
                 node_mempools: HashMap::new(),
+                coalition_experiment: None,
                 node_relay_profiles: HashMap::new(),
                 node_relay_forward_counters: HashMap::new(),
                 adaptive_relay_config: AdaptiveRelayConfig::default(),
@@ -758,7 +763,9 @@ impl WorldState {
             }));
         }
         self.consensus.next_slot(&validators, block_index);
-        self.logical_slot_counter.fetch_add(1, Ordering::Relaxed);
+        if self.coalition_experiment.is_none() {
+            self.logical_slot_counter.fetch_add(1, Ordering::Relaxed);
+        }
         let current_slot = self.get_current_slot().await;
         self.update_scheduled_availability(current_slot.current_epoch);
         let selection_seed = current_slot.next_seed;
@@ -820,6 +827,53 @@ impl WorldState {
             .unwrap_or(true);
         let mut produced = false;
         let mut failure_reason = "";
+        if let Some(experiment) = &mut self.coalition_experiment {
+            let preparation_start = Instant::now();
+            if scheduled_online {
+                let pool = experiment.pools.get(&miner_validator.address).unwrap();
+                pool.lock().await.prepare(
+                    current_slot.current_epoch,
+                    current_slot.current_slot,
+                    experiment.max_hops,
+                    validators.iter().map(|v| v.address.clone()).collect(),
+                );
+            }
+            // Only the opt-in mode exposes this slot's workload after the
+            // selected terminal receiver has opened its collection window.
+            let logical_slot = self.logical_slot_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let (reply, completion) = tokio::sync::oneshot::channel();
+            let workload_sender = experiment.workload_sender.as_ref().unwrap();
+            let generation = async {
+                workload_sender
+                    .send(crate::network::coalition::SlotWorkloadRequest {
+                        logical_slot,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| "workload generator disconnected")?;
+                completion
+                    .await
+                    .map_err(|_| "slot generation acknowledgement cancelled")
+            };
+            experiment.generation_batch =
+                match time::timeout(Duration::from_secs(30), generation).await {
+                    Ok(Ok(batch)) => batch,
+                    error => {
+                        error!("Coalition workload generation failed: {:?}", error);
+                        eprintln!(
+                            "Coalition workload generation failed at epoch {} slot {}: {:?}",
+                            current_slot.current_epoch, current_slot.current_slot, error
+                        );
+                        std::process::exit(2);
+                    }
+                };
+            experiment.preparation_ms = preparation_start.elapsed().as_secs_f64() * 1000.0;
+            if scheduled_online {
+                let pool = experiment.pools.get(&miner_validator.address).unwrap();
+                let deadline = pool.lock().await.arm(experiment.window);
+                time::sleep_until(deadline).await;
+            }
+        }
         if !scheduled_online {
             warn!(
                 "Scheduled outage: proposer {} missed epoch {} slot {}",
@@ -963,7 +1017,7 @@ impl WorldState {
     }
 
     async fn build_canonical_block(
-        &self,
+        &mut self,
         miner: &Validator,
         epoch: u64,
         slot: u64,
@@ -979,7 +1033,10 @@ impl WorldState {
             .cloned()
             .ok_or(BlockError::InvalidBlock)?;
 
-        let transaction_paths_to_pack = {
+        let transaction_paths_to_pack = if self.coalition_experiment.is_some() {
+            self.finalize_coalition_candidates(miner, epoch, slot)
+                .await?
+        } else {
             let transaction_paths_cache = mempool.read().await;
             let blockchain = self.blockchain.read().await;
             let mut valid_paths: Vec<Arc<TransactionPaths>> = transaction_paths_cache
@@ -999,7 +1056,7 @@ impl WorldState {
             valid_paths
         };
 
-        if !transaction_paths_to_pack.is_empty() {
+        if self.coalition_experiment.is_none() && !transaction_paths_to_pack.is_empty() {
             let mut transaction_paths_cache = mempool.write().await;
             for paths in &transaction_paths_to_pack {
                 transaction_paths_cache.remove(&paths.transaction.hash);
@@ -1029,9 +1086,151 @@ impl WorldState {
         )
     }
 
+    async fn finalize_coalition_candidates(
+        &mut self,
+        miner: &Validator,
+        epoch: u64,
+        slot: u64,
+    ) -> Result<Vec<Arc<TransactionPaths>>, BlockError> {
+        let snapshot = self.consensus.metrics_snapshot();
+        let depth = snapshot.trail_depth.unwrap();
+        let theta = snapshot.trail_proposer_fee_ratio.unwrap();
+        let cost_reference = snapshot.trail_score_cost_reference.unwrap();
+        let experiment = self.coalition_experiment.as_mut().unwrap();
+        let pool = experiment.pools.get(&miner.address).unwrap().clone();
+        let mut window = pool.lock().await;
+        let mempool = self.node_mempools.get(&miner.address).unwrap();
+        let mut cache = mempool.write().await;
+        let blockchain = self.blockchain.read().await;
+        let pending = std::mem::take(&mut window.candidates);
+        let mut available: Vec<Arc<TransactionPaths>> = cache
+            .values()
+            .filter(|p| !blockchain.exist_transaction(&p.transaction.hash))
+            .cloned()
+            .collect();
+        for (hash, candidates) in &pending {
+            if !cache.contains_key(hash) && !blockchain.exist_transaction(hash) {
+                available.push(candidates[0].clone());
+            }
+        }
+        available.sort_by(|a, b| {
+            b.transaction
+                .fee
+                .total_cmp(&a.transaction.fee)
+                .then_with(|| a.transaction.timestamp.cmp(&b.transaction.timestamp))
+                .then_with(|| a.transaction.hash.cmp(&b.transaction.hash))
+        });
+        available.truncate(self.max_tx_per_block);
+        let selected_hashes: HashSet<String> = available
+            .iter()
+            .map(|p| p.transaction.hash.clone())
+            .collect();
+        let coalition_proposer = self.adversarial_nodes.contains(&miner.address);
+        let favoritism = experiment.uses_favoritism(epoch, coalition_proposer);
+        experiment.pending_audits.clear();
+        let mut packed = Vec::with_capacity(available.len());
+        for existing in available {
+            let hash = &existing.transaction.hash;
+            if cache.contains_key(hash) {
+                packed.push(existing);
+                continue;
+            }
+            let candidates = &pending[hash];
+            let honest_idx = choose_path(candidates, false, &self.adversarial_nodes, depth);
+            let favorite_idx = choose_path(candidates, true, &self.adversarial_nodes, depth);
+            let chosen_idx = if favoritism { favorite_idx } else { honest_idx };
+            let mut chosen = candidates[chosen_idx].as_ref().clone();
+            // The original receipt guard is mandatory and is never cleared.
+            if !chosen.complete_pending_hop(self.node_wallets[&miner.address].clone()) {
+                return Err(BlockError::InvalidBlock);
+            }
+            let certificate = AggregatedSignedPaths::from_transaction_paths(chosen.clone());
+            if !certificate.verify_at_epoch_uncached(
+                chosen.transaction.clone(),
+                miner.address.clone(),
+                epoch,
+            ) {
+                return Err(BlockError::InvalidBlock);
+            }
+            let honest = &candidates[honest_idx];
+            let favorite = &candidates[favorite_idx];
+            let h_gamma = coalition_gamma(honest, &self.adversarial_nodes, depth);
+            let f_gamma = coalition_gamma(favorite, &self.adversarial_nodes, depth);
+            let relay_budget = (1.0 - theta) * chosen.transaction.fee;
+            let q = TrailConsensus::transaction_credit_weight(
+                chosen.transaction.irrecoverable_cost,
+                cost_reference,
+            );
+            let honest_nodes: HashSet<String> = window
+                .validators
+                .difference(&self.adversarial_nodes)
+                .cloned()
+                .collect();
+            let honest_loss = relay_budget
+                * (coalition_gamma(honest, &honest_nodes, depth)
+                    - coalition_gamma(favorite, &honest_nodes, depth));
+            experiment.pending_audits.push(SelectionAudit {
+                epoch,
+                slot,
+                proposer: miner.address.clone(),
+                coalition_proposer,
+                phase: experiment.phase(epoch).to_string(),
+                applied_rule: if favoritism { "favoritism" } else { "honest" }.to_string(),
+                tx_hash: hash.clone(),
+                candidate_count: candidates.len(),
+                eligible: coalition_proposer && candidates.len() >= 2,
+                would_change: honest_idx != favorite_idx,
+                effective_change: chosen_idx != honest_idx,
+                honest_path: honest.node_sequence(),
+                favoritism_path: favorite.node_sequence(),
+                selected_path: chosen.node_sequence(),
+                honest_coalition_relay_reward: relay_budget * h_gamma,
+                favoritism_coalition_relay_reward: relay_budget * f_gamma,
+                honest_coalition_raw_contribution: q * h_gamma,
+                favoritism_coalition_raw_contribution: q * f_gamma,
+                local_honest_relay_reward_loss: honest_loss,
+                candidate_prefixes: candidates.clone(),
+                selected_certificate: certificate,
+            });
+            let chosen = Arc::new(chosen);
+            cache.insert(hash.clone(), chosen.clone());
+            packed.push(chosen);
+        }
+        // Candidates beyond block capacity return to ordinary first-receipt
+        // propagation, using the honest choice in BOTH arms. Only included
+        // transactions can be affected by the malicious selector.
+        let mut resume = Vec::new();
+        for (hash, candidates) in pending {
+            if !selected_hashes.contains(&hash)
+                && !cache.contains_key(&hash)
+                && !blockchain.exist_transaction(&hash)
+            {
+                let idx = choose_path(&candidates, false, &self.adversarial_nodes, depth);
+                resume.push(candidates[idx].clone());
+            }
+        }
+        experiment.rejected += window.rejected;
+        experiment.capped += window.capped;
+        experiment.write_window(&window, &miner.address);
+        window.collecting = false;
+        drop(blockchain);
+        drop(cache);
+        drop(window);
+        for path in resume {
+            let from = path.paths.last().unwrap().from.clone();
+            self.nodes_sender[&miner.address]
+                .try_send(Message::new_transaction_paths_msg(path, from))
+                .expect("unpacked candidates must resume ordinary propagation");
+        }
+        Ok(packed)
+    }
+
     async fn apply_canonical_block(&mut self, block: &Block) -> Result<(), BlockChainError> {
         {
             self.blockchain.write().await.add_block(block.clone())?;
+        }
+        if let Some(experiment) = &mut self.coalition_experiment {
+            experiment.accept_block(block);
         }
         self.block_production_success += 1;
 
@@ -1393,6 +1592,44 @@ impl WorldState {
             .map(|ledger| ledger.clone())
             .unwrap_or_default();
         let raw_contribution = self.raw_epoch_contribution(&epoch_blocks, validators, &snapshot);
+        if let Some(experiment) = &mut self.coalition_experiment {
+            let coalition_sum = |values: &HashMap<String, f64>| {
+                self.adversarial_nodes
+                    .iter()
+                    .map(|address| values.get(address).copied().unwrap_or(0.0))
+                    .sum::<f64>()
+            };
+            let relay_reward = coalition_sum(&reward_report.relay_by_address);
+            let proposer_reward = coalition_sum(&reward_report.proposer_by_address);
+            let transaction_cost = experiment
+                .payments
+                .lock()
+                .unwrap()
+                .get(&epoch)
+                .copied()
+                .unwrap_or(0.0);
+            let rejected_candidates = std::mem::take(&mut experiment.rejected);
+            let capped_candidates = std::mem::take(&mut experiment.capped);
+            experiment.write_economics(&EpochEconomics {
+                epoch,
+                phase: experiment.phase(epoch).to_string(),
+                selection: experiment.selection.to_string(),
+                relay_reward,
+                proposer_reward,
+                transaction_cost,
+                modeled_net_income: relay_reward + proposer_reward - transaction_cost,
+                raw_contribution: coalition_sum(&raw_contribution),
+                honest_relay_reward: reward_report.total_relay_reward - relay_reward,
+                proposer_weight_share: adversary_proposer_weight_share,
+                next_epoch_expected_base_proposer_reward: self.slot_per_epoch as f64
+                    * self.base_reward
+                    * adversary_proposer_weight_share,
+                actual_stake_share: adversary_real_stake_share,
+                theoretical_weight_bound: theoretical_proposer_weight_bound,
+                rejected_candidates,
+                capped_candidates,
+            });
+        }
         let mut epoch_forward_attempts = HashMap::new();
         for validator in validators {
             let cumulative = self
@@ -1894,6 +2131,15 @@ impl WorldState {
     }
 
     async fn write_run_summary(&self, completed_epochs: u64) {
+        if let Some(experiment) = &self.coalition_experiment {
+            let payments = experiment.payments.lock().unwrap().clone();
+            let path = self
+                .run_summary_filename
+                .parent()
+                .unwrap()
+                .join("coalition_actual_payments.json");
+            std::fs::write(path, serde_json::to_vec_pretty(&payments).unwrap()).unwrap();
+        }
         let fee_spent = self
             .fee_spent
             .lock()
@@ -2610,6 +2856,193 @@ mod tests {
     use crate::blockchain::Blockchain;
     use crate::network::node::{Neighbor, Node};
     use log::info;
+
+    /// A real four-validator diamond, delivered through the ordinary node
+    /// message handlers. This is an integration test, not a simulation batch.
+    async fn coalition_diamond(
+        selection: crate::network::coalition::CoalitionPathSelection,
+    ) -> f64 {
+        use crate::network::coalition::{CandidateWindow, CoalitionExperiment};
+        let origin = Wallet::new();
+        let mut relays = [Wallet::new(), Wallet::new()];
+        relays.sort_by(|a, b| a.address.cmp(&b.address));
+        let miner = Wallet::new();
+        let genesis = Block::gen_genesis_block();
+        let blockchain = Blockchain::new(genesis.clone());
+        let directory =
+            std::env::temp_dir().join(format!("trail-coalition-test-{}", miner.address));
+        let config = TrailConfig::default();
+        let (mut world, sender, _receiver) = WorldState::new(
+            genesis,
+            ConsensusType::Trail,
+            blockchain.clone(),
+            1,
+            5,
+            20,
+            8,
+            config.clone(),
+            0.1,
+            0.0,
+            4,
+            20,
+            "diamond".to_string(),
+            2,
+            80,
+            directory.clone(),
+            "coalition-test".to_string(),
+            1,
+            false,
+            0.05,
+            0.0,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(FloodingAuditState::default())),
+        );
+        assert!(world.coalition_experiment.is_none());
+        let mut experiment =
+            CoalitionExperiment::new(&directory, selection, Duration::from_secs(1), 0, 1);
+        let pool = Arc::new(tokio::sync::Mutex::new(CandidateWindow::default()));
+        let wallets = [
+            origin.clone(),
+            relays[0].clone(),
+            relays[1].clone(),
+            miner.clone(),
+        ];
+        pool.lock().await.open(
+            0,
+            Instant::now() + Duration::from_secs(10),
+            16,
+            wallets.iter().map(|w| w.address.clone()).collect(),
+        );
+        let mut proposer = Node::new_with_wallet(
+            3,
+            0,
+            0,
+            blockchain.clone(),
+            miner.clone(),
+            sender.clone(),
+            80,
+            ConsensusType::Trail,
+        );
+        assert!(proposer.coalition_candidates.is_none());
+        proposer.coalition_candidates = Some(pool.clone());
+        let proposer_sender = proposer.sender.clone();
+        world
+            .node_wallets
+            .insert(miner.address.clone(), miner.clone());
+        world.node_mempools.insert(
+            miner.address.clone(),
+            proposer.transaction_paths_cache.clone(),
+        );
+        world
+            .nodes_sender
+            .insert(miner.address.clone(), proposer_sender.clone());
+        experiment.pools.insert(miner.address.clone(), pool.clone());
+        world.coalition_experiment = Some(experiment);
+        world
+            .adversarial_nodes
+            .extend([relays[1].address.clone(), miner.address.clone()]);
+        let validators: Vec<Validator> = wallets
+            .iter()
+            .map(|w| Validator::new(w.address.clone(), 1.0, 1.0))
+            .collect();
+        let tx = Transaction::with_costs(miner.address.clone(), 0, 0.001, 0.00001, origin.clone());
+        let mut handles = vec![tokio::spawn(async move {
+            proposer.run().await;
+        })];
+        for (i, relay) in relays.iter().enumerate() {
+            let mut node = Node::new_with_wallet(
+                i as u32 + 1,
+                0,
+                0,
+                blockchain.clone(),
+                relay.clone(),
+                sender.clone(),
+                80,
+                ConsensusType::Trail,
+            );
+            node.relay_profile = RelayProfile::Active;
+            node.tx_propagation_delay = 0;
+            node.neighbors.push(Neighbor::new(
+                3,
+                miner.address.clone(),
+                proposer_sender.clone(),
+            ));
+            let relay_sender = node.sender.clone();
+            handles.push(tokio::spawn(async move {
+                node.run().await;
+            }));
+            let mut path = TransactionPaths::new_with_epoch(tx.clone(), 0);
+            assert!(path.append_outgoing_hop(relay.address.clone(), origin.clone()));
+            relay_sender
+                .send(Message::new_transaction_paths_msg(
+                    Arc::new(path),
+                    origin.address.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if pool.lock().await.candidates.get(&tx.hash).map(Vec::len) == Some(2) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both genuine relay paths must reach the proposer before signing");
+        assert!(world.node_mempools[&miner.address].read().await.is_empty());
+        let prefixes = pool.lock().await.candidates[&tx.hash].clone();
+        assert!(prefixes
+            .iter()
+            .all(|p| p.verify_pending_prefix(&miner.address, 0, 16)));
+        assert_eq!(conflicting_receipt_count(&tx.hash, 0, &miner.address), 0);
+        let block = world
+            .build_canonical_block(&validators[3], 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(block.body.transactions.len(), 1);
+        assert!(block.verify_path_evidence(0));
+        assert!(block.verify());
+        let audit = &world.coalition_experiment.as_ref().unwrap().pending_audits[0];
+        assert_eq!(audit.candidate_count, 2);
+        assert!(audit.eligible && audit.would_change);
+        assert_eq!(
+            audit.effective_change,
+            selection == crate::network::coalition::CoalitionPathSelection::Favoritism
+        );
+        assert!(audit.favoritism_coalition_relay_reward > audit.honest_coalition_relay_reward);
+        assert_eq!(conflicting_receipt_count(&tx.hash, 0, &miner.address), 0);
+        world.apply_canonical_block(&block).await.unwrap();
+        let plan = world
+            .consensus
+            .block_reward_plan(&block, &validators)
+            .unwrap();
+        let income = plan
+            .rewards
+            .iter()
+            .filter(|r| world.adversarial_nodes.contains(&r.address))
+            .map(|r| r.amount)
+            .sum();
+        let audit_lines =
+            std::fs::read_to_string(directory.join("coalition_path_selections.jsonl")).unwrap();
+        assert_eq!(audit_lines.lines().count(), 1);
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+        income
+    }
+
+    #[tokio::test]
+    async fn coalition_real_candidates_produce_valid_blocks_and_incremental_income() {
+        use crate::network::coalition::CoalitionPathSelection;
+        let honest_income = coalition_diamond(CoalitionPathSelection::Honest).await;
+        let favoritism_income = coalition_diamond(CoalitionPathSelection::Favoritism).await;
+        assert!(favoritism_income > honest_income);
+    }
 
     #[test]
     fn adaptive_window_uses_reward_premium_over_extra_work() {

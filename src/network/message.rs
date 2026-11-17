@@ -18,6 +18,7 @@ pub enum Message {
     GenerateTransactionPaths {
         to: String,
         self_generated_attack: bool,
+        generation_ack: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     RecordGeneratedTransaction {
         tx_hash: String,
@@ -78,6 +79,7 @@ impl Message {
         Message::GenerateTransactionPaths {
             to,
             self_generated_attack: false,
+            generation_ack: None,
         }
     }
 
@@ -85,6 +87,7 @@ impl Message {
         Message::GenerateTransactionPaths {
             to,
             self_generated_attack: true,
+            generation_ack: None,
         }
     }
 

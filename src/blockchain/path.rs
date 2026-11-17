@@ -191,6 +191,25 @@ impl TransactionPaths {
         self.verify_pending_sender_signature()
     }
 
+    /// Check an authentic incoming prefix without creating a receiving proof.
+    /// Used only by the opt-in proposer candidate-collection experiment.
+    pub fn verify_pending_prefix(&self, receiver: &str, epoch: u64, max_hops: usize) -> bool {
+        if self.epoch != epoch
+            || self.chain_id != DEFAULT_TRAIL_CHAIN_ID
+            || self.paths.is_empty()
+            || self.paths.len() > max_hops
+            || self.current_tail() != receiver
+            || self.has_repeated_identities()
+            || !self.transaction.verify()
+        {
+            return false;
+        }
+        let last = self.paths.len() - 1;
+        self.paths[last].receiver_signature.is_none()
+            && (0..last).all(|idx| self.verify_hop(idx, true))
+            && self.verify_hop(last, false)
+    }
+
     pub fn verify_completed_hops(&self) -> bool {
         for (idx, hop) in self.paths.iter().enumerate() {
             if hop.receiver_signature.is_none() {
@@ -778,26 +797,13 @@ mod tests {
         clear_receipt_cache_for_tests();
         let origin = Wallet::new_deterministic(9001, 0);
         let relay = Wallet::new_deterministic(9001, 1);
-        let transaction = Transaction::with_costs(
-            relay.address.clone(),
-            1,
-            1.0,
-            1.0,
-            origin.clone(),
-        );
+        let transaction =
+            Transaction::with_costs(relay.address.clone(), 1, 1.0, 1.0, origin.clone());
         let mut paths = TransactionPaths::new_with_epoch(transaction.clone(), 3);
-        assert!(paths.append_completed_hop(
-            relay.address.clone(),
-            origin,
-            relay.clone(),
-        ));
+        assert!(paths.append_completed_hop(relay.address.clone(), origin, relay.clone(),));
         let mut aggregate = paths.to_aggregated_signed_paths();
         aggregate.signature = "0x00".to_string();
-        assert!(!aggregate.verify_at_epoch_uncached(
-            transaction,
-            relay.address,
-            3,
-        ));
+        assert!(!aggregate.verify_at_epoch_uncached(transaction, relay.address, 3,));
     }
 
     #[test]
@@ -805,30 +811,13 @@ mod tests {
         clear_receipt_cache_for_tests();
         let origin = Wallet::new_deterministic(9002, 0);
         let relay = Wallet::new_deterministic(9002, 1);
-        let transaction = Transaction::with_costs(
-            relay.address.clone(),
-            1,
-            1.0,
-            1.0,
-            origin.clone(),
-        );
+        let transaction =
+            Transaction::with_costs(relay.address.clone(), 1, 1.0, 1.0, origin.clone());
         let mut paths = TransactionPaths::new_with_epoch(transaction.clone(), 4);
-        assert!(paths.append_completed_hop(
-            relay.address.clone(),
-            origin,
-            relay.clone(),
-        ));
+        assert!(paths.append_completed_hop(relay.address.clone(), origin, relay.clone(),));
         let aggregate = paths.to_aggregated_signed_paths();
-        assert!(aggregate.verify_at_epoch(
-            transaction.clone(),
-            relay.address.clone(),
-            4,
-        ));
-        assert!(aggregate.verify_at_epoch_uncached(
-            transaction,
-            relay.address,
-            4,
-        ));
+        assert!(aggregate.verify_at_epoch(transaction.clone(), relay.address.clone(), 4,));
+        assert!(aggregate.verify_at_epoch_uncached(transaction, relay.address, 4,));
     }
 
     #[test]

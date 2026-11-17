@@ -123,6 +123,10 @@ CLI_KEYS = {
     "attack_mode": "--attack-mode",
     "padding_identities": "--padding-identities",
     "attack_tx_rate_multiplier": "--attack-tx-rate-multiplier",
+    "coalition_path_selection": "--coalition-path-selection",
+    "coalition_candidate_window_ms": "--coalition-candidate-window-ms",
+    "coalition_attack_start_epoch": "--coalition-attack-start-epoch",
+    "coalition_attack_end_epoch": "--coalition-attack-end-epoch",
 }
 
 EXPERIMENT_OVERRIDE_KEYS = set(CLI_KEYS) | {
@@ -223,14 +227,17 @@ def expand_runs(spec: Dict[str, Any], only: Iterable[str] | None = None) -> List
         if only_set and name not in only_set:
             continue
         protocols = experiment.get("protocols", [defaults.get("protocol", "trail")])
+        dimension_keys = DIMENSION_KEYS + (
+            ["coalition_path_selection"] if "coalition_path_selection" in experiment else []
+        )
         experiment_overrides = {
             key: experiment[key]
             for key in EXPERIMENT_OVERRIDE_KEYS
-            if key in experiment and key not in DIMENSION_KEYS
+            if key in experiment and key not in dimension_keys
         }
         dimensions = {
             key: as_list(experiment[key])
-            for key in DIMENSION_KEYS
+            for key in dimension_keys
             if key in experiment and key != "attack_mode"
         }
         if "attack_mode" in experiment:

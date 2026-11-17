@@ -25,6 +25,7 @@ use std::{fmt, fmt::Display};
 use tokio::sync::mpsc::Sender;
 use tokio::time;
 
+pub mod coalition;
 pub mod graph;
 pub mod message;
 pub mod node;
@@ -236,6 +237,24 @@ pub struct SimulationConfig {
     pub attack_mode: AttackMode,
     pub padding_identities: u32,
     pub attack_tx_rate_multiplier: f64,
+    #[serde(default)]
+    pub coalition_path_selection: coalition::CoalitionPathSelection,
+    #[serde(default = "default_candidate_window_ms")]
+    pub coalition_candidate_window_ms: u64,
+    #[serde(default = "default_coalition_attack_start")]
+    pub coalition_attack_start_epoch: u64,
+    #[serde(default = "default_coalition_attack_end")]
+    pub coalition_attack_end_epoch: u64,
+}
+
+fn default_candidate_window_ms() -> u64 {
+    1000
+}
+fn default_coalition_attack_start() -> u64 {
+    10
+}
+fn default_coalition_attack_end() -> u64 {
+    50
 }
 
 impl SimulationConfig {
@@ -244,6 +263,32 @@ impl SimulationConfig {
     }
 
     pub fn resolved(mut self) -> Self {
+        if self.coalition_path_selection != coalition::CoalitionPathSelection::Off {
+            assert!(
+                self.consensus == ConsensusType::Trail,
+                "coalition path selection requires TRAIL"
+            );
+            assert!(
+                self.trail_config.reward_policy == crate::consensus::trail::RewardPolicy::Trail,
+                "coalition path selection uses the original TRAIL reward policy"
+            );
+            assert!(
+                self.attack_mode == AttackMode::None,
+                "coalition path selection cannot be combined with other attacks"
+            );
+            assert!(
+                self.sybil_node_num == 0
+                    && self.effective_unstable_node_num() == 0
+                    && !self.adaptive_relay.enabled
+                    && self.outage_validator_ids.trim().is_empty(),
+                "coalition path selection requires ordinary online validators"
+            );
+            assert!(
+                self.coalition_candidate_window_ms > 0
+                    && self.coalition_attack_start_epoch < self.coalition_attack_end_epoch,
+                "coalition collection window and attack interval must be positive"
+            );
+        }
         assert!(self.transaction_fee.is_finite() && self.transaction_fee >= 0.0);
         for value in [self.irrecoverable_cost, self.initial_liquid_balance]
             .into_iter()
@@ -714,7 +759,12 @@ pub async fn start_network(config: SimulationConfig) {
                 .insert(sybil.get_address(), sybil.relay_profile.to_string());
         }
     }
-    let node_betweenness = approximate_betweenness(&graph);
+    let node_betweenness =
+        if config.coalition_path_selection != coalition::CoalitionPathSelection::Off {
+            coalition::betweenness(&graph)
+        } else {
+            approximate_betweenness(&graph)
+        };
     let mut adversarial_nodes = select_adversarial_nodes(
         &stake_map_from_nodes(&node_map, &stake_values),
         &node_degrees,
@@ -735,6 +785,44 @@ pub async fn start_network(config: SimulationConfig) {
         }
     }
     world.adversarial_nodes = adversarial_nodes.clone();
+    let mut coalition_slot_requests = None;
+    if config.coalition_path_selection != coalition::CoalitionPathSelection::Off {
+        let mut experiment = coalition::CoalitionExperiment::new(
+            &output_dir,
+            config.coalition_path_selection,
+            config.scaled_duration(Duration::from_millis(config.coalition_candidate_window_ms)),
+            config.coalition_attack_start_epoch,
+            config.coalition_attack_end_epoch,
+        );
+        experiment.max_hops = config
+            .trail_config
+            .max_path_hops
+            .min(config.trail_config.evidence_work_limit / 2);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        experiment.workload_sender = Some(sender);
+        coalition_slot_requests = Some(receiver);
+        let initial_stakes: std::collections::BTreeMap<_, _> =
+            stake_map_from_nodes(&node_map, &stake_values)
+                .into_iter()
+                .collect();
+        std::fs::write(
+            output_dir.join("initial_stakes.json"),
+            serde_json::to_vec_pretty(&initial_stakes).unwrap(),
+        )
+        .unwrap();
+        for (address, node) in node_map.iter_mut() {
+            let pool = Arc::new(tokio::sync::Mutex::new(coalition::CandidateWindow {
+                arrival_log: Some(experiment.arrival_log.clone()),
+                ..coalition::CandidateWindow::default()
+            }));
+            node.coalition_candidates = Some(pool.clone());
+            experiment.pools.insert(address.clone(), pool);
+            if adversarial_nodes.contains(address) {
+                node.coalition_payments = Some(experiment.payments.clone());
+            }
+        }
+        world.coalition_experiment = Some(experiment);
+    }
     world.node_degrees = node_degrees.clone();
     world.node_betweenness = node_betweenness.clone();
     world.configure_adaptive_relay(config.adaptive_relay.clone(), config.failure_seed);
@@ -849,6 +937,7 @@ pub async fn start_network(config: SimulationConfig) {
         config.attack_mode,
         config.attack_tx_rate_multiplier,
     );
+    tg.slot_requests = coalition_slot_requests;
 
     let t = tokio::spawn(async move {
         info!(
@@ -915,6 +1004,7 @@ struct TransactionGenerator {
     adversarial_nodes: HashSet<String>,
     attack_mode: AttackMode,
     attack_tx_rate_multiplier: f64,
+    slot_requests: Option<tokio::sync::mpsc::Receiver<coalition::SlotWorkloadRequest>>,
 }
 
 impl TransactionGenerator {
@@ -956,58 +1046,105 @@ impl TransactionGenerator {
             adversarial_nodes,
             attack_mode,
             attack_tx_rate_multiplier,
+            slot_requests: None,
         }
     }
 
     async fn run(&mut self) {
+        if let Some(mut requests) = self.slot_requests.take() {
+            while let Some(request) = requests.recv().await {
+                assert_eq!(
+                    self.last_logical_slot + 1,
+                    request.logical_slot,
+                    "opt-in slot workloads must be generated exactly once in order"
+                );
+                let (mut batch, completions) =
+                    self.generate_through_slot(request.logical_slot, true).await;
+                for completion in join_all(completions).await {
+                    if matches!(completion, Ok(true)) {
+                        batch.generated += 1;
+                    }
+                }
+                batch.rejected = batch.sampled - batch.generated;
+                let _ = request.reply.send(batch);
+            }
+            return;
+        }
         let mut interval = time::interval(self.time_interval);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
         loop {
             interval.tick().await;
             let observed_slot = self.logical_slot_counter.load(Ordering::Relaxed);
-            while self.last_logical_slot < observed_slot {
-                self.last_logical_slot += 1;
-                let lambda =
-                    self.trans_num_per_interval as f64 * self.logical_slot_duration_secs.max(0.0);
-                if lambda <= 0.0 {
-                    continue;
-                }
-                // 泊松分布生成器：每个逻辑 slot 采样一次，避免真实时间变慢时 workload 继续堆积。
-                let poisson = Poisson::new(lambda).unwrap();
-
-                // 获取当前逻辑 slot 生成的消息数
-                let num_messages: usize = poisson.sample(&mut self.background_count_rng) as usize;
-
-                for _ in 0..num_messages {
-                    self.emit_one_transaction(false).await;
-                }
-
-                let mut attack_messages = 0usize;
-                if self.attack_mode == AttackMode::Flooding && self.attack_tx_rate_multiplier > 0.0
-                {
-                    let attack_lambda = lambda * self.attack_tx_rate_multiplier;
-                    if attack_lambda > 0.0 {
-                        let attack_poisson = Poisson::new(attack_lambda).unwrap();
-                        attack_messages =
-                            attack_poisson.sample(&mut self.attack_count_rng) as usize;
-                        for _ in 0..attack_messages {
-                            self.emit_one_transaction(true).await;
-                        }
-                    }
-                }
-                info!(
-                    "[{}]Transactions generated for logical_slot={} (λ={:.3}, flooding_extra={})",
-                    num_messages + attack_messages,
-                    self.last_logical_slot,
-                    lambda,
-                    attack_messages
-                );
-            }
+            self.generate_through_slot(observed_slot, false).await;
         }
     }
 
-    async fn emit_one_transaction(&mut self, adversarial_only: bool) {
+    async fn generate_through_slot(
+        &mut self,
+        observed_slot: u64,
+        acknowledge: bool,
+    ) -> (
+        coalition::GenerationBatch,
+        Vec<tokio::sync::oneshot::Receiver<bool>>,
+    ) {
+        let mut batch = coalition::GenerationBatch {
+            logical_slot: observed_slot,
+            ..coalition::GenerationBatch::default()
+        };
+        let mut completions = Vec::new();
+        while self.last_logical_slot < observed_slot {
+            self.last_logical_slot += 1;
+            let lambda =
+                self.trans_num_per_interval as f64 * self.logical_slot_duration_secs.max(0.0);
+            if lambda <= 0.0 {
+                continue;
+            }
+            // 泊松分布生成器：每个逻辑 slot 采样一次，避免真实时间变慢时 workload 继续堆积。
+            let poisson = Poisson::new(lambda).unwrap();
+
+            // 获取当前逻辑 slot 生成的消息数
+            let num_messages: usize = poisson.sample(&mut self.background_count_rng) as usize;
+            batch.sampled += num_messages as u64;
+
+            for _ in 0..num_messages {
+                if let Some(completion) = self.emit_one_transaction(false, acknowledge).await {
+                    completions.push(completion);
+                }
+            }
+
+            let mut attack_messages = 0usize;
+            if self.attack_mode == AttackMode::Flooding && self.attack_tx_rate_multiplier > 0.0 {
+                let attack_lambda = lambda * self.attack_tx_rate_multiplier;
+                if attack_lambda > 0.0 {
+                    let attack_poisson = Poisson::new(attack_lambda).unwrap();
+                    attack_messages = attack_poisson.sample(&mut self.attack_count_rng) as usize;
+                    batch.sampled += attack_messages as u64;
+                    for _ in 0..attack_messages {
+                        if let Some(completion) = self.emit_one_transaction(true, acknowledge).await
+                        {
+                            completions.push(completion);
+                        }
+                    }
+                }
+            }
+            info!(
+                "[{}]Transactions generated for logical_slot={} (λ={:.3}, flooding_extra={})",
+                num_messages + attack_messages,
+                self.last_logical_slot,
+                lambda,
+                attack_messages
+            );
+        }
+        batch.enqueued = completions.len() as u64;
+        (batch, completions)
+    }
+
+    async fn emit_one_transaction(
+        &mut self,
+        adversarial_only: bool,
+        acknowledge: bool,
+    ) -> Option<tokio::sync::oneshot::Receiver<bool>> {
         let candidates: Vec<String> = if adversarial_only {
             self.nodes_address
                 .iter()
@@ -1018,7 +1155,7 @@ impl TransactionGenerator {
             self.nodes_address.clone()
         };
         if candidates.len() < 2 || self.nodes_address.len() < 2 {
-            return;
+            return None;
         }
         let route_rng = if adversarial_only {
             &mut self.attack_route_rng
@@ -1041,15 +1178,21 @@ impl TransactionGenerator {
             }
         }
         let Some(sender) = self.nodes_sender.get(&from) else {
-            return;
+            return None;
         };
-        let sent = sender.try_send(if adversarial_only {
-            Message::new_generate_attack_transaction_path_msg(to.clone())
+        let (generation_ack, completion) = if acknowledge {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            (Some(sender), Some(receiver))
         } else {
-            Message::new_generate_transaction_path_msg(to.clone())
+            (None, None)
+        };
+        let sent = sender.try_send(Message::GenerateTransactionPaths {
+            to: to.clone(),
+            self_generated_attack: adversarial_only,
+            generation_ack,
         });
         if sent.is_err() {
-            return;
+            return None;
         }
         self.generated_tx_counter.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut audit) = self.flooding_audit.lock() {
@@ -1064,6 +1207,7 @@ impl TransactionGenerator {
             // configured irrecoverable cost. Without an override this is 2F.
             *ledger.entry(from).or_insert(0.0) += self.transaction_fee + self.irrecoverable_cost;
         }
+        completion
     }
 }
 
@@ -1370,6 +1514,91 @@ fn approximate_betweenness(graph: &Graph<String, ()>) -> HashMap<String, f64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn coalition_workload_is_immediate_and_keeps_the_original_sampling_stream() {
+        let (a, mut a_rx) = tokio::sync::mpsc::channel(1024);
+        let (b, mut b_rx) = tokio::sync::mpsc::channel(1024);
+        let consumer_a = tokio::spawn(async move {
+            while let Some(Message::GenerateTransactionPaths { generation_ack, .. }) =
+                a_rx.recv().await
+            {
+                if let Some(reply) = generation_ack {
+                    let _ = reply.send(true);
+                }
+            }
+        });
+        let consumer_b = tokio::spawn(async move {
+            while let Some(Message::GenerateTransactionPaths { generation_ack, .. }) =
+                b_rx.recv().await
+            {
+                if let Some(reply) = generation_ack {
+                    let _ = reply.send(true);
+                }
+            }
+        });
+        let senders: HashMap<_, _> = [("a".to_string(), a), ("b".to_string(), b)].into();
+        let make = |audit| {
+            TransactionGenerator::new(
+                senders.clone(),
+                vec!["a".into(), "b".into()],
+                Duration::from_secs(60),
+                20,
+                7,
+                9,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                1.0,
+                Arc::new(Mutex::new(HashMap::new())),
+                audit,
+                0.00001,
+                0.00001,
+                HashSet::new(),
+                AttackMode::None,
+                0.0,
+            )
+        };
+        let immediate_audit = Arc::new(Mutex::new(FloodingAuditState::default()));
+        let legacy_audit = Arc::new(Mutex::new(FloodingAuditState::default()));
+        let mut immediate = make(immediate_audit.clone());
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        immediate.slot_requests = Some(receiver);
+        let generator = tokio::spawn(async move {
+            immediate.run().await;
+        });
+        let mut sampled = 0;
+        for logical_slot in 1..=2 {
+            let (reply, completion) = tokio::sync::oneshot::channel();
+            sender
+                .send(coalition::SlotWorkloadRequest {
+                    logical_slot,
+                    reply,
+                })
+                .await
+                .unwrap();
+            let batch = tokio::time::timeout(Duration::from_secs(1), completion)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(batch.logical_slot, logical_slot);
+            assert_eq!(batch.sampled, batch.generated);
+            assert_eq!(batch.rejected, 0);
+            sampled += batch.sampled;
+        }
+        assert!(sampled > 0);
+        let mut legacy = make(legacy_audit.clone());
+        legacy.generate_through_slot(2, false).await;
+        assert_eq!(
+            immediate_audit.lock().unwrap().background_workload_trace,
+            legacy_audit.lock().unwrap().background_workload_trace
+        );
+        assert_eq!(legacy.generated_tx_counter.load(Ordering::Relaxed), sampled);
+        generator.abort();
+        consumer_a.abort();
+        consumer_b.abort();
+    }
+
     use log::info;
     use rand::prelude::Distribution;
     use rand::rngs::StdRng;

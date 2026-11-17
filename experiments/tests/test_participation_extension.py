@@ -1,8 +1,8 @@
 import hashlib
 import json
 from pathlib import Path
-import shutil
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -30,11 +30,14 @@ class ParticipationExtensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             snapshot = directory/'source'
-            for name in baseline['source_sha256']:
-                target = snapshot/name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(ROOT/name, target)
             archive = historical/'baseline_source.tar.gz'
+            # The successful fixture is the archived source, independently of
+            # later opt-in simulator features in the current working tree.
+            with tarfile.open(archive) as archived:
+                for name in baseline['source_sha256']:
+                    target = snapshot/name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(archived.extractfile(name).read())
             proof = dict(binary_sha256=baseline['binary_sha256'], binary=str(historical/'trail_before'),
                          historical_source_archive=str(archive),
                          historical_source_archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),

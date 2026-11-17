@@ -3,6 +3,7 @@ use crate::blockchain::path::{AggregatedSignedPaths, TransactionPaths};
 use crate::blockchain::transaction::Transaction;
 use crate::blockchain::{BlockChainError, Blockchain};
 use crate::consensus::{ConsensusType, RandaoSeed, Validator};
+use crate::network::coalition::{CandidatePool, GenerationCompletion, PaymentLedger};
 use crate::network::message::Message;
 use crate::network::world_state::logical_tx_metadata;
 use crate::network::RelayProfile;
@@ -33,6 +34,8 @@ pub struct Node {
     pub neighbors: Vec<Neighbor>,
     pub world_state_sender: Sender<Message>,
     pub transaction_paths_cache: Arc<RwLock<HashMap<String, Arc<TransactionPaths>>>>,
+    pub coalition_candidates: Option<CandidatePool>,
+    pub coalition_payments: Option<PaymentLedger>,
     pub node_type: NodeType,
     pub sybil_nodes: Vec<Node>,
     pub is_online: bool,
@@ -111,6 +114,8 @@ impl Node {
             sender,
             receiver,
             transaction_paths_cache: Arc::new(RwLock::new(HashMap::new())),
+            coalition_candidates: None,
+            coalition_payments: None,
             neighbors: Vec::new(),
             world_state_sender,
             node_type: NodeType::Honest,
@@ -156,6 +161,8 @@ impl Node {
             sender,
             receiver,
             transaction_paths_cache: Arc::new(RwLock::new(HashMap::new())),
+            coalition_candidates: None,
+            coalition_payments: None,
             neighbors: Vec::new(),
             world_state_sender,
             node_type: NodeType::Honest,
@@ -222,6 +229,8 @@ impl Node {
             sender,
             receiver,
             transaction_paths_cache: Arc::new(RwLock::new(HashMap::new())),
+            coalition_candidates: None,
+            coalition_payments: None,
             neighbors: Vec::new(),
             world_state_sender,
             node_type: NodeType::Sybil,
@@ -584,14 +593,36 @@ impl Node {
                         }
                     }
 
-                    {
+                    let already_cached = {
                         let transactions_cache = self.transaction_paths_cache.read().await;
+                        transactions_cache.contains_key(&tx_hash)
+                    };
+                    if already_cached {
+                        if let Some(pool) = &self.coalition_candidates {
+                            let mut window = pool.lock().await;
+                            if window.collecting {
+                                window.already_committed += 1;
+                            }
+                        }
+                        continue;
+                    }
 
-                        if transactions_cache.contains_key(&tx_hash) {
+                    if let Some(pool) = &self.coalition_candidates {
+                        let mut window = pool.lock().await;
+                        if window.offer(transaction_paths.clone(), &self.wallet.address) {
+                            continue;
+                        }
+                        // A builder may have committed this transaction while
+                        // this handler waited for the window lock.
+                        if self
+                            .transaction_paths_cache
+                            .read()
+                            .await
+                            .contains_key(&tx_hash)
+                        {
                             continue;
                         }
                     }
-
                     let mut received_transaction_paths = (*transaction_paths).clone();
                     if !received_transaction_paths.complete_pending_hop(self.wallet.clone()) {
                         debug!(
@@ -788,7 +819,9 @@ impl Node {
                 Message::GenerateTransactionPaths {
                     to,
                     self_generated_attack,
+                    generation_ack,
                 } => {
+                    let mut completion = GenerationCompletion::new(generation_ack);
                     // 检查余额是否充足
                     let irrecoverable_cost =
                         self.irrecoverable_cost.unwrap_or(self.transaction_fee);
@@ -799,6 +832,10 @@ impl Node {
                             self.index, self.balance, total_transaction_cost
                         );
                         continue;
+                    }
+                    if let Some(payments) = &self.coalition_payments {
+                        *payments.lock().unwrap().entry(self.epoch).or_insert(0.0) +=
+                            total_transaction_cost;
                     }
 
                     // 扣除余额后，只同步账户余额；经济 stake 不随交易费变化
@@ -937,6 +974,7 @@ impl Node {
                             ));
                         });
                     }
+                    completion.generated = true;
                 }
                 Message::SendRandaoSeed => {
                     let seed = RandaoSeed::generate_seed();

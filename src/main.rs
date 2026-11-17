@@ -7,6 +7,7 @@ use std::fs::File;
 use trail::consensus::trail::{RewardPolicy, TrailConfig};
 use trail::consensus::ConsensusType;
 use trail::network;
+use trail::network::coalition::CoalitionPathSelection;
 use trail::network::graph::TopologyType;
 use trail::network::{
     AdaptiveRelayConfig, AdversaryPlacement, AttackMode, RelayProfile, SimulationConfig,
@@ -337,6 +338,21 @@ struct Args {
     /// Extra adversarial transaction rate multiplier for flooding
     #[clap(long, default_value = "0.0")]
     attack_tx_rate_multiplier: f64,
+
+    /// Opt-in Fig. 4(b) terminal candidate collection; off preserves legacy experiments
+    #[arg(long, default_value_t = CoalitionPathSelection::Off)]
+    coalition_path_selection: CoalitionPathSelection,
+
+    /// Logical duration of the proposer-only incoming-prefix collection window
+    #[arg(long, default_value = "1000")]
+    coalition_candidate_window_ms: u64,
+
+    #[arg(long, default_value = "10")]
+    coalition_attack_start_epoch: u64,
+
+    /// Exclusive end of coalition favoritism; subsequent epochs use honest selection
+    #[arg(long, default_value = "50")]
+    coalition_attack_end_epoch: u64,
 }
 
 #[tokio::main]
@@ -469,6 +485,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         attack_mode: args.attack_mode,
         padding_identities: args.padding_identities,
         attack_tx_rate_multiplier: args.attack_tx_rate_multiplier,
+        coalition_path_selection: args.coalition_path_selection,
+        coalition_candidate_window_ms: args.coalition_candidate_window_ms,
+        coalition_attack_start_epoch: args.coalition_attack_start_epoch,
+        coalition_attack_end_epoch: args.coalition_attack_end_epoch,
     };
     network::start_network(config).await;
     Ok(())
