@@ -29,6 +29,7 @@ pub mod coalition;
 pub mod graph;
 pub mod message;
 pub mod node;
+pub mod withholding;
 pub mod world_state;
 
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub enum AttackMode {
     MaxScore,
     PathPadding,
     Flooding,
+    SelectiveWithholding,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +131,7 @@ impl Display for AttackMode {
             AttackMode::MaxScore => write!(f, "max-score"),
             AttackMode::PathPadding => write!(f, "path-padding"),
             AttackMode::Flooding => write!(f, "flooding"),
+            AttackMode::SelectiveWithholding => write!(f, "selective-withholding"),
         }
     }
 }
@@ -245,6 +248,16 @@ pub struct SimulationConfig {
     pub coalition_attack_start_epoch: u64,
     #[serde(default = "default_coalition_attack_end")]
     pub coalition_attack_end_epoch: u64,
+    #[serde(default)]
+    pub withholding_probability: f64,
+    #[serde(default = "default_coalition_attack_start")]
+    pub withholding_start_epoch: u64,
+    #[serde(default = "default_coalition_attack_end")]
+    pub withholding_end_epoch: u64,
+    #[serde(default = "withholding::default_forwarding_cost")]
+    pub withholding_forwarding_cost: f64,
+    #[serde(default = "withholding::default_node_workers")]
+    pub withholding_node_workers: usize,
 }
 
 fn default_candidate_window_ms() -> u64 {
@@ -263,6 +276,30 @@ impl SimulationConfig {
     }
 
     pub fn resolved(mut self) -> Self {
+        if self.attack_mode == AttackMode::SelectiveWithholding {
+            assert!(
+                self.withholding_node_workers >= 2,
+                "withholding runs require parallel node workers"
+            );
+            assert!(self.consensus == ConsensusType::Trail);
+            assert!(
+                self.trail_config.reward_policy == crate::consensus::trail::RewardPolicy::Trail
+            );
+            assert!(self.coalition_path_selection == coalition::CoalitionPathSelection::Off);
+            assert!(self.relay_profile == RelayProfile::Active && !self.adaptive_relay.enabled);
+            assert!(self.sybil_node_num == 0 && self.effective_unstable_node_num() == 0);
+            assert!(self.focal_relayer_count == 0 && self.lazy_fraction == 0.0);
+            assert!(
+                self.reward_reinvestment_rate == 0.0 && self.outage_validator_ids.trim().is_empty()
+            );
+            assert!(self.wallet_seed != 0 && self.max_epochs > 0);
+            assert!((0.0..=1.0).contains(&self.withholding_probability));
+            assert!(self.withholding_start_epoch < self.withholding_end_epoch);
+            assert!(
+                self.withholding_forwarding_cost.is_finite()
+                    && self.withholding_forwarding_cost >= 0.0
+            );
+        }
         if self.coalition_path_selection != coalition::CoalitionPathSelection::Off {
             assert!(
                 self.consensus == ConsensusType::Trail,
@@ -401,6 +438,11 @@ pub async fn start_network(config: SimulationConfig) {
     let run_config_path = output_dir.join("run_config.json");
     if let Ok(json) = serde_json::to_string_pretty(&run_config) {
         let _ = std::fs::write(&run_config_path, json);
+    }
+
+    if config.attack_mode == AttackMode::SelectiveWithholding {
+        withholding::run(&config).await;
+        return;
     }
 
     let node_num = config.node_num;

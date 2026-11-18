@@ -205,12 +205,8 @@ pub fn random_eth_empirical_graph(nodes_address: Vec<String>, seed: u64) -> Grap
         return graph;
     }
 
-    let network = BANetwork::generate_ba_network(
-        node_number,
-        initial_clique,
-        links_per_new_node,
-        seed,
-    );
+    let network =
+        BANetwork::generate_ba_network(node_number, initial_clique, links_per_new_node, seed);
     let mut edges = Vec::new();
     for (source, neighbors) in network.adjacency {
         for target in neighbors {

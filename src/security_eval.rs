@@ -51,7 +51,10 @@ pub fn evaluate_padding_case(
     let other_positions: Vec<usize> = (1..original_path_length)
         .filter(|position| *position != relay_position)
         .collect();
-    assert!(other_positions.len() < 63, "path too long for exhaustive masks");
+    assert!(
+        other_positions.len() < 63,
+        "path too long for exhaustive masks"
+    );
     let assignments = 1u64 << other_positions.len();
     let padded_path_length = original_path_length + inserted_identities;
     let mut maximum = -1.0;

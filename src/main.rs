@@ -353,6 +353,17 @@ struct Args {
     /// Exclusive end of coalition favoritism; subsequent epochs use honest selection
     #[arg(long, default_value = "50")]
     coalition_attack_end_epoch: u64,
+
+    #[arg(long, default_value = "0")]
+    withholding_probability: f64,
+    #[arg(long, default_value = "10")]
+    withholding_start_epoch: u64,
+    #[arg(long, default_value = "50")]
+    withholding_end_epoch: u64,
+    #[arg(long, default_value = "1.4055695425812074e-7")]
+    withholding_forwarding_cost: f64,
+    #[arg(long, default_value = "8")]
+    withholding_node_workers: usize,
 }
 
 #[tokio::main]
@@ -489,6 +500,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         coalition_candidate_window_ms: args.coalition_candidate_window_ms,
         coalition_attack_start_epoch: args.coalition_attack_start_epoch,
         coalition_attack_end_epoch: args.coalition_attack_end_epoch,
+        withholding_probability: args.withholding_probability,
+        withholding_start_epoch: args.withholding_start_epoch,
+        withholding_end_epoch: args.withholding_end_epoch,
+        withholding_forwarding_cost: args.withholding_forwarding_cost,
+        withholding_node_workers: args.withholding_node_workers,
     };
     network::start_network(config).await;
     Ok(())

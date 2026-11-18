@@ -65,6 +65,28 @@ impl Transaction {
         wallet: Wallet,
         self_generated_attack: bool,
     ) -> Transaction {
+        Self::with_timestamp(
+            to,
+            amount,
+            fee,
+            irrecoverable_cost,
+            wallet,
+            self_generated_attack,
+            get_timestamp(),
+        )
+    }
+
+    /// Explicit logical identity for the isolated deterministic withholding runner.
+    /// Legacy constructors continue using the original wall clock.
+    pub fn with_timestamp(
+        to: String,
+        amount: i64,
+        fee: f64,
+        irrecoverable_cost: f64,
+        wallet: Wallet,
+        self_generated_attack: bool,
+        timestamp: u64,
+    ) -> Transaction {
         let from = wallet.address.clone();
 
         let mut t = Transaction {
@@ -76,7 +98,7 @@ impl Transaction {
             self_generated_attack,
             hash: "".to_string(),
             signature: "".to_string(),
-            timestamp: get_timestamp(),
+            timestamp,
             data: Vec::new(),
         };
         let t_json = serde_json::to_string(&t).unwrap();

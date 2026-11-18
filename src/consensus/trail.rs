@@ -137,6 +137,7 @@ pub struct RewardPlan {
 }
 
 pub struct TrailConsensus {
+    deterministic_reductions: bool,
     config: TrailConfig,
     base_reward: f64,
     /// Latest produced EMA state, whether activated or not.
@@ -159,6 +160,7 @@ impl TrailConsensus {
     pub fn new(base_reward: f64, config: TrailConfig) -> Result<Self, String> {
         config.validate()?;
         Ok(TrailConsensus {
+            deterministic_reductions: false,
             config,
             base_reward,
             score_history: HashMap::new(),
@@ -177,6 +179,32 @@ impl TrailConsensus {
 
     pub fn config(&self) -> &TrailConfig {
         &self.config
+    }
+
+    /// Stable reduction order only for the opt-in withholding event runner.
+    pub fn enable_deterministic_reductions(&mut self) {
+        self.deterministic_reductions = true;
+    }
+
+    fn run_normalized_stake(&self, validators: &[Validator]) -> HashMap<String, f64> {
+        if !self.deterministic_reductions {
+            return Self::normalized_stake(validators);
+        }
+        let raw = validators
+            .iter()
+            .map(|v| (v.address.clone(), v.stake.max(0.0)))
+            .collect();
+        Self::ordered_normalize(&raw)
+    }
+
+    fn ordered_normalize(map: &HashMap<String, f64>) -> HashMap<String, f64> {
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by_key(|(key, _)| *key);
+        let sum: f64 = entries.iter().map(|(_, value)| **value).sum();
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.clone(), if sum > 0.0 { value / sum } else { 0.0 }))
+            .collect()
     }
 
     pub fn current_depth(&self) -> usize {
@@ -290,7 +318,7 @@ impl TrailConsensus {
     }
 
     pub fn freeze_proposer_weights(&mut self, validators: &[Validator]) {
-        let normalized_stake = Self::normalized_stake(validators);
+        let normalized_stake = self.run_normalized_stake(validators);
         self.normalized_score = Self::damped_score_for_active_set(
             &self.active_score_history,
             validators,
@@ -325,7 +353,11 @@ impl TrailConsensus {
 
         self.epoch_bonuses = bonuses;
         self.unnormalized_proposer_weights = unnormalized.clone();
-        self.frozen_proposer_weights = Self::normalize_map(&unnormalized);
+        self.frozen_proposer_weights = if self.deterministic_reductions {
+            Self::ordered_normalize(&unnormalized)
+        } else {
+            Self::normalize_map(&unnormalized)
+        };
     }
 
     pub fn compute_block_rewards(&self, block: &Block, validators: &[Validator]) -> RewardPlan {
@@ -493,7 +525,7 @@ impl TrailConsensus {
     }
 
     fn update_scores_from_epoch(&mut self, blocks: &[Block], validators: &[Validator]) {
-        let normalized_stake = Self::normalized_stake(validators);
+        let normalized_stake = self.run_normalized_stake(validators);
         let raw_contribution = self.raw_epoch_contribution(blocks, validators);
         let mut next_scores = HashMap::new();
 

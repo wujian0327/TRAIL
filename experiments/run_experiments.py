@@ -127,6 +127,11 @@ CLI_KEYS = {
     "coalition_candidate_window_ms": "--coalition-candidate-window-ms",
     "coalition_attack_start_epoch": "--coalition-attack-start-epoch",
     "coalition_attack_end_epoch": "--coalition-attack-end-epoch",
+    "withholding_probability": "--withholding-probability",
+    "withholding_start_epoch": "--withholding-start-epoch",
+    "withholding_end_epoch": "--withholding-end-epoch",
+    "withholding_forwarding_cost": "--withholding-forwarding-cost",
+    "withholding_node_workers": "--withholding-node-workers",
 }
 
 EXPERIMENT_OVERRIDE_KEYS = set(CLI_KEYS) | {
@@ -229,6 +234,8 @@ def expand_runs(spec: Dict[str, Any], only: Iterable[str] | None = None) -> List
         protocols = experiment.get("protocols", [defaults.get("protocol", "trail")])
         dimension_keys = DIMENSION_KEYS + (
             ["coalition_path_selection"] if "coalition_path_selection" in experiment else []
+        ) + (
+            ["withholding_probability"] if "withholding_probability" in experiment else []
         )
         experiment_overrides = {
             key: experiment[key]

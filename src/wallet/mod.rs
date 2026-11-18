@@ -238,8 +238,7 @@ impl Wallet {
         }
         let signature_bytes = decode(&signature)?;
 
-        Signature::from_bytes(signature_bytes.as_slice())
-            .map_err(|_| WalletError::InvalidSignature)
+        Signature::from_bytes(signature_bytes.as_slice()).map_err(|_| WalletError::InvalidSignature)
     }
 
     pub fn bls_aggregated_sign(signatures: Vec<Signature>) -> String {

@@ -96,10 +96,7 @@ fn main() {
         cases: rows.len(),
         coalition_assignments: rows.iter().map(|row| row.coalition_assignments).sum(),
         violations,
-        maximum_ratio: rows
-            .iter()
-            .map(|row| row.max_ratio)
-            .fold(0.0_f64, f64::max),
+        maximum_ratio: rows.iter().map(|row| row.max_ratio).fold(0.0_f64, f64::max),
         passed: violations == 0,
         csv: args.csv.display().to_string(),
     };

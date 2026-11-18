@@ -162,7 +162,7 @@ def main():
                    if args.metric == "percent" else "mean paired net income difference in token",
         period="epochs 10-79", ci_method="two-sided 95% Student t over paired-seed values",
         points=rows)
-    (args.output_dir / f"{args.output_name}_metadata.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    (args.input.parent / f"{args.output_name}_metadata.json").write_text(json.dumps(provenance, indent=2) + "\n")
 
 
 if __name__ == "__main__":

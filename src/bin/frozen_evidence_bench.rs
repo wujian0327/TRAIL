@@ -137,7 +137,9 @@ fn parse_hops(raw: &str, max_path_hops: usize) -> Vec<usize> {
     values.dedup();
     assert!(!values.is_empty(), "--hops must not be empty");
     assert!(
-        values.iter().all(|value| *value > 0 && *value <= max_path_hops),
+        values
+            .iter()
+            .all(|value| *value > 0 && *value <= max_path_hops),
         "all hop counts must be in 1..=max-path-hops"
     );
     values
@@ -333,9 +335,8 @@ fn work_budget_accepts(
 
 fn write_samples(path: &Path, samples: &[Sample]) {
     ensure_parent(path);
-    let mut output = String::from(
-        "protocol_version,operation,hops,iteration,nanoseconds,check_passed\n",
-    );
+    let mut output =
+        String::from("protocol_version,operation,hops,iteration,nanoseconds,check_passed\n");
     for sample in samples {
         output.push_str(&format!(
             "{},{},{},{},{},{}\n",
@@ -397,18 +398,17 @@ fn main() {
 
     for fixture in &fixtures {
         let hop_count = fixture.paths.paths.len();
-        let construction_transactions: Vec<Transaction> =
-            (0..args.warmup + args.repetitions)
-                .map(|iteration| {
-                    Transaction::with_costs(
-                        fixture.miner.clone(),
-                        100_000 + (hop_count * 1_000 + iteration) as i64,
-                        1.0,
-                        1.0,
-                        fixture.wallets[0].clone(),
-                    )
-                })
-                .collect();
+        let construction_transactions: Vec<Transaction> = (0..args.warmup + args.repetitions)
+            .map(|iteration| {
+                Transaction::with_costs(
+                    fixture.miner.clone(),
+                    100_000 + (hop_count * 1_000 + iteration) as i64,
+                    1.0,
+                    1.0,
+                    fixture.wallets[0].clone(),
+                )
+            })
+            .collect();
         let build = measure(
             "construct_path",
             hop_count,
@@ -444,10 +444,20 @@ fn main() {
         ));
         samples.extend(individual);
 
-        let aggregate = measure("aggregate_only", hop_count, args.warmup, args.repetitions, |_| {
-            !aggregate_signatures(&fixture.paths).is_empty()
-        });
-        summaries.push(summarize("aggregate_only", fixture, &aggregate, 1, hop_count));
+        let aggregate = measure(
+            "aggregate_only",
+            hop_count,
+            args.warmup,
+            args.repetitions,
+            |_| !aggregate_signatures(&fixture.paths).is_empty(),
+        );
+        summaries.push(summarize(
+            "aggregate_only",
+            fixture,
+            &aggregate,
+            1,
+            hop_count,
+        ));
         samples.extend(aggregate);
 
         let aggregate_verify = measure(
@@ -472,9 +482,13 @@ fn main() {
         ));
         samples.extend(aggregate_verify);
 
-        let encode = measure("encode_json", hop_count, args.warmup, args.repetitions, |_| {
-            !black_box(fixture.aggregate.to_json()).is_empty()
-        });
+        let encode = measure(
+            "encode_json",
+            hop_count,
+            args.warmup,
+            args.repetitions,
+            |_| !black_box(fixture.aggregate.to_json()).is_empty(),
+        );
         summaries.push(summarize("encode_json", fixture, &encode, 1, hop_count));
         samples.extend(encode);
     }
