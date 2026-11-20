@@ -35,8 +35,16 @@ g=0.0001、初始支付余额10、经济stake不再投资，全部沿用原10see
 随后按用户要求，常用目录中的b图更新为统一排除seed209、212后的18seed敏感性预览，
 四种机制在全部fee点使用相同的18个seed，重算均值及df=17的95%区间，图例与坐标文字保持原样。
 a、c、d仍为完整20seed结果，原始560次运行及完整20seed统计继续保留。
-复现当前b图：`python3 analysis/plot_trail_relay_participation_v2.py --panels b --exclude-seed 209 --exclude-seed 212`。
-省略排除选项可重画完整20seed结果；当前导出范围记录于结果目录的 `publication_export.json`。
+当前 `trail_participationV2` 的 a、b、c 图显示 **Active relays (%)**，取原始
+`adaptive_relay_metrics.csv` 的 `active_fraction × 100`，即活跃转发节点数占验证者总数的百分比。
+a 逐 epoch 取值，b、c 先对每个 seed 的 epoch 100–199 取均值。a、c 使用 20 个 seed，b 使用同一组 18 个 seed。
+逐点均值和 95% Student-t 区间均按新指标复算。相对旧版质押占比，三图中均值最大绝对变化分别为
+1.89、0.96 和 0.75 个百分点。当前导出范围记录于结果目录的 `publication_export.json`。
+
+```bash
+python3 analysis/plot_trail_relay_participation_v2.py --active-relays --panels ac
+python3 analysis/plot_trail_relay_participation_v2.py --active-relays --panels b --exclude-seed 209 --exclude-seed 212
+```
 
 Git提交后来源标签发生变化。跨批次合并仍逐个核对实际可执行文件哈希，
 并用历史源码归档与新批次源码快照证明26个源码/依赖/启动器文件逐项一致；

@@ -74,12 +74,17 @@ def configure_style() -> None:
     )
 
 
-def decorate(ax: Any) -> None:
+def decorate(ax: Any, *, reverse_legend: bool = False) -> None:
     ax.grid(axis="y", color="#E6E6E6", linewidth=0.7, zorder=0)
     ax.spines["left"].set_linewidth(0.9)
     ax.spines["bottom"].set_linewidth(0.9)
     ax.tick_params(width=0.8, length=3)
+    entries = ()
+    if reverse_legend:
+        handles, labels = ax.get_legend_handles_labels()
+        entries = (handles[::-1], labels[::-1])
     ax.legend(
+        *entries,
         frameon=True,
         framealpha=0.9,
         facecolor="white",
