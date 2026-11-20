@@ -1,7 +1,7 @@
 use crate::blockchain::block::Block;
 use crate::blockchain::Blockchain;
 use crate::consensus::trail::TrailConfig;
-use crate::consensus::ConsensusType;
+use crate::consensus::{ConsensusType, ValidatorRegistry, ValidatorRegistryError};
 use crate::metrics::FloodingAuditState;
 use crate::network::graph::TopologyType;
 use crate::network::message::Message;
@@ -420,6 +420,27 @@ struct RunConfigFile {
     config: SimulationConfig,
 }
 
+fn write_validator_indices(directory: &std::path::Path, registry: &ValidatorRegistry) {
+    #[derive(Serialize)]
+    struct Entry<'a> {
+        index: u64,
+        address: &'a str,
+        bls_public_key: String,
+    }
+
+    let entries: Vec<_> = registry
+        .entries()
+        .map(|(index, address, key)| Entry {
+            index,
+            address,
+            bls_public_key: hex::encode(key.to_bytes()),
+        })
+        .collect();
+    let file = std::fs::File::create(directory.join("validator_indices.json"))
+        .expect("create validator index manifest");
+    serde_json::to_writer_pretty(file, &entries).expect("write validator index manifest");
+}
+
 pub async fn start_network(config: SimulationConfig) {
     let config = config.resolved();
     let output_dir = PathBuf::from(&config.output_dir);
@@ -485,8 +506,104 @@ pub async fn start_network(config: SimulationConfig) {
     let bc = Blockchain::new(genesis_block.clone());
     info!("Generate genesis block");
 
+    let (world_sender, world_receiver) = tokio::sync::mpsc::channel(4096);
+
+    //3. nodes
+    let total_nodes = node_num + sybil_node_num + unstable_node_num;
+
+    // Generate stake distribution based on gini with wallet_seed for shuffling
+    let stake_values = if gini > 0.0 {
+        generate_stake_by_gini(total_nodes, gini, wallet_seed)
+    } else {
+        // Default: equal stakes
+        vec![1.0; total_nodes as usize]
+    };
+
+    let mut nodes: Vec<Node> = (0..total_nodes)
+        .map(|i| {
+            let hash_power = stake_values.get(i as usize).cloned().unwrap_or(1.0);
+            if i < node_num {
+                // Honest nodes
+                let mut node = Node::new(
+                    i,
+                    0,
+                    0,
+                    bc.clone(),
+                    world_sender.clone(),
+                    max_tx_per_block,
+                    consensus,
+                    wallet_seed,
+                );
+                node.set_failure_seed(config.failure_seed);
+                node.set_transaction_fee(transaction_fee);
+                node.set_irrecoverable_cost(config.irrecoverable_cost);
+                node.set_initial_liquid_balance(config.initial_liquid_balance);
+                node.set_hash_power(hash_power);
+                node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
+                node.simple_print();
+                node
+            } else if i < node_num + sybil_node_num {
+                // Malicious nodes with sybil
+                let mut node = Node::new_with_sybil_nodes(
+                    i,
+                    0,
+                    0,
+                    bc.clone(),
+                    world_sender.clone(),
+                    fake_node_num as i32,
+                    max_tx_per_block,
+                    consensus,
+                    wallet_seed,
+                );
+                node.set_failure_seed(config.failure_seed);
+                node.set_transaction_fee(transaction_fee);
+                node.set_irrecoverable_cost(config.irrecoverable_cost);
+                node.set_initial_liquid_balance(config.initial_liquid_balance);
+                node.set_hash_power(hash_power);
+                node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
+                node.simple_print();
+                node
+            } else {
+                // Unstable nodes
+                let mut node = Node::new(
+                    i,
+                    0,
+                    0,
+                    bc.clone(),
+                    world_sender.clone(),
+                    max_tx_per_block,
+                    consensus,
+                    wallet_seed,
+                );
+                node.set_failure_seed(config.failure_seed);
+                node.set_node_type(NodeType::Unstable);
+                node.set_offline_probability(offline_probability);
+                node.set_transaction_fee(transaction_fee);
+                node.set_irrecoverable_cost(config.irrecoverable_cost);
+                node.set_initial_liquid_balance(config.initial_liquid_balance);
+                node.set_hash_power(hash_power);
+                node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
+                node.simple_print();
+                node
+            }
+        })
+        .collect();
+
+    let registry = Arc::new(
+        network_validator_registry(nodes.iter()).expect("invalid simulator validator roster"),
+    );
+    write_validator_indices(&output_dir, &registry);
+    let bc = bc.with_validator_registry(registry);
+    for node in &mut nodes {
+        node.set_initial_blockchain(&bc);
+    }
+    let mut node_map: HashMap<String, Node> = nodes
+        .into_iter()
+        .map(|node| (node.get_address(), node))
+        .collect();
+
     //2. world state
-    let (mut world, world_sender, world_receiver) = WorldState::new(
+    let mut world = WorldState::new(
         genesis_block,
         consensus,
         bc.clone(),
@@ -514,87 +631,6 @@ pub async fn start_network(config: SimulationConfig) {
     );
     let logical_slot_counter = world.logical_slot_counter.clone();
     info!("Generate world state");
-
-    //3. nodes
-    let total_nodes = node_num + sybil_node_num + unstable_node_num;
-
-    // Generate stake distribution based on gini with wallet_seed for shuffling
-    let stake_values = if gini > 0.0 {
-        generate_stake_by_gini(total_nodes, gini, wallet_seed)
-    } else {
-        // Default: equal stakes
-        vec![1.0; total_nodes as usize]
-    };
-
-    let mut node_map: HashMap<String, Node> = (0..total_nodes)
-        .map(|i| {
-            let hash_power = stake_values.get(i as usize).cloned().unwrap_or(1.0);
-            if i < node_num {
-                // Honest nodes
-                let mut node = Node::new(
-                    i,
-                    0,
-                    0,
-                    bc.clone(),
-                    world_sender.clone(),
-                    max_tx_per_block,
-                    consensus,
-                    wallet_seed,
-                );
-                node.set_failure_seed(config.failure_seed);
-                node.set_transaction_fee(transaction_fee);
-                node.set_irrecoverable_cost(config.irrecoverable_cost);
-                node.set_initial_liquid_balance(config.initial_liquid_balance);
-                node.set_hash_power(hash_power);
-                node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
-                node.simple_print();
-                (node.get_address(), node)
-            } else if i < node_num + sybil_node_num {
-                // Malicious nodes with sybil
-                let mut node = Node::new_with_sybil_nodes(
-                    i,
-                    0,
-                    0,
-                    bc.clone(),
-                    world_sender.clone(),
-                    fake_node_num as i32,
-                    max_tx_per_block,
-                    consensus,
-                    wallet_seed,
-                );
-                node.set_failure_seed(config.failure_seed);
-                node.set_transaction_fee(transaction_fee);
-                node.set_irrecoverable_cost(config.irrecoverable_cost);
-                node.set_initial_liquid_balance(config.initial_liquid_balance);
-                node.set_hash_power(hash_power);
-                node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
-                node.simple_print();
-                (node.get_address(), node)
-            } else {
-                // Unstable nodes
-                let mut node = Node::new(
-                    i,
-                    0,
-                    0,
-                    bc.clone(),
-                    world_sender.clone(),
-                    max_tx_per_block,
-                    consensus,
-                    wallet_seed,
-                );
-                node.set_failure_seed(config.failure_seed);
-                node.set_node_type(NodeType::Unstable);
-                node.set_offline_probability(offline_probability);
-                node.set_transaction_fee(transaction_fee);
-                node.set_irrecoverable_cost(config.irrecoverable_cost);
-                node.set_initial_liquid_balance(config.initial_liquid_balance);
-                node.set_hash_power(hash_power);
-                node.set_relay_profile(node_relay_profile(initial_relay_profile, i));
-                node.simple_print();
-                (node.get_address(), node)
-            }
-        })
-        .collect();
 
     let nodes_sender: HashMap<String, Sender<Message>> = node_map
         .iter()
@@ -1001,6 +1037,14 @@ pub async fn start_network(config: SimulationConfig) {
     tasks.push(t);
 
     let _ = join_all(tasks).await;
+}
+
+fn network_validator_registry<'a>(
+    nodes: impl IntoIterator<Item = &'a Node>,
+) -> Result<ValidatorRegistry, ValidatorRegistryError> {
+    ValidatorRegistry::from_wallets(nodes.into_iter().flat_map(|node| {
+        std::iter::once(&node.wallet).chain(node.sybil_nodes.iter().map(|sybil| &sybil.wallet))
+    }))
 }
 
 fn effective_max_tx_per_block(config: &SimulationConfig) -> usize {
@@ -1557,6 +1601,82 @@ fn approximate_betweenness(graph: &Graph<String, ()>) -> HashMap<String, f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sybil_wallets_have_independent_deterministic_indices() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let chain = Blockchain::new(Block::gen_genesis_block());
+        let honest = Node::new(
+            1,
+            0,
+            0,
+            chain.clone(),
+            sender.clone(),
+            8,
+            ConsensusType::Trail,
+            42,
+        );
+        let sybil =
+            Node::new_with_sybil_nodes(17, 0, 0, chain, sender, 2, 8, ConsensusType::Trail, 42);
+        let registry = network_validator_registry([&honest, &sybil]).unwrap();
+        let reversed = network_validator_registry([&sybil, &honest]).unwrap();
+        let addresses: Vec<_> = [
+            &honest,
+            &sybil,
+            &sybil.sybil_nodes[0],
+            &sybil.sybil_nodes[1],
+        ]
+        .into_iter()
+        .map(|node| node.wallet.address.as_str())
+        .collect();
+        let indices: HashSet<_> = addresses
+            .iter()
+            .map(|address| {
+                let index = registry.index(address).unwrap();
+                assert_eq!(registry.address(index).unwrap(), *address);
+                assert_eq!(reversed.index(address), Ok(index));
+                index
+            })
+            .collect();
+        assert_eq!(indices.len(), 4);
+        assert_ne!(
+            registry
+                .index(&sybil.sybil_nodes[0].wallet.address)
+                .unwrap(),
+            u64::from(sybil.sybil_nodes[0].index)
+        );
+        let wallets = [
+            &honest.wallet,
+            &sybil.sybil_nodes[0].wallet,
+            &sybil.sybil_nodes[1].wallet,
+            &sybil.wallet,
+        ];
+        let transaction = crate::blockchain::transaction::Transaction::new(
+            sybil.wallet.address.clone(),
+            1,
+            honest.wallet.clone(),
+        );
+        let mut path = crate::blockchain::path::TransactionPaths::new(transaction.clone());
+        for pair in wallets.windows(2) {
+            assert!(path.append_completed_hop(
+                pair[1].address.clone(),
+                pair[0].clone(),
+                pair[1].clone()
+            ));
+        }
+        let certificate = path.to_aggregated_signed_paths(&registry).unwrap();
+        assert_eq!(
+            certificate
+                .full_path(&sybil.wallet.address, &reversed)
+                .unwrap(),
+            path.node_sequence()
+        );
+        assert!(certificate.verify_at_epoch(&transaction, &sybil.wallet.address, 0, &reversed));
+        assert_eq!(
+            network_validator_registry([&honest, &sybil, &honest]).unwrap_err(),
+            ValidatorRegistryError::DuplicateAddress(honest.wallet.address)
+        );
+    }
 
     #[tokio::test]
     async fn coalition_workload_is_immediate_and_keeps_the_original_sampling_stream() {

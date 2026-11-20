@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::Instant;
 use trail::blockchain::path::{AggregatedSignedPaths, TransactionPaths};
 use trail::blockchain::transaction::Transaction;
+use trail::consensus::ValidatorRegistry;
 use trail::wallet::Wallet;
 
 const PROTOCOL_VERSION: &str = "frozen-v1";
@@ -44,13 +45,15 @@ struct Args {
     report: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Fixture {
     transaction: Transaction,
     paths: TransactionPaths,
     aggregate: AggregatedSignedPaths,
     invalid_aggregate: AggregatedSignedPaths,
     wallets: Vec<Wallet>,
+    registry: ValidatorRegistry,
+    seed: u64,
     miner: String,
     epoch: u64,
 }
@@ -86,6 +89,19 @@ struct SummaryRow {
 }
 
 #[derive(Debug, Serialize)]
+struct CertificateSizes {
+    hops: usize,
+    wallet_seed: u64,
+    core_bytes: u64,
+    legacy_core_bytes: u64,
+    json_bytes: usize,
+    legacy_json_bytes: usize,
+    compact_binary_bytes: usize,
+    legacy_binary_bytes: usize,
+    legacy_address_and_hex_signature_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct Report {
     protocol_version: &'static str,
     os: &'static str,
@@ -107,6 +123,7 @@ struct Report {
     wrong_epoch_rejected: bool,
     repeated_identity_rejected: bool,
     failed_sample_checks: usize,
+    certificate_sizes: Vec<CertificateSizes>,
     passed: bool,
     samples_csv: String,
     summary_csv: String,
@@ -161,37 +178,47 @@ fn fixture(hops: usize, seed: u64) -> Fixture {
     let wallets: Vec<Wallet> = (0..=hops)
         .map(|index| Wallet::new_deterministic(seed, index as u32))
         .collect();
-    let transaction = Transaction::with_costs(
+    let registry = ValidatorRegistry::from_wallets(&wallets).unwrap();
+    let transaction = Transaction::with_timestamp(
         wallets[hops].address.clone(),
         hops as i64,
         1.0,
         1.0,
         wallets[0].clone(),
+        false,
+        1_700_000_000,
     );
     let paths = build_paths(transaction.clone(), &wallets, DEFAULT_EPOCH);
-    let aggregate = paths.to_aggregated_signed_paths();
+    let aggregate = paths.to_aggregated_signed_paths(&registry).unwrap();
 
-    let other_transaction = Transaction::with_costs(
+    let other_transaction = Transaction::with_timestamp(
         wallets[hops].address.clone(),
         10_000 + hops as i64,
         1.0,
         1.0,
         wallets[0].clone(),
+        false,
+        1_700_000_000,
     );
     let other_paths = build_paths(other_transaction, &wallets, DEFAULT_EPOCH);
     let mut invalid_aggregate = aggregate.clone();
-    invalid_aggregate.signature = other_paths.to_aggregated_signed_paths().signature;
+    invalid_aggregate.signature = other_paths
+        .to_aggregated_signed_paths(&registry)
+        .unwrap()
+        .signature;
 
     assert!(paths.verify_completed_hops());
     assert!(aggregate.verify_at_epoch_uncached(
-        transaction.clone(),
-        wallets[hops].address.clone(),
+        &transaction,
+        &wallets[hops].address,
         DEFAULT_EPOCH,
+        &registry,
     ));
     assert!(!invalid_aggregate.verify_at_epoch_uncached(
-        transaction.clone(),
-        wallets[hops].address.clone(),
+        &transaction,
+        &wallets[hops].address,
         DEFAULT_EPOCH,
+        &registry,
     ));
 
     Fixture {
@@ -199,8 +226,10 @@ fn fixture(hops: usize, seed: u64) -> Fixture {
         paths,
         aggregate,
         invalid_aggregate,
-        wallets: wallets.clone(),
         miner: wallets[hops].address.clone(),
+        wallets,
+        registry,
+        seed,
         epoch: DEFAULT_EPOCH,
     }
 }
@@ -310,15 +339,65 @@ fn summarize(
     }
 }
 
+fn certificate_sizes(fixture: &Fixture) -> CertificateSizes {
+    #[derive(Serialize)]
+    struct AddressCertificate<'a> {
+        chain_id: u64,
+        epoch: u64,
+        signature: &'a str,
+        paths: &'a [String],
+    }
+
+    let certificate = &fixture.aggregate;
+    let full_path = fixture.paths.node_sequence();
+    let addresses = &full_path[..certificate.paths.len()];
+    let signature_bytes = Wallet::bls_signature_from_string(certificate.signature.clone())
+        .unwrap()
+        .to_bytes()
+        .len() as u64;
+    let address_bytes: u64 = addresses.iter().map(|address| address.len() as u64).sum();
+    let legacy_json = serde_json::to_vec(&AddressCertificate {
+        chain_id: certificate.chain_id,
+        epoch: certificate.epoch,
+        signature: &certificate.signature,
+        paths: addresses,
+    })
+    .unwrap();
+    let compact_binary = certificate.to_compact_binary().unwrap();
+    // The prior simulator had no binary codec. Encode its UTF-8 addresses
+    // with the same header and a u64 byte-length prefix per address.
+    let mut legacy_binary =
+        compact_binary[..compact_binary.len() - 8 * certificate.paths.len()].to_vec();
+    for address in addresses {
+        legacy_binary.extend_from_slice(&(address.len() as u64).to_le_bytes());
+        legacy_binary.extend_from_slice(address.as_bytes());
+    }
+    CertificateSizes {
+        hops: addresses.len(),
+        wallet_seed: fixture.seed,
+        core_bytes: certificate.bytes(),
+        legacy_core_bytes: signature_bytes + address_bytes,
+        json_bytes: certificate.to_json().len(),
+        legacy_json_bytes: legacy_json.len(),
+        compact_binary_bytes: compact_binary.len(),
+        legacy_binary_bytes: legacy_binary.len(),
+        legacy_address_and_hex_signature_bytes: address_bytes + certificate.signature.len() as u64,
+    }
+}
+
 fn work_budget_accepts(
     records: &[&AggregatedSignedPaths],
     miner: &str,
+    registry: &ValidatorRegistry,
     max_path_hops: usize,
     work_limit: usize,
 ) -> bool {
     let mut work = 0usize;
     for record in records {
-        let hops = record.full_path(miner.to_string()).len().saturating_sub(1);
+        let Ok(nodes) = record.full_path(miner, registry) else {
+            return false;
+        };
+        let hops = nodes.len() - 1;
         if hops > max_path_hops {
             return false;
         }
@@ -467,9 +546,10 @@ fn main() {
             args.repetitions,
             |_| {
                 fixture.aggregate.verify_at_epoch_uncached(
-                    fixture.transaction.clone(),
-                    fixture.miner.clone(),
+                    &fixture.transaction,
+                    &fixture.miner,
                     fixture.epoch,
+                    &fixture.registry,
                 )
             },
         );
@@ -504,12 +584,14 @@ fn main() {
     let at_limit_admitted = work_budget_accepts(
         &at_limit_records,
         &maximum.miner,
+        &maximum.registry,
         args.max_path_hops,
         args.evidence_work_limit,
     );
     let over_limit_rejected = !work_budget_accepts(
         &over_limit_records,
         &maximum.miner,
+        &maximum.registry,
         args.max_path_hops,
         args.evidence_work_limit,
     );
@@ -522,9 +604,10 @@ fn main() {
         |_| {
             at_limit_records.iter().all(|record| {
                 record.verify_at_epoch_uncached(
-                    maximum.transaction.clone(),
-                    maximum.miner.clone(),
+                    &maximum.transaction,
+                    &maximum.miner,
                     maximum.epoch,
+                    &maximum.registry,
                 )
             })
         },
@@ -547,6 +630,7 @@ fn main() {
             !work_budget_accepts(
                 &over_limit_records,
                 &maximum.miner,
+                &maximum.registry,
                 args.max_path_hops,
                 args.evidence_work_limit,
             )
@@ -564,9 +648,10 @@ fn main() {
     let mut malformed = maximum.aggregate.clone();
     malformed.signature = "0x00".to_string();
     let malformed_encoding_rejected = !malformed.verify_at_epoch_uncached(
-        maximum.transaction.clone(),
-        maximum.miner.clone(),
+        &maximum.transaction,
+        &maximum.miner,
         maximum.epoch,
+        &maximum.registry,
     );
     let malformed_samples = measure(
         "reject_malformed_encoding",
@@ -575,9 +660,10 @@ fn main() {
         args.repetitions,
         |_| {
             !malformed.verify_at_epoch_uncached(
-                maximum.transaction.clone(),
-                maximum.miner.clone(),
+                &maximum.transaction,
+                &maximum.miner,
                 maximum.epoch,
+                &maximum.registry,
             )
         },
     );
@@ -591,9 +677,10 @@ fn main() {
     samples.extend(malformed_samples);
 
     let invalid_signature_rejected = !maximum.invalid_aggregate.verify_at_epoch_uncached(
-        maximum.transaction.clone(),
-        maximum.miner.clone(),
+        &maximum.transaction,
+        &maximum.miner,
         maximum.epoch,
+        &maximum.registry,
     );
     let invalid_samples = measure(
         "reject_invalid_signature",
@@ -602,9 +689,10 @@ fn main() {
         args.repetitions,
         |_| {
             !maximum.invalid_aggregate.verify_at_epoch_uncached(
-                maximum.transaction.clone(),
-                maximum.miner.clone(),
+                &maximum.transaction,
+                &maximum.miner,
                 maximum.epoch,
+                &maximum.registry,
             )
         },
     );
@@ -618,9 +706,10 @@ fn main() {
     samples.extend(invalid_samples);
 
     let wrong_epoch_rejected = !maximum.aggregate.verify_at_epoch_uncached(
-        maximum.transaction.clone(),
-        maximum.miner.clone(),
+        &maximum.transaction,
+        &maximum.miner,
         maximum.epoch + 1,
+        &maximum.registry,
     );
     let wrong_epoch_samples = measure(
         "reject_wrong_epoch",
@@ -629,9 +718,10 @@ fn main() {
         args.repetitions,
         |_| {
             !maximum.aggregate.verify_at_epoch_uncached(
-                maximum.transaction.clone(),
-                maximum.miner.clone(),
+                &maximum.transaction,
+                &maximum.miner,
                 maximum.epoch + 1,
+                &maximum.registry,
             )
         },
     );
@@ -645,11 +735,12 @@ fn main() {
     samples.extend(wrong_epoch_samples);
 
     let mut repeated = maximum.aggregate.clone();
-    repeated.paths[1] = repeated.paths[0].clone();
+    repeated.paths[1] = repeated.paths[0];
     let repeated_identity_rejected = !repeated.verify_at_epoch_uncached(
-        maximum.transaction.clone(),
-        maximum.miner.clone(),
+        &maximum.transaction,
+        &maximum.miner,
         maximum.epoch,
+        &maximum.registry,
     );
 
     write_samples(&args.samples, &samples);
@@ -685,6 +776,7 @@ fn main() {
         wrong_epoch_rejected,
         repeated_identity_rejected,
         failed_sample_checks,
+        certificate_sizes: fixtures.iter().map(certificate_sizes).collect(),
         passed,
         samples_csv: args.samples.display().to_string(),
         summary_csv: args.summary.display().to_string(),

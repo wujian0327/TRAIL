@@ -3,10 +3,12 @@ pub mod path;
 pub mod transaction;
 
 use crate::blockchain::block::Block;
+use crate::consensus::ValidatorRegistry;
 use log::error;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -16,6 +18,8 @@ pub struct Blockchain {
     pub transaction_index: HashSet<String>,
     #[serde(skip)]
     pub max_blocks_in_memory: usize,
+    #[serde(skip)]
+    validator_registry: Arc<ValidatorRegistry>,
 }
 
 impl Blockchain {
@@ -27,8 +31,18 @@ impl Blockchain {
         Blockchain {
             blocks: vec![genesis_block],
             transaction_index: set,
+            validator_registry: Arc::default(),
             max_blocks_in_memory: 100, // 默认只在内存中保留最近的100个区块
         }
+    }
+
+    pub fn with_validator_registry(mut self, registry: Arc<ValidatorRegistry>) -> Self {
+        self.validator_registry = registry;
+        self
+    }
+
+    pub fn validator_registry(&self) -> &Arc<ValidatorRegistry> {
+        &self.validator_registry
     }
 
     pub fn pop_block(&mut self) -> Option<Block> {
@@ -151,7 +165,7 @@ impl Blockchain {
     pub fn simple_print_last_five_block(&self) {
         let last_five = &self.blocks[self.blocks.len().saturating_sub(5)..];
         for x in last_five {
-            x.simple_print_no_transaction_detail();
+            x.simple_print_no_transaction_detail(&self.validator_registry);
         }
     }
 
@@ -183,7 +197,9 @@ impl Blockchain {
                 return;
             }
         };
-        let string = self.get_last_block().simple_print_no_transaction_string();
+        let string = self
+            .get_last_block()
+            .simple_print_no_transaction_string(&self.validator_registry);
         if let Err(e) = file.write_all(string.as_bytes()).await {
             error!("Error writing blockchain file: {}", e);
         }
@@ -250,11 +266,15 @@ mod tests {
             .is_test(true)
             .try_init();
 
-        let mut blockchain = Blockchain::new(Block::gen_genesis_block());
         let wallet = Wallet::new();
         let wallet2 = Wallet::new();
         let wallet3 = Wallet::new();
         let miner = Wallet::new();
+        let registry = Arc::new(
+            ValidatorRegistry::from_wallets([&wallet, &wallet2, &wallet3, &miner]).unwrap(),
+        );
+        let mut blockchain =
+            Blockchain::new(Block::gen_genesis_block()).with_validator_registry(registry.clone());
         let transaction = Transaction::new("123".to_string(), 32, wallet.clone());
         let mut transaction_paths = TransactionPaths::new(transaction.clone());
         transaction_paths.add_path(wallet2.address.clone(), wallet);
@@ -265,9 +285,9 @@ mod tests {
         assert!(transaction_paths.complete_pending_hop(miner.clone()));
         let body = Body::new(
             vec![transaction],
-            vec![AggregatedSignedPaths::from_transaction_paths(
-                transaction_paths,
-            )],
+            vec![transaction_paths
+                .to_aggregated_signed_paths(&registry)
+                .unwrap()],
         );
         let block = Block::new(
             blockchain.get_last_index() + 1,
@@ -300,8 +320,9 @@ mod tests {
             blockchain.get_last_hash(),
             Body::new(
                 vec![tx1.clone()],
-                vec![AggregatedSignedPaths::from_transaction_paths(
-                    TransactionPaths::new(tx1.clone()),
+                vec![AggregatedSignedPaths::empty(
+                    crate::blockchain::path::DEFAULT_TRAIL_CHAIN_ID,
+                    0,
                 )],
             ),
             miner.clone(),
@@ -316,8 +337,9 @@ mod tests {
             blockchain.get_last_hash(),
             Body::new(
                 vec![tx2.clone()],
-                vec![AggregatedSignedPaths::from_transaction_paths(
-                    TransactionPaths::new(tx2),
+                vec![AggregatedSignedPaths::empty(
+                    crate::blockchain::path::DEFAULT_TRAIL_CHAIN_ID,
+                    0,
                 )],
             ),
             miner.clone(),
@@ -335,8 +357,9 @@ mod tests {
             blockchain.get_last_hash(),
             Body::new(
                 vec![tx1.clone()],
-                vec![AggregatedSignedPaths::from_transaction_paths(
-                    TransactionPaths::new(tx1),
+                vec![AggregatedSignedPaths::empty(
+                    crate::blockchain::path::DEFAULT_TRAIL_CHAIN_ID,
+                    0,
                 )],
             ),
             miner,

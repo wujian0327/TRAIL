@@ -16,6 +16,9 @@ pub mod minotaur;
 pub mod pos;
 pub mod pow;
 pub mod trail;
+mod validator_registry;
+
+pub use validator_registry::{ValidatorIndex, ValidatorRegistry, ValidatorRegistryError};
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusType {

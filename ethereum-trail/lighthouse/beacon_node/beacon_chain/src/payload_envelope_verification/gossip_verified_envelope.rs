@@ -350,6 +350,8 @@ mod tests {
             parent_root: Hash256::ZERO,
             state_root: Hash256::ZERO,
             body: BeaconBlockBodyGloas {
+                trail_evidence_root: Default::default(),
+                trail_evidence_records: ssz_types::VariableList::empty(),
                 randao_reveal: Signature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::ZERO,

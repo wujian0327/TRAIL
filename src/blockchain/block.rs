@@ -1,5 +1,6 @@
-use crate::blockchain::path::{AggregatedSignedPaths, TransactionPaths};
+use crate::blockchain::path::{AggregatedSignedPaths, DEFAULT_TRAIL_CHAIN_ID};
 use crate::blockchain::transaction::Transaction;
+use crate::consensus::{ValidatorRegistry, ValidatorRegistryError};
 use crate::tools;
 use crate::wallet::Wallet;
 use hex::{decode, encode};
@@ -149,18 +150,26 @@ impl Block {
         true
     }
 
-    pub fn verify_path_evidence(&self, transaction_index: usize) -> bool {
+    pub fn verify_path_evidence(
+        &self,
+        transaction_index: usize,
+        registry: &ValidatorRegistry,
+    ) -> bool {
         let Some(transaction) = self.body.transactions.get(transaction_index) else {
             return false;
         };
         let Some(path) = self.body.paths.get(transaction_index) else {
             return false;
         };
-        path.verify_at_epoch(
-            transaction.clone(),
-            self.header.miner.clone(),
-            self.header.epoch,
-        )
+        // The synthetic genesis proposer is outside the validator roster.
+        if self.header.index == 0 && path.paths.is_empty() {
+            return path.signature.is_empty()
+                && path.epoch == self.header.epoch
+                && path.chain_id == DEFAULT_TRAIL_CHAIN_ID
+                && transaction.from == self.header.miner
+                && transaction.verify();
+        }
+        path.verify_at_epoch(transaction, &self.header.miner, self.header.epoch, registry)
     }
 
     pub fn cal_merkle_root(mut leaves: Vec<String>) -> String {
@@ -197,48 +206,46 @@ impl Block {
     pub fn gen_genesis_block() -> Block {
         let miner = Wallet::new();
         let transaction = Transaction::new("000".to_string(), 50, miner.clone());
-        let transaction_paths = TransactionPaths::new(transaction.clone());
-        let paths = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
+        let paths = AggregatedSignedPaths::empty(DEFAULT_TRAIL_CHAIN_ID, 0);
         let body = Body::new(vec![transaction], vec![paths]);
         Block::new(0, 0, 0, "".to_string(), body, miner).unwrap()
     }
 
-    pub fn count_node_paths_map(&self) -> HashMap<String, usize> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for x in self.body.paths.clone() {
-            for p in x.full_path(self.header.miner.clone()) {
-                counts
-                    .entry(p)
-                    .and_modify(|counter| *counter += 1)
-                    .or_insert(1);
-            }
+    pub fn decode_path(
+        &self,
+        path: &AggregatedSignedPaths,
+        registry: &ValidatorRegistry,
+    ) -> Result<Vec<String>, ValidatorRegistryError> {
+        if self.header.index == 0 && path.paths.is_empty() {
+            return Ok(vec![self.header.miner.clone()]);
+        }
+        path.full_path(&self.header.miner, registry)
+    }
+
+    pub fn count_node_paths_map(&self, registry: &ValidatorRegistry) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        for address in self.get_all_paths(registry).into_iter().flatten() {
+            *counts.entry(address).or_insert(0) += 1;
         }
         counts
     }
 
-    pub fn count_node_paths(&self, address: String) -> usize {
-        self.count_node_paths_map()
+    pub fn count_node_paths(&self, address: String, registry: &ValidatorRegistry) -> usize {
+        self.count_node_paths_map(registry)
             .get(&address)
-            .or_else(|| Some(&(0usize)))
-            .unwrap()
-            .clone()
+            .copied()
+            .unwrap_or(0)
     }
 
-    pub fn count_all_paths(&self) -> usize {
-        let mut counts = 0;
-        for x in self.body.paths.clone() {
-            for _y in x.full_path(self.header.miner.clone()) {
-                counts += 1;
-            }
-        }
-        counts
+    pub fn count_all_paths(&self, registry: &ValidatorRegistry) -> usize {
+        self.get_all_paths(registry).iter().map(Vec::len).sum()
     }
 
-    pub fn get_all_paths(&self) -> Vec<Vec<String>> {
+    pub fn get_all_paths(&self, registry: &ValidatorRegistry) -> Vec<Vec<String>> {
         self.body
             .paths
             .iter()
-            .map(|p| p.full_path(self.header.miner.clone()))
+            .filter_map(|path| self.decode_path(path, registry).ok())
             .collect()
     }
 
@@ -251,7 +258,7 @@ impl Block {
         serde_json::to_vec(&self).unwrap()
     }
 
-    pub fn simple_print_with_transaction(&self) {
+    pub fn simple_print_with_transaction(&self, registry: &ValidatorRegistry) {
         info!("Block[{}]:", self.header.index);
         info!("\t epoch:{}:", self.header.epoch);
         info!("\t slot:{}:", self.header.slot);
@@ -263,18 +270,16 @@ impl Block {
             info!("\t\t from:{}:", x.from);
             info!("\t\t to:{}:", x.to);
             info!("\t\t paths:");
-            let mut s = String::from("");
-            for (j, p) in self.body.paths[i]
-                .full_path(self.header.miner.clone())
-                .iter()
-                .enumerate()
-            {
-                if j == 0 {
-                    s.push_str("\t\t\t");
-                }
-                s.push_str(format!("->{}", p).as_str());
+            let path = self
+                .body
+                .paths
+                .get(i)
+                .map(|path| self.decode_path(path, registry));
+            match path {
+                Some(Ok(nodes)) => info!("\t\t\t{}", nodes.join("->")),
+                Some(Err(error)) => info!("\t\t\t{error}"),
+                None => info!("\t\t\tmissing path evidence"),
             }
-            info!("{}", s);
         }
     }
 
@@ -287,7 +292,7 @@ impl Block {
         info!("\t transactions:{}:", self.body.transactions.len());
     }
 
-    pub fn simple_print_no_transaction_string(&self) -> String {
+    pub fn simple_print_no_transaction_string(&self, registry: &ValidatorRegistry) -> String {
         let mut s = format!("Block[{}]: \n", self.header.index);
         s.push_str(format!("\t epoch:{} \n", self.header.epoch).as_str());
         s.push_str(format!("\t slot:{} \n", self.header.slot).as_str());
@@ -304,14 +309,17 @@ impl Block {
             .body
             .paths
             .iter()
-            .map(|p| p.full_path(self.header.miner.clone()).join("->"))
+            .map(|path| match self.decode_path(path, registry) {
+                Ok(nodes) => nodes.join("->"),
+                Err(error) => error.to_string(),
+            })
             .collect();
         s.push_str(format!("\t paths[{}]\n", paths.join(",")).as_str());
         s
     }
 
-    pub fn simple_print_no_transaction_detail(&self) {
-        info!("{}", self.simple_print_no_transaction_string());
+    pub fn simple_print_no_transaction_detail(&self, registry: &ValidatorRegistry) {
+        info!("{}", self.simple_print_no_transaction_string(registry));
     }
 
     pub fn bytes(&self) -> u64 {
@@ -337,6 +345,7 @@ impl Body {
 pub enum BlockError {
     InvalidBlock,
     InvalidBlockPath,
+    ValidatorRegistry(ValidatorRegistryError),
     InvalidBlockTransactions,
     JSONError,
 }
@@ -344,6 +353,7 @@ pub enum BlockError {
 impl fmt::Display for BlockError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            BlockError::ValidatorRegistry(ref error) => write!(f, "{error}"),
             BlockError::InvalidBlock => {
                 write!(f, "Invalid Block Error")
             }
@@ -361,6 +371,12 @@ impl fmt::Display for BlockError {
     }
 }
 
+impl From<ValidatorRegistryError> for BlockError {
+    fn from(error: ValidatorRegistryError) -> Self {
+        Self::ValidatorRegistry(error)
+    }
+}
+
 impl From<serde_json::error::Error> for BlockError {
     fn from(_: serde_json::error::Error) -> Self {
         BlockError::JSONError
@@ -370,6 +386,7 @@ impl From<serde_json::error::Error> for BlockError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blockchain::path::TransactionPaths;
 
     #[test]
     fn test_block() {
@@ -378,6 +395,8 @@ mod tests {
         let wallet3 = Wallet::new();
         let miner = Wallet::new();
 
+        let registry =
+            ValidatorRegistry::from_wallets([&wallet, &wallet2, &wallet3, &miner]).unwrap();
         let transaction = Transaction::new("123".to_string(), 32, wallet.clone());
         let mut transaction_paths = TransactionPaths::new(transaction.clone());
         transaction_paths.add_path(wallet2.address.clone(), wallet);
@@ -388,9 +407,9 @@ mod tests {
         assert!(transaction_paths.complete_pending_hop(miner.clone()));
         let body = Body::new(
             vec![transaction],
-            vec![AggregatedSignedPaths::from_transaction_paths(
-                transaction_paths,
-            )],
+            vec![transaction_paths
+                .to_aggregated_signed_paths(&registry)
+                .unwrap()],
         );
         let block = match Block::new(0, 0, 0, String::from(""), body, miner) {
             Ok(block) => block,
@@ -405,7 +424,16 @@ mod tests {
 
     #[test]
     fn test_gen_genesis_block() {
-        println!("{:#?}", Block::gen_genesis_block());
+        let genesis = Block::gen_genesis_block();
+        let registry = ValidatorRegistry::default();
+        assert!(genesis.verify_base());
+        assert!(genesis.verify_path_evidence(0, &registry));
+        assert_eq!(genesis.body.paths[0].bytes(), 0);
+        assert_eq!(
+            genesis.get_all_paths(&registry),
+            vec![vec![genesis.header.miner.clone()]]
+        );
+        assert!(!genesis.verify_path_evidence(1, &registry));
     }
 
     #[test]
@@ -413,6 +441,7 @@ mod tests {
         let origin = Wallet::new();
         let relay = Wallet::new();
         let miner = Wallet::new();
+        let registry = ValidatorRegistry::from_wallets([&origin, &relay, &miner]).unwrap();
         let transaction = Transaction::new("123".to_string(), 32, origin.clone());
         let mut transaction_paths = TransactionPaths::new(transaction.clone());
         transaction_paths.add_path(relay.address.clone(), origin);
@@ -421,14 +450,62 @@ mod tests {
         assert!(transaction_paths.complete_pending_hop(miner.clone()));
         let body = Body::new(
             vec![transaction],
-            vec![AggregatedSignedPaths::from_transaction_paths(
-                transaction_paths,
-            )],
+            vec![transaction_paths
+                .to_aggregated_signed_paths(&registry)
+                .unwrap()],
         );
         let mut block = Block::new(1, 0, 0, String::from("parent"), body, miner).unwrap();
         assert!(block.verify_base());
+        assert!(block.verify_path_evidence(0, &registry));
+        let decoded = Block::from_json(block.to_json()).unwrap();
+        assert!(decoded.verify_base());
+        assert!(decoded.verify_path_evidence(0, &registry));
 
-        block.body.paths[0].paths[0] = "0xdeadbeef".to_string();
+        block.body.paths[0].paths[0] = u64::MAX;
         assert!(!block.verify_base());
+        block.header.path_root = Block::cal_path_root(&block.body.paths);
+        block.header.hash = block.header.get_hash();
+        assert!(block.verify_base());
+        assert!(!block.verify_path_evidence(0, &registry));
+    }
+
+    #[test]
+    fn path_signatures_cannot_cancel_between_certificates() {
+        let origin = Wallet::new();
+        let miner = Wallet::new();
+        let registry = ValidatorRegistry::from_wallets([&origin, &miner]).unwrap();
+        let transactions: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|amount| Transaction::new(miner.address.clone(), amount, origin.clone()))
+            .collect();
+        let mut certs: Vec<_> = transactions
+            .iter()
+            .map(|transaction| {
+                let mut path = TransactionPaths::new(transaction.clone());
+                assert!(path.append_completed_hop(
+                    miner.address.clone(),
+                    origin.clone(),
+                    miner.clone()
+                ));
+                path.to_aggregated_signed_paths(&registry).unwrap()
+            })
+            .collect();
+        let body = Body::new(transactions.clone(), certs.clone());
+        let valid = Block::new(1, 0, 0, String::new(), body, miner.clone()).unwrap();
+        assert!((0..2).all(|index| valid.verify_path_evidence(index, &registry)));
+        // The sum of both certificates would stay the same after this swap.
+        let (first, second) = certs.split_at_mut(1);
+        std::mem::swap(&mut first[0].signature, &mut second[0].signature);
+        let swapped = Block::new(
+            1,
+            0,
+            0,
+            String::new(),
+            Body::new(transactions, certs),
+            miner,
+        )
+        .unwrap();
+        assert!(swapped.verify_base());
+        assert!((0..2).all(|index| !swapped.verify_path_evidence(index, &registry)));
     }
 }

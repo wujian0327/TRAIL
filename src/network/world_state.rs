@@ -1,12 +1,14 @@
 use crate::blockchain::block::{Block, BlockError, Body};
-use crate::blockchain::path::{conflicting_receipt_count, AggregatedSignedPaths, TransactionPaths};
+use crate::blockchain::path::{conflicting_receipt_count, TransactionPaths};
 use crate::blockchain::transaction::Transaction;
 use crate::blockchain::{BlockChainError, Blockchain};
 use crate::consensus::minotaur::MinotaurConsensus;
 use crate::consensus::pos::PosConsensus;
 use crate::consensus::pow::PowConsensus;
 use crate::consensus::trail::{RewardPolicy, TrailConfig, TrailConsensus};
-use crate::consensus::{Consensus, ConsensusMetricsSnapshot, ConsensusType, RandaoSeed, Validator};
+use crate::consensus::{
+    Consensus, ConsensusMetricsSnapshot, ConsensusType, RandaoSeed, Validator, ValidatorRegistry,
+};
 use crate::metrics::{
     self, calculate_hhi, calculate_stake_concentration, AttackOnlyMetrics, EpochMetrics,
     FloodingAuditState, NodeEpochMetrics, RunSummary, SlotMetrics,
@@ -63,6 +65,7 @@ pub struct WorldState {
     adaptive_failure_seed: u64,
     pub node_availability: HashMap<String, Arc<AtomicBool>>,
     pub blockchain: Arc<RwLock<Blockchain>>,
+    validator_registry: Arc<ValidatorRegistry>,
     pub consensus: Box<dyn Consensus>,
     consensus_name: String,
     metrics_filename: String,
@@ -387,8 +390,8 @@ impl WorldState {
         generated_tx_counter: Arc<AtomicU64>,
         fee_spent: Arc<std::sync::Mutex<HashMap<String, f64>>>,
         flooding_audit: Arc<Mutex<FloodingAuditState>>,
-    ) -> (Self, Sender<Message>, Receiver<Message>) {
-        let (sender, receiver) = tokio::sync::mpsc::channel(4096);
+    ) -> Self {
+        let validator_registry = blockchain.validator_registry().clone();
         let nodes_sender: HashMap<String, Sender<Message>> = HashMap::new();
         let slot_duration = Duration::from_secs(slot_duration_secs);
         let real_slot_duration = if real_time {
@@ -399,8 +402,12 @@ impl WorldState {
         let consensus_name = consensus_type.to_string();
         let consensus: Box<dyn Consensus> = match consensus_type {
             ConsensusType::Trail => Box::new(
-                TrailConsensus::new(base_reward, trail_config.clone())
-                    .expect("invalid TRAIL config"),
+                TrailConsensus::new(
+                    base_reward,
+                    trail_config.clone(),
+                    validator_registry.clone(),
+                )
+                .expect("invalid TRAIL config"),
             ),
             ConsensusType::POS => Box::new(PosConsensus::new(base_reward)),
             ConsensusType::POW => Box::new(PowConsensus::new(
@@ -484,91 +491,88 @@ impl WorldState {
             .open(&proposer_duties_filename)
             .ok();
 
-        (
-            WorldState {
-                current_slot: Arc::new(RwLock::new(SlotManager {
-                    randao_seeds: vec![],
-                    slot_duration,
-                    current_epoch: 0,
-                    current_slot: 0,
-                    next_seed: derive_election_seed(election_seed, 0, 0, 0),
-                    start_timestamp: genesis_block.header.timestamp,
-                })),
-                validators: Arc::new(RwLock::new(vec![])),
-                account_balances: Arc::new(RwLock::new(HashMap::new())),
-                nodes_sender,
-                node_wallets: HashMap::new(),
-                node_mempools: HashMap::new(),
-                coalition_experiment: None,
-                node_relay_profiles: HashMap::new(),
-                node_relay_forward_counters: HashMap::new(),
-                adaptive_relay_config: AdaptiveRelayConfig::default(),
-                adaptive_relay_costs: HashMap::new(),
-                adaptive_benefit_ema: None,
-                adaptive_benefit_estimator: AdaptiveBenefitEstimator::default(),
-                adaptive_observation_window: AdaptiveObservationWindow::default(),
-                adaptive_update_round: 0,
-                adaptive_failure_seed: 0,
-                node_availability: HashMap::new(),
-                blockchain: Arc::new(RwLock::new(blockchain)),
-                consensus,
-                consensus_name,
-                metrics_filename: metrics_path.to_string_lossy().to_string(),
-                metrics_slots_file,
-                epoch_metrics_filename,
-                epoch_metrics_file,
-                node_epoch_metrics_filename,
-                node_epoch_metrics_file,
-                adaptive_relay_metrics_filename,
-                adaptive_relay_metrics_file,
-                inclusion_samples_filename,
-                inclusion_samples_file,
-                generation_samples_filename,
-                generation_samples_file,
-                run_summary_filename,
-                proposer_duties_filename,
-                proposer_duties_file,
-                run_id,
+        WorldState {
+            current_slot: Arc::new(RwLock::new(SlotManager {
+                randao_seeds: vec![],
                 slot_duration,
-                real_slot_duration,
-                slot_per_epoch,
-                election_seed,
-                outage_start_epoch: u64::MAX,
-                outage_duration_epochs: 0,
-                outage_validator_indices: HashSet::new(),
-                outage_validator_addresses: HashSet::new(),
-                outage_common_slot_randomness: false,
-                logical_slot_counter: Arc::new(AtomicU64::new(0)),
-                generated_tx_counter,
-                last_generated_tx_counter: 0,
-                fee_spent,
-                flooding_audit,
-                nodes_index: HashMap::new(),
-                adversarial_nodes: HashSet::new(),
-                focal_relayer_nodes: HashSet::new(),
-                node_degrees: HashMap::new(),
-                node_betweenness: HashMap::new(),
-                last_relay_forward_attempts: HashMap::new(),
-                epoch_proposer_counts: HashMap::new(),
-                total_included_tx: 0,
-                total_reward_income: HashMap::new(),
-                block_production_success: 0,
-                block_production_failed: 0,
-                last_block_production_success: 0,
-                last_block_production_failed: 0,
-                base_reward,
-                reward_reinvestment_rate: if reward_reinvestment_rate.is_finite() {
-                    reward_reinvestment_rate.clamp(0.0, 1.0)
-                } else {
-                    0.0
-                },
-                max_epochs,
-                max_tx_per_block,
-                confirmation_latency_adjustment_s,
+                current_epoch: 0,
+                current_slot: 0,
+                next_seed: derive_election_seed(election_seed, 0, 0, 0),
+                start_timestamp: genesis_block.header.timestamp,
+            })),
+            validators: Arc::new(RwLock::new(vec![])),
+            account_balances: Arc::new(RwLock::new(HashMap::new())),
+            nodes_sender,
+            node_wallets: HashMap::new(),
+            node_mempools: HashMap::new(),
+            coalition_experiment: None,
+            node_relay_profiles: HashMap::new(),
+            node_relay_forward_counters: HashMap::new(),
+            adaptive_relay_config: AdaptiveRelayConfig::default(),
+            adaptive_relay_costs: HashMap::new(),
+            adaptive_benefit_ema: None,
+            adaptive_benefit_estimator: AdaptiveBenefitEstimator::default(),
+            adaptive_observation_window: AdaptiveObservationWindow::default(),
+            adaptive_update_round: 0,
+            adaptive_failure_seed: 0,
+            node_availability: HashMap::new(),
+            blockchain: Arc::new(RwLock::new(blockchain)),
+            validator_registry,
+            consensus,
+            consensus_name,
+            metrics_filename: metrics_path.to_string_lossy().to_string(),
+            metrics_slots_file,
+            epoch_metrics_filename,
+            epoch_metrics_file,
+            node_epoch_metrics_filename,
+            node_epoch_metrics_file,
+            adaptive_relay_metrics_filename,
+            adaptive_relay_metrics_file,
+            inclusion_samples_filename,
+            inclusion_samples_file,
+            generation_samples_filename,
+            generation_samples_file,
+            run_summary_filename,
+            proposer_duties_filename,
+            proposer_duties_file,
+            run_id,
+            slot_duration,
+            real_slot_duration,
+            slot_per_epoch,
+            election_seed,
+            outage_start_epoch: u64::MAX,
+            outage_duration_epochs: 0,
+            outage_validator_indices: HashSet::new(),
+            outage_validator_addresses: HashSet::new(),
+            outage_common_slot_randomness: false,
+            logical_slot_counter: Arc::new(AtomicU64::new(0)),
+            generated_tx_counter,
+            last_generated_tx_counter: 0,
+            fee_spent,
+            flooding_audit,
+            nodes_index: HashMap::new(),
+            adversarial_nodes: HashSet::new(),
+            focal_relayer_nodes: HashSet::new(),
+            node_degrees: HashMap::new(),
+            node_betweenness: HashMap::new(),
+            last_relay_forward_attempts: HashMap::new(),
+            epoch_proposer_counts: HashMap::new(),
+            total_included_tx: 0,
+            total_reward_income: HashMap::new(),
+            block_production_success: 0,
+            block_production_failed: 0,
+            last_block_production_success: 0,
+            last_block_production_failed: 0,
+            base_reward,
+            reward_reinvestment_rate: if reward_reinvestment_rate.is_finite() {
+                reward_reinvestment_rate.clamp(0.0, 1.0)
+            } else {
+                0.0
             },
-            sender,
-            receiver,
-        )
+            max_epochs,
+            max_tx_per_block,
+            confirmation_latency_adjustment_s,
+        }
     }
 
     pub fn configure_adaptive_relay(&mut self, config: AdaptiveRelayConfig, failure_seed: u64) {
@@ -1056,34 +1060,32 @@ impl WorldState {
             valid_paths
         };
 
-        if self.coalition_experiment.is_none() && !transaction_paths_to_pack.is_empty() {
-            let mut transaction_paths_cache = mempool.write().await;
-            for paths in &transaction_paths_to_pack {
-                transaction_paths_cache.remove(&paths.transaction.hash);
-            }
-        }
-
         let mut transactions = Vec::with_capacity(transaction_paths_to_pack.len());
         let mut paths = Vec::with_capacity(transaction_paths_to_pack.len());
         for transaction_paths in transaction_paths_to_pack {
+            paths.push(transaction_paths.to_aggregated_signed_paths(&self.validator_registry)?);
             transactions.push(transaction_paths.transaction.clone());
-            paths.push(AggregatedSignedPaths::from_transaction_paths(
-                transaction_paths.as_ref().clone(),
-            ));
         }
 
         let (last_index, last_hash) = {
             let blockchain = self.blockchain.read().await;
             (blockchain.get_last_index(), blockchain.get_last_hash())
         };
-        Block::new(
+        let block = Block::new(
             last_index + 1,
             epoch,
             slot,
             last_hash,
             Body::new(transactions, paths),
             wallet,
-        )
+        )?;
+        if self.coalition_experiment.is_none() && !block.body.transactions.is_empty() {
+            let mut transaction_paths_cache = mempool.write().await;
+            for transaction in &block.body.transactions {
+                transaction_paths_cache.remove(&transaction.hash);
+            }
+        }
+        Ok(block)
     }
 
     async fn finalize_coalition_candidates(
@@ -1144,11 +1146,12 @@ impl WorldState {
             if !chosen.complete_pending_hop(self.node_wallets[&miner.address].clone()) {
                 return Err(BlockError::InvalidBlock);
             }
-            let certificate = AggregatedSignedPaths::from_transaction_paths(chosen.clone());
+            let certificate = chosen.to_aggregated_signed_paths(&self.validator_registry)?;
             if !certificate.verify_at_epoch_uncached(
-                chosen.transaction.clone(),
-                miner.address.clone(),
+                &chosen.transaction,
+                &miner.address,
                 epoch,
+                &self.validator_registry,
             ) {
                 return Err(BlockError::InvalidBlock);
             }
@@ -1284,7 +1287,7 @@ impl WorldState {
 
         let throughput = tx_count as f64 / self.slot_duration.as_secs_f64().max(1.0);
 
-        let paths = last_block.get_all_paths();
+        let paths = last_block.get_all_paths(&self.validator_registry);
         let path_stats = metrics::calculate_path_stats(paths);
 
         // Calculate stake concentration from stakes
@@ -1387,7 +1390,7 @@ impl WorldState {
         for block in &epoch_blocks {
             for (idx, tx) in block.body.transactions.iter().enumerate() {
                 let included_slot = block.header.epoch * self.slot_per_epoch + block.header.slot;
-                let evidence_eligible = block.verify_path_evidence(idx);
+                let evidence_eligible = block.verify_path_evidence(idx, &self.validator_registry);
                 if let Some(created_slot) = tx_logical_slot(tx, self.slot_per_epoch) {
                     let slots = included_slot.saturating_sub(created_slot);
                     let latency = slots as f64 * self.slot_duration.as_secs_f64()
@@ -1404,11 +1407,12 @@ impl WorldState {
                     ));
                 }
                 if let Some(path) = block.body.paths.get(idx) {
-                    let full_path = path.full_path(block.header.miner.clone());
-                    path_lengths.push(full_path.len().saturating_sub(1) as f64);
-                    for receiver in &full_path {
-                        conflict_count +=
-                            conflicting_receipt_count(&tx.hash, path.epoch, receiver) as u64;
+                    if let Ok(full_path) = block.decode_path(path, &self.validator_registry) {
+                        path_lengths.push(full_path.len().saturating_sub(1) as f64);
+                        for receiver in &full_path {
+                            conflict_count +=
+                                conflicting_receipt_count(&tx.hash, path.epoch, receiver) as u64;
+                        }
                     }
                 }
                 if evidence_eligible {
@@ -2231,10 +2235,12 @@ impl WorldState {
                 let Some(path) = block.body.paths.get(idx) else {
                     continue;
                 };
-                if !block.verify_path_evidence(idx) {
+                if !block.verify_path_evidence(idx, &self.validator_registry) {
                     continue;
                 }
-                let full_path = path.full_path(block.header.miner.clone());
+                let Ok(full_path) = block.decode_path(path, &self.validator_registry) else {
+                    continue;
+                };
                 let path_length = full_path.len().saturating_sub(1);
                 if path_length < 2 {
                     continue;
@@ -2279,13 +2285,9 @@ impl WorldState {
                             .body
                             .paths
                             .get(idx)
-                            .filter(|_| block.verify_path_evidence(idx))
+                            .filter(|_| block.verify_path_evidence(idx, &self.validator_registry))
                             .map(|path| {
-                                let k = path
-                                    .full_path(block.header.miner.clone())
-                                    .len()
-                                    .saturating_sub(1)
-                                    .max(1);
+                                let k = path.paths.len().max(1);
                                 TrailConsensus::ersoy_fee_share(
                                     tx.fee,
                                     snapshot.ersoy_c.unwrap_or(0.25),
@@ -2302,10 +2304,12 @@ impl WorldState {
                 let Some(path) = block.body.paths.get(idx) else {
                     continue;
                 };
-                if !block.verify_path_evidence(idx) {
+                if !block.verify_path_evidence(idx, &self.validator_registry) {
                     continue;
                 }
-                let full_path = path.full_path(block.header.miner.clone());
+                let Ok(full_path) = block.decode_path(path, &self.validator_registry) else {
+                    continue;
+                };
                 let path_length = full_path.len().saturating_sub(1);
                 if path_length < 2 {
                     continue;
@@ -2405,10 +2409,12 @@ impl WorldState {
                 let Some(path) = block.body.paths.get(idx) else {
                     continue;
                 };
-                if !block.verify_path_evidence(idx) {
+                if !block.verify_path_evidence(idx, &self.validator_registry) {
                     continue;
                 }
-                let full_path = path.full_path(block.header.miner.clone());
+                let Ok(full_path) = block.decode_path(path, &self.validator_registry) else {
+                    continue;
+                };
                 let path_length = full_path.len().saturating_sub(1);
                 if path_length < 2 {
                     continue;
@@ -2465,7 +2471,19 @@ impl WorldState {
                         Message::ReceiveBecomeValidator(validator) => {
                             let shared_self = shared_self.write().await;
                             let mut validators = shared_self.validators.write().await;
-                            validators.retain(|v| v.address != validator.address);
+                            if let Err(error) =
+                                shared_self.validator_registry.index(&validator.address)
+                            {
+                                warn!("Rejecting validator registration: {error}");
+                                continue;
+                            }
+                            if validators.iter().any(|v| v.address == validator.address) {
+                                warn!(
+                                    "Rejecting duplicate validator registration for {}",
+                                    validator.address
+                                );
+                                continue;
+                            }
                             validators.push(validator.clone());
                             drop(validators);
                             let mut balances = shared_self.account_balances.write().await;
@@ -2868,11 +2886,15 @@ mod tests {
         relays.sort_by(|a, b| a.address.cmp(&b.address));
         let miner = Wallet::new();
         let genesis = Block::gen_genesis_block();
-        let blockchain = Blockchain::new(genesis.clone());
+        let registry = Arc::new(
+            ValidatorRegistry::from_wallets([&origin, &relays[0], &relays[1], &miner]).unwrap(),
+        );
+        let blockchain = Blockchain::new(genesis.clone()).with_validator_registry(registry);
         let directory =
             std::env::temp_dir().join(format!("trail-coalition-test-{}", miner.address));
         let config = TrailConfig::default();
-        let (mut world, sender, _receiver) = WorldState::new(
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4096);
+        let mut world = WorldState::new(
             genesis,
             ConsensusType::Trail,
             blockchain.clone(),
@@ -3003,7 +3025,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(block.body.transactions.len(), 1);
-        assert!(block.verify_path_evidence(0));
+        assert!(block.verify_path_evidence(0, &world.validator_registry));
         assert!(block.verify());
         let audit = &world.coalition_experiment.as_ref().unwrap().pending_audits[0];
         assert_eq!(audit.candidate_count, 2);
@@ -3262,12 +3284,17 @@ mod tests {
             adversary.clone(),
         ));
         assert!(path.append_completed_hop(miner.address.clone(), adversary.clone(), miner.clone(),));
+        let registry =
+            Arc::new(ValidatorRegistry::from_wallets([&origin, &adversary, &miner]).unwrap());
         let block = Block::new(
             1,
             0,
             0,
             Block::gen_genesis_block().header.hash,
-            Body::new(vec![tx], vec![path.to_aggregated_signed_paths()]),
+            Body::new(
+                vec![tx],
+                vec![path.to_aggregated_signed_paths(&registry).unwrap()],
+            ),
             miner.clone(),
         )
         .unwrap();
@@ -3276,10 +3303,10 @@ mod tests {
             score_cost_reference: 1.0,
             ..TrailConfig::default()
         };
-        let (mut world, _sender, _receiver) = WorldState::new(
+        let mut world = WorldState::new(
             Block::gen_genesis_block(),
             ConsensusType::Trail,
-            Blockchain::new(Block::gen_genesis_block()),
+            Blockchain::new(Block::gen_genesis_block()).with_validator_registry(registry),
             1,
             5,
             20,
@@ -3331,7 +3358,8 @@ mod tests {
             .try_init();
 
         let blockchain = Blockchain::new(Block::gen_genesis_block());
-        let (world, _world_sender, world_receiver) = WorldState::new(
+        let (_world_sender, world_receiver) = tokio::sync::mpsc::channel(4096);
+        let world = WorldState::new(
             blockchain.get_last_block().clone(),
             ConsensusType::POS,
             Blockchain::new(Block::gen_genesis_block()),
@@ -3370,11 +3398,16 @@ mod tests {
             .is_test(true)
             .try_init();
 
-        let blockchain = Blockchain::new(Block::gen_genesis_block());
-        let (mut world, world_sender, world_receiver) = WorldState::new(
+        let wallet0 = Wallet::new();
+        let wallet1 = Wallet::new();
+        let registry = Arc::new(ValidatorRegistry::from_wallets([&wallet0, &wallet1]).unwrap());
+        let blockchain =
+            Blockchain::new(Block::gen_genesis_block()).with_validator_registry(registry);
+        let (world_sender, world_receiver) = tokio::sync::mpsc::channel(4096);
+        let mut world = WorldState::new(
             blockchain.get_last_block().clone(),
             ConsensusType::POS,
-            Blockchain::new(Block::gen_genesis_block()),
+            blockchain.clone(),
             5,
             5,
             20,
@@ -3400,25 +3433,25 @@ mod tests {
 
         let validators = world.validators.clone();
         let current_slot = world.current_slot.clone();
-        let mut node0 = Node::new(
+        let mut node0 = Node::new_with_wallet(
             0,
             0,
             0,
             blockchain.clone(),
+            wallet0,
             world_sender.clone(),
             1000,
             ConsensusType::Trail,
-            0,
         );
-        let mut node1 = Node::new(
+        let mut node1 = Node::new_with_wallet(
             1,
             0,
             0,
             blockchain,
+            wallet1,
             world_sender.clone(),
             1000,
             ConsensusType::Trail,
-            0,
         );
         let node0_sender = node0.sender.clone();
         let node1_sender = node1.sender.clone();
@@ -3475,7 +3508,16 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         {
             let validators = validators.read().await.clone();
+            assert_eq!(validators.len(), 2);
             info!("validators:{:?}", validators);
+        }
+        for address in [node0_wallet.address.clone(), Wallet::new().address] {
+            world_sender
+                .send(Message::new_receive_become_validator_msg(Validator::new(
+                    address, 999.0, 999.0,
+                )))
+                .await
+                .unwrap();
         }
 
         //send seed
@@ -3491,6 +3533,11 @@ mod tests {
         {
             let current_slot = current_slot.read().await.clone();
             info!("current_slot:{:?}", current_slot);
+        }
+        {
+            let validators = validators.read().await;
+            assert_eq!(validators.len(), 2);
+            assert!(validators.iter().all(|validator| validator.stake == 1.0));
         }
 
         //node0发送交易

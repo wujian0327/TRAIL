@@ -16,6 +16,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from run_experiments import ROOT, expand_runs, load_yaml
+from validator_indices import decode_certificate_path, load_validator_indices
 
 
 def json_lines(path: Path) -> list[dict]:
@@ -68,6 +69,7 @@ def aggregate_run(run: dict) -> dict:
     if any(int(epoch) not in range(run["max_epochs"]) for epoch in payments):
         raise ValueError(f"payment outside measurement timeline: {directory}")
     audits = json_lines(directory / "coalition_path_selections.jsonl")
+    validator_addresses = load_validator_indices(directory)
     seen = set()
     for a in audits:
         key = a["tx_hash"]
@@ -88,8 +90,9 @@ def aggregate_run(run: dict) -> dict:
         if len(paths) != len(set(paths)) or tuple(a["selected_path"]) not in paths:
             raise ValueError(f"duplicate or invented selected path: {directory}")
         certificate = a["selected_certificate"]
+        certificate_path = decode_certificate_path(certificate["paths"], validator_addresses)
         if (certificate["epoch"] != a["epoch"] or not certificate["signature"]
-                or certificate["paths"] + [a["proposer"]] != a["selected_path"]):
+                or certificate_path + [a["proposer"]] != a["selected_path"]):
             raise ValueError(f"selected certificate does not match the audited path: {directory}")
         expected = a["favoritism_path"] if a["applied_rule"] == "favoritism" else a["honest_path"]
         if (a["selected_path"] != expected

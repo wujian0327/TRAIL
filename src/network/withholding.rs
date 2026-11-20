@@ -3,11 +3,11 @@
 use super::{coalition, generate_stake_by_gini, graph, select_adversarial_nodes, SimulationConfig};
 use crate::blockchain::{
     block::{Block, Body},
-    path::{AggregatedSignedPaths, TransactionPaths},
+    path::TransactionPaths,
     transaction::Transaction,
     Blockchain,
 };
-use crate::consensus::{trail::TrailConsensus, Consensus, Validator};
+use crate::consensus::{trail::TrailConsensus, Consensus, Validator, ValidatorRegistry};
 use crate::{tools, wallet::Wallet};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::{Distribution, Poisson};
@@ -587,8 +587,17 @@ pub async fn run(config: &SimulationConfig) {
         .iter()
         .map(|p| Validator::new(p.wallet.address.clone(), p.stake, p.stake))
         .collect();
-    let mut consensus =
-        TrailConsensus::new(config.base_reward, config.trail_config.clone()).unwrap();
+    let registry = Arc::new(
+        ValidatorRegistry::from_wallets(peers.iter().map(|peer| &peer.wallet))
+            .expect("invalid withholding validator roster"),
+    );
+    super::write_validator_indices(directory, &registry);
+    let mut consensus = TrailConsensus::new(
+        config.base_reward,
+        config.trail_config.clone(),
+        registry.clone(),
+    )
+    .unwrap();
     consensus.enable_deterministic_reductions();
     consensus.freeze_proposer_weights(&validators);
     let mut genesis = Block::new(
@@ -602,7 +611,7 @@ pub async fn run(config: &SimulationConfig) {
     .unwrap();
     genesis.header.timestamp = 0;
     genesis.header.hash = genesis.header.get_hash();
-    let mut chain = Blockchain::new(genesis);
+    let mut chain = Blockchain::new(genesis).with_validator_registry(registry.clone());
     let mut transport = Transport {
         config,
         peers,
@@ -723,9 +732,9 @@ pub async fn run(config: &SimulationConfig) {
                 paths.iter().map(|p| p.transaction.clone()).collect(),
                 paths
                     .iter()
-                    .cloned()
-                    .map(AggregatedSignedPaths::from_transaction_paths)
-                    .collect(),
+                    .map(|path| path.to_aggregated_signed_paths(&registry))
+                    .collect::<Result<_, _>>()
+                    .expect("registered withholding path identities"),
             );
             let mut block = Block::new(
                 index_block,
@@ -741,12 +750,15 @@ pub async fn run(config: &SimulationConfig) {
             assert!(block.verify());
             for (i, tx) in block.body.transactions.iter().enumerate() {
                 assert!(block.body.paths[i].verify_at_epoch_uncached(
-                    tx.clone(),
-                    proposer.address.clone(),
-                    epoch
+                    tx,
+                    &proposer.address,
+                    epoch,
+                    &registry
                 ));
                 assert!(transport.included.insert(tx.hash.clone()));
-                let path = block.body.paths[i].full_path(proposer.address.clone());
+                let path = block.body.paths[i]
+                    .full_path(&proposer.address, &registry)
+                    .unwrap();
                 let hops = path.len().saturating_sub(1);
                 for position in 1..hops {
                     let q = TrailConsensus::transaction_credit_weight(

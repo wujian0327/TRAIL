@@ -1,9 +1,7 @@
 use crate::blockchain::block::Block;
-use crate::blockchain::path::AggregatedSignedPaths;
-use crate::blockchain::transaction::Transaction;
 use crate::blockchain::Blockchain;
 use crate::consensus::{
-    BalanceDelta, Consensus, ConsensusMetricsSnapshot, Validator, ValidatorError,
+    BalanceDelta, Consensus, ConsensusMetricsSnapshot, Validator, ValidatorError, ValidatorRegistry,
 };
 use clap::ValueEnum;
 use log::{debug, info};
@@ -11,6 +9,7 @@ use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 const FROZEN_V1_CONFIG_JSON: &str =
     include_str!("../../experiments/configs/protocol_frozen_v1.yaml");
@@ -138,6 +137,7 @@ pub struct RewardPlan {
 
 pub struct TrailConsensus {
     deterministic_reductions: bool,
+    validator_registry: Arc<ValidatorRegistry>,
     config: TrailConfig,
     base_reward: f64,
     /// Latest produced EMA state, whether activated or not.
@@ -157,10 +157,15 @@ pub struct TrailConsensus {
 }
 
 impl TrailConsensus {
-    pub fn new(base_reward: f64, config: TrailConfig) -> Result<Self, String> {
+    pub fn new(
+        base_reward: f64,
+        config: TrailConfig,
+        validator_registry: Arc<ValidatorRegistry>,
+    ) -> Result<Self, String> {
         config.validate()?;
         Ok(TrailConsensus {
             deterministic_reductions: false,
+            validator_registry,
             config,
             base_reward,
             score_history: HashMap::new(),
@@ -376,16 +381,10 @@ impl TrailConsensus {
 
         for (idx, tx) in block.body.transactions.iter().enumerate() {
             let relay_budget = (1.0 - self.config.proposer_fee_ratio) * tx.fee;
-            let Some(path) = block.body.paths.get(idx) else {
+            let Some(full_path) = self.valid_block_path(block, idx) else {
                 burned_relay_fee += relay_budget;
                 continue;
             };
-            if !self.valid_path_record(path, tx, &block.header.miner, block.header.epoch) {
-                burned_relay_fee += relay_budget;
-                continue;
-            }
-
-            let full_path = path.full_path(block.header.miner.clone());
             let path_length = full_path.len().saturating_sub(1);
             if path_length < 2 {
                 burned_relay_fee += relay_budget;
@@ -440,15 +439,10 @@ impl TrailConsensus {
             ..RewardPlan::default()
         };
         for (idx, tx) in block.body.transactions.iter().enumerate() {
-            let Some(path) = block.body.paths.get(idx) else {
+            let Some(full_path) = self.valid_block_path(block, idx) else {
                 plan.burned_relay_fee += tx.fee;
                 continue;
             };
-            if !self.valid_path_record(path, tx, &block.header.miner, block.header.epoch) {
-                plan.burned_relay_fee += tx.fee;
-                continue;
-            }
-            let full_path = path.full_path(block.header.miner.clone());
             let k = full_path.len().saturating_sub(1);
             // A proposer-originated transaction has no relay; the proposer
             // receives the entire fee, as with a direct client-to-proposer path.
@@ -577,13 +571,9 @@ impl TrailConsensus {
 
         for block in blocks {
             for (idx, tx) in block.body.transactions.iter().enumerate() {
-                let Some(path) = block.body.paths.get(idx) else {
+                let Some(full_path) = self.valid_block_path(block, idx) else {
                     continue;
                 };
-                if !self.valid_path_record(path, tx, &block.header.miner, block.header.epoch) {
-                    continue;
-                }
-                let full_path = path.full_path(block.header.miner.clone());
                 let path_length = full_path.len().saturating_sub(1);
                 if path_length < 2 {
                     continue;
@@ -628,16 +618,14 @@ impl TrailConsensus {
         map.iter().map(|(k, v)| (k.clone(), v / sum)).collect()
     }
 
-    fn valid_path_record(
-        &self,
-        path: &AggregatedSignedPaths,
-        tx: &Transaction,
-        miner: &str,
-        epoch: u64,
-    ) -> bool {
-        let path_length = path.full_path(miner.to_string()).len().saturating_sub(1);
-        path_length <= self.config.max_path_hops
-            && path.verify_at_epoch(tx.clone(), miner.to_string(), epoch)
+    fn valid_block_path(&self, block: &Block, index: usize) -> Option<Vec<String>> {
+        let path = block.body.paths.get(index)?;
+        if path.paths.len() > self.config.max_path_hops
+            || !block.verify_path_evidence(index, &self.validator_registry)
+        {
+            return None;
+        }
+        block.decode_path(path, &self.validator_registry).ok()
     }
 
     fn settle_matured_rewards(&mut self, current_block_index: u64) -> Vec<BalanceDelta> {
@@ -751,7 +739,7 @@ impl Consensus for TrailConsensus {
 mod tests {
     use super::*;
     use crate::blockchain::block::{Block, Body};
-    use crate::blockchain::path::{AggregatedSignedPaths, TransactionPaths};
+    use crate::blockchain::path::TransactionPaths;
     use crate::blockchain::transaction::Transaction;
     use crate::blockchain::Blockchain;
     use crate::consensus::Consensus;
@@ -836,7 +824,8 @@ mod tests {
             eta: 0.0,
             ..test_config()
         };
-        let mut consensus = TrailConsensus::new(0.1, config).unwrap();
+        let mut consensus =
+            TrailConsensus::new(0.1, config, registry(&[&origin, &relay, &miner])).unwrap();
         let plan = consensus.block_reward_plan(&block, &validators).unwrap();
         assert!((plan.proposer_reward - 0.85).abs() < 1e-12);
         assert!((plan.relay_reward - 0.25).abs() < 1e-12);
@@ -863,7 +852,7 @@ mod tests {
             eta: 0.0,
             ..test_config()
         };
-        let consensus = TrailConsensus::new(0.1, config).unwrap();
+        let consensus = TrailConsensus::new(0.1, config, registry(&[&origin, &miner])).unwrap();
         for source in [&origin, &miner] {
             let tx = Transaction::with_fee("receiver".into(), 0, 1.0, source.clone());
             let mut paths = TransactionPaths::new_with_epoch(tx.clone(), 0);
@@ -873,7 +862,9 @@ mod tests {
             }
             let body = Body::new(
                 vec![tx],
-                vec![AggregatedSignedPaths::from_transaction_paths(paths)],
+                vec![paths
+                    .to_aggregated_signed_paths(&consensus.validator_registry)
+                    .unwrap()],
             );
             let block = Block::new(
                 1,
@@ -898,7 +889,7 @@ mod tests {
             eta: 0.0,
             ..test_config()
         };
-        let mut consensus = TrailConsensus::new(0.1, config.clone()).unwrap();
+        let mut consensus = TrailConsensus::new(0.1, config.clone(), Arc::default()).unwrap();
         let validators = vec![
             Validator::new("a".into(), 1.0, 1.0),
             Validator::new("b".into(), 3.0, 1.0),
@@ -923,6 +914,10 @@ mod tests {
         }
     }
 
+    fn registry(wallets: &[&Wallet]) -> Arc<ValidatorRegistry> {
+        Arc::new(ValidatorRegistry::from_wallets(wallets.iter().copied()).unwrap())
+    }
+
     fn validators(wallets: &[&Wallet]) -> Vec<Validator> {
         wallets
             .iter()
@@ -943,7 +938,9 @@ mod tests {
         assert!(tx_paths.complete_pending_hop(relay.clone()));
         assert!(tx_paths.append_outgoing_hop(miner.address.clone(), relay.clone()));
         assert!(tx_paths.complete_pending_hop(miner.clone()));
-        let path = AggregatedSignedPaths::from_transaction_paths(tx_paths);
+        let path = tx_paths
+            .to_aggregated_signed_paths(&registry(&[origin, relay, miner]))
+            .unwrap();
         let body = Body::new(vec![tx], vec![path]);
         let block = Block::new(
             1,
@@ -977,7 +974,9 @@ mod tests {
         assert!(tx_paths.complete_pending_hop(relay.clone()));
         assert!(tx_paths.append_outgoing_hop(miner.address.clone(), relay.clone()));
         assert!(tx_paths.complete_pending_hop(miner.clone()));
-        let path = AggregatedSignedPaths::from_transaction_paths(tx_paths);
+        let path = tx_paths
+            .to_aggregated_signed_paths(&registry(&[origin, relay, miner]))
+            .unwrap();
         let body = Body::new(vec![tx], vec![path]);
         let block = Block::new(
             1,
@@ -1119,7 +1118,8 @@ mod tests {
         let miner = Wallet::new();
         let mut config = test_config();
         config.score_cost_reference = 10.0;
-        let consensus = TrailConsensus::new(1.0, config).unwrap();
+        let consensus =
+            TrailConsensus::new(1.0, config, registry(&[&origin, &relay, &miner])).unwrap();
         let (full_cost_block, validators) =
             block_with_path_and_cost(&origin, &relay, &miner, 1.0, 10.0);
         let (half_cost_block, _) = block_with_path_and_cost(&origin, &relay, &miner, 1.0, 5.0);
@@ -1136,7 +1136,7 @@ mod tests {
         let a = Wallet::new();
         let b = Wallet::new();
         let validators = validators(&[&a, &b]);
-        let mut consensus = TrailConsensus::new(1.0, test_config()).unwrap();
+        let mut consensus = TrailConsensus::new(1.0, test_config(), Arc::default()).unwrap();
         consensus
             .active_score_history
             .insert(a.address.clone(), 1e-9);
@@ -1164,7 +1164,8 @@ mod tests {
         let (block, validators) = block_with_path(&origin, &relay, &miner, 10.0);
         let mut config = test_config();
         config.score_activation_delay_epochs = 2;
-        let mut consensus = TrailConsensus::new(1.0, config).unwrap();
+        let mut consensus =
+            TrailConsensus::new(1.0, config, registry(&[&origin, &relay, &miner])).unwrap();
 
         consensus.on_epoch_end(&[block], &validators);
         assert_eq!(consensus.active_score_epoch(), None);
@@ -1188,12 +1189,14 @@ mod tests {
         let b = Wallet::new();
         let c = Wallet::new();
         let validators = validators(&[&a, &b, &c]);
-        let mut consensus = TrailConsensus::new(1.0, test_config()).unwrap();
+        let mut consensus =
+            TrailConsensus::new(1.0, test_config(), registry(&[&a, &b, &c])).unwrap();
         consensus.freeze_proposer_weights(&validators);
         let before = consensus.frozen_proposer_weights.clone();
 
         let (block, _) = block_with_path(&a, &b, &c, 10.0);
         consensus.update_scores_from_epoch(&[block], &validators);
+        assert!(consensus.score_history[&b.address] > 0.0);
 
         assert_eq!(before, consensus.frozen_proposer_weights);
     }
@@ -1204,7 +1207,7 @@ mod tests {
         let b = Wallet::new();
         let validators = validators(&[&a, &b]);
         let blockchain = Blockchain::new(Block::gen_genesis_block());
-        let mut consensus = TrailConsensus::new(1.0, test_config()).unwrap();
+        let mut consensus = TrailConsensus::new(1.0, test_config(), registry(&[&a, &b])).unwrap();
         consensus.freeze_proposer_weights(&validators);
         let before = consensus.score_history.clone();
 
@@ -1223,7 +1226,7 @@ mod tests {
             Validator::new(a.address.clone(), 1.0, 1.0),
             Validator::new(b.address.clone(), 3.0, 1.0),
         ];
-        let mut consensus = TrailConsensus::new(1.0, test_config()).unwrap();
+        let mut consensus = TrailConsensus::new(1.0, test_config(), Arc::default()).unwrap();
         consensus
             .active_score_history
             .insert(a.address.clone(), 100.0);
@@ -1267,8 +1270,8 @@ mod tests {
         let blockchain = Blockchain::new(Block::gen_genesis_block());
         let seeds = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
 
-        let mut a = TrailConsensus::new(1.0, test_config()).unwrap();
-        let mut b = TrailConsensus::new(1.0, test_config()).unwrap();
+        let mut a = TrailConsensus::new(1.0, test_config(), Arc::default()).unwrap();
+        let mut b = TrailConsensus::new(1.0, test_config(), Arc::default()).unwrap();
         a.freeze_proposer_weights(&validators);
         b.freeze_proposer_weights(&validators);
 
@@ -1298,7 +1301,8 @@ mod tests {
         let relay = Wallet::new();
         let miner = Wallet::new();
         let (block, validators) = block_with_path(&origin, &relay, &miner, 10.0);
-        let consensus = TrailConsensus::new(1.0, test_config()).unwrap();
+        let consensus =
+            TrailConsensus::new(1.0, test_config(), registry(&[&origin, &relay, &miner])).unwrap();
         let plan = consensus.compute_block_rewards(&block, &validators);
         let relay_budget = (1.0 - consensus.config.proposer_fee_ratio) * plan.total_fee;
 
@@ -1315,7 +1319,7 @@ mod tests {
         let a = Wallet::new();
         let b = Wallet::new();
         let validators = validators(&[&a, &b]);
-        let mut consensus = TrailConsensus::new(1.0, test_config()).unwrap();
+        let mut consensus = TrailConsensus::new(1.0, test_config(), Arc::default()).unwrap();
         consensus.freeze_proposer_weights(&validators);
         let snapshot = consensus.epoch_stake_snapshot.clone();
 

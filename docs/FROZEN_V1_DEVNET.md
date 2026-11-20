@@ -73,15 +73,36 @@ without changing an already computed epoch's proposer duties. The first lookup
 for proposer epoch `e` caches its activated score map, so later settlement or
 reorganization observations cannot change that epoch's weights.
 
+## Per-path BLS certificates
+
+Each Geth transaction evidence item contains its own `aggregate_signature` and
+statement count. The aggregate retains that transaction's origin signature and
+both signatures for every completed propagation edge. Signatures from different
+transactions are never combined. The RPC marks this scheme `per_path_v1` and
+lists transactions whose certificates could not be constructed.
+
+Lighthouse copies the transaction's signature into the existing 48-byte SSZ
+record field. Its verifier independently reconstructs and checks each path's
+transaction/epoch/chain-bound messages against the registered public keys. There
+is no fallback to the old block-wide signature. Empty evidence lists remain
+valid; an empty path record is invalid. A zero-hop origin-only record requires
+its valid origin signature and earns no relay credit.
+
+Packing enforces both the record count and identity-work limits. Every skipped
+transaction is logged with its hash and reason (`max_paths_per_block`,
+`evidence_work_limit`, or a construction error). Keeping a prefix cannot alter
+or invalidate the independent signatures of retained records. Invalid evidence
+never reaches relay reward or propagation score accumulation.
+
 ## Evidence bounds
 
-Path length is checked before signature verification. The aggregate verifier
+Path length is checked before signature verification. The per-path verifier
 also rejects evidence whose total path work exceeds `evidence_work_limit`.
 Records from a past tagged epoch may remain attached when a transaction crosses
 an epoch boundary. Their signatures are verified against the tagged epoch, but
 they are recorded as stale evidence and earn neither score nor relay credit.
-Fresh records in the same aggregate remain eligible; records tagged with a
-future epoch invalidate the aggregate.
+Fresh records in the same block remain eligible; a future epoch or an invalid
+path certificate prevents the block's TRAIL evidence batch from receiving credit.
 
 ## Automated acceptance
 

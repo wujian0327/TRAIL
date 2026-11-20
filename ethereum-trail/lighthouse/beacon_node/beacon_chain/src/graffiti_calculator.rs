@@ -10,9 +10,7 @@ use std::{fmt::Debug, str::FromStr, time::Duration};
 use task_executor::TaskExecutor;
 use tracing::{debug, error, warn};
 use typenum::U48;
-use types::{
-    ChainSpec, EthSpec, GRAFFITI_BYTES_LEN, Graffiti, Hash256, TrailInlineEvidenceRecord,
-};
+use types::{ChainSpec, EthSpec, GRAFFITI_BYTES_LEN, Graffiti, Hash256, TrailInlineEvidenceRecord};
 
 const ENGINE_VERSION_AGE_LIMIT_EPOCH_MULTIPLE: u32 = 6; // 6 epochs
 const ENGINE_VERSION_CACHE_REFRESH_EPOCH_MULTIPLE: u32 = 2; // 2 epochs
@@ -177,16 +175,27 @@ pub fn trail_tx_evidence_records_from_json<E: EthSpec>(
     let Some(evidence) = evidence else {
         return VariableList::empty();
     };
-    serde_json::from_value::<TrailBlockEvidence>(evidence)
-        .ok()
-        .and_then(|evidence| evidence.inline_records(spec).ok())
-        .and_then(|records| records.try_into().ok())
-        .unwrap_or_else(VariableList::empty)
+    let parsed = match serde_json::from_value::<TrailBlockEvidence>(evidence) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warn!(%error, "TRAIL path certificate response rejected");
+            return VariableList::empty();
+        }
+    };
+    let built = parsed.inline_records::<E>(spec);
+    for omission in &built.omitted {
+        warn!(tx_hash = %omission.tx_hash, reason = %omission.reason, "TRAIL path certificate omitted");
+    }
+    match built.records.try_into() {
+        Ok(records) => records,
+        Err(error) => {
+            warn!(?error, "TRAIL SSZ evidence list rejected");
+            VariableList::empty()
+        }
+    }
 }
 
-pub fn trail_tx_evidence_root_from_json(
-    evidence: Option<serde_json::Value>,
-) -> Option<Hash256> {
+pub fn trail_tx_evidence_root_from_json(evidence: Option<serde_json::Value>) -> Option<Hash256> {
     let evidence = evidence?;
     serde_json::from_value::<TrailBlockEvidence>(evidence)
         .ok()
@@ -207,38 +216,67 @@ fn hex_bytes_exact<const N: usize>(input: &str) -> Option<[u8; N]> {
 struct TrailBlockEvidence {
     evidence_root: Option<String>,
     #[serde(default)]
-    aggregate_signature: Option<String>,
-    #[serde(default)]
     transactions: Vec<TrailTxEvidence>,
 }
 
+#[derive(Debug)]
+struct TrailCertificateOmission {
+    tx_hash: String,
+    reason: String,
+}
+
+struct TrailInlineBuild<E: EthSpec> {
+    records: Vec<TrailInlineEvidenceRecord<E>>,
+    omitted: Vec<TrailCertificateOmission>,
+}
+
 impl TrailBlockEvidence {
-    fn inline_records<E: EthSpec>(
-        self,
-        spec: &ChainSpec,
-    ) -> Result<Vec<TrailInlineEvidenceRecord<E>>, String> {
-        let aggregate_signature = self
-            .aggregate_signature
-            .as_deref()
-            .and_then(hex_bytes_exact::<48>)
-            .unwrap_or([0; 48]);
-        let aggregate_signature = FixedVector::new(aggregate_signature.to_vec())
-            .map_err(|e| format!("invalid aggregate signature length: {e}"))?;
+    fn inline_records<E: EthSpec>(self, spec: &ChainSpec) -> TrailInlineBuild<E> {
         let max_paths = spec.trail_config.max_paths_per_block as usize;
         let max_len = spec.trail_config.max_path_evidence_len as usize;
-        let mut records = Vec::new();
-        for tx in self.transactions.into_iter().take(max_paths) {
-            let Some(record) = tx.inline_record(aggregate_signature.clone(), max_len)? else {
+        let mut result = TrailInlineBuild {
+            records: Vec::new(),
+            omitted: Vec::new(),
+        };
+        let mut work = 0u64;
+        for tx in self.transactions {
+            let tx_hash = tx
+                .tx_hash
+                .clone()
+                .unwrap_or_else(|| tx.metadata.tx_hash.clone());
+            if result.records.len() >= max_paths {
+                result.omitted.push(TrailCertificateOmission {
+                    tx_hash,
+                    reason: "max_paths_per_block".into(),
+                });
                 continue;
-            };
-            records.push(record);
+            }
+            match tx.inline_record::<E>(max_len) {
+                Ok(record) => {
+                    let next_work = work.saturating_add(record.relay_path.len() as u64);
+                    if next_work > spec.trail_config.evidence_work_limit {
+                        result.omitted.push(TrailCertificateOmission {
+                            tx_hash,
+                            reason: "evidence_work_limit".into(),
+                        });
+                    } else {
+                        work = next_work;
+                        result.records.push(record);
+                    }
+                }
+                Err(reason) => result
+                    .omitted
+                    .push(TrailCertificateOmission { tx_hash, reason }),
+            }
         }
-        Ok(records)
+        result
     }
 }
 
 #[derive(Deserialize)]
 struct TrailTxEvidence {
+    #[serde(default)]
+    aggregate_signature: Option<String>,
     #[serde(default)]
     tx_hash: Option<String>,
     #[serde(default)]
@@ -251,19 +289,31 @@ struct TrailTxEvidence {
 impl TrailTxEvidence {
     fn inline_record<E: EthSpec>(
         self,
-        aggregate_signature: FixedVector<u8, U48>,
         max_len: usize,
-    ) -> Result<Option<TrailInlineEvidenceRecord<E>>, String> {
+    ) -> Result<TrailInlineEvidenceRecord<E>, String> {
+        let signature = self
+            .aggregate_signature
+            .as_deref()
+            .and_then(hex_bytes_exact::<48>)
+            .ok_or_else(|| "missing_or_malformed_per_path_signature".to_string())?;
+        let aggregate_signature = FixedVector::<u8, U48>::new(signature.to_vec())
+            .map_err(|error| format!("invalid aggregate signature: {error}"))?;
         let tx_hash = self.tx_hash.as_deref().unwrap_or(&self.metadata.tx_hash);
-        let tx_hash = hex_bytes_exact::<32>(tx_hash)
-            .ok_or_else(|| "invalid TRAIL tx hash".to_string())?;
+        let tx_hash =
+            hex_bytes_exact::<32>(tx_hash).ok_or_else(|| "invalid TRAIL tx hash".to_string())?;
+        if hex_bytes_exact::<32>(&self.metadata.tx_hash) != Some(tx_hash) {
+            return Err("transaction_metadata_mismatch".into());
+        }
         let mut path = Vec::with_capacity(self.metadata.paths.len().saturating_add(1));
         path.push(self.metadata.origin_relay_validator_index);
         for edge in self.metadata.paths {
             path.push(edge.to);
         }
         if path.is_empty() || path.len() > max_len {
-            return Ok(None);
+            return Err("invalid_path_length".into());
+        }
+        if path.iter().collect::<std::collections::HashSet<_>>().len() != path.len() {
+            return Err("repeated_path_identity".into());
         }
         let priority_fee_wei = self
             .priority_fee_wei
@@ -275,16 +325,16 @@ impl TrailTxEvidence {
             .as_deref()
             .and_then(parse_u64_decimal)
             .unwrap_or(0);
-        let relay_path = VariableList::new(path)
-            .map_err(|e| format!("invalid TRAIL inline relay path: {e}"))?;
-        Ok(Some(TrailInlineEvidenceRecord {
+        let relay_path =
+            VariableList::new(path).map_err(|e| format!("invalid TRAIL inline relay path: {e}"))?;
+        Ok(TrailInlineEvidenceRecord {
             tx_hash: Hash256::from_slice(&tx_hash),
             epoch: self.metadata.epoch,
             priority_fee_wei,
             irrecoverable_cost_wei,
             relay_path,
             aggregate_signature,
-        }))
+        })
     }
 }
 
@@ -395,7 +445,7 @@ async fn engine_version_cache_refresh_service<T: BeaconChainTypes>(
 #[cfg(test)]
 mod tests {
     use crate::ChainConfig;
-    use crate::graffiti_calculator::{GraffitiSettings, trail_evidence_root_to_graffiti};
+    use crate::graffiti_calculator::{GraffitiSettings, trail_tx_evidence_root_from_json};
     use crate::test_utils::{BeaconChainHarness, EphemeralHarnessType, test_spec};
     use bls::Keypair;
     use eth2::types::GraffitiPolicy;
@@ -406,6 +456,82 @@ mod tests {
     use std::time::Duration;
     use tracing::info;
     use types::{ChainSpec, GRAFFITI_BYTES_LEN, Graffiti, MinimalEthSpec};
+
+    fn per_path_response(count: usize) -> serde_json::Value {
+        serde_json::json!({"signature_scheme":"per_path_v1", "transactions": (0..count).map(|index| {
+            let hash = format!("0x{:064x}", index.saturating_add(1));
+            serde_json::json!({"tx_hash":hash,"aggregate_signature":format!("0x{}", hex::encode([index as u8;48])),
+                "metadata":{"tx_hash":hash,"epoch":7,"origin_relay_validator_index":0,"paths":[{"to":1}]}})
+        }).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn trail_per_path_packing_preserves_signatures_and_reports_1024_cap() {
+        let spec = ChainSpec::minimal();
+        let parsed: super::TrailBlockEvidence =
+            serde_json::from_value(per_path_response(1025)).unwrap();
+        let built = parsed.inline_records::<MinimalEthSpec>(&spec);
+        assert_eq!(built.records.len(), 1024);
+        assert_eq!(built.omitted.len(), 1);
+        assert_eq!(built.omitted[0].tx_hash, format!("0x{:064x}", 1025));
+        assert_eq!(built.omitted[0].reason, "max_paths_per_block");
+        for (index, record) in built.records.iter().enumerate() {
+            assert_eq!(record.aggregate_signature.as_ref(), &[index as u8; 48]);
+            assert_eq!(record.relay_path.as_ref(), &[0, 1]);
+        }
+        assert_ne!(
+            built.records[0].aggregate_signature,
+            built.records[1].aggregate_signature
+        );
+    }
+
+    #[test]
+    fn trail_per_path_packing_does_not_fall_back_to_block_signature() {
+        let spec = ChainSpec::minimal();
+        let mut response = per_path_response(2);
+        response["aggregate_signature"] =
+            response["transactions"][0]["aggregate_signature"].clone();
+        response["transactions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("aggregate_signature");
+        let parsed: super::TrailBlockEvidence = serde_json::from_value(response).unwrap();
+        let built = parsed.inline_records::<MinimalEthSpec>(&spec);
+        assert_eq!(built.records.len(), 1);
+        let mut expected_hash = [0u8; 32];
+        expected_hash[31] = 2;
+        assert_eq!(
+            built.records[0].tx_hash,
+            types::Hash256::from_slice(&expected_hash)
+        );
+        assert_eq!(
+            built.omitted[0].reason,
+            "missing_or_malformed_per_path_signature"
+        );
+    }
+
+    #[test]
+    fn trail_per_path_packing_reports_budget_and_malformed_paths() {
+        let mut spec = ChainSpec::minimal();
+        spec.trail_config.evidence_work_limit = 2;
+        let parsed: super::TrailBlockEvidence =
+            serde_json::from_value(per_path_response(3)).unwrap();
+        let built = parsed.inline_records::<MinimalEthSpec>(&spec);
+        assert_eq!(built.records.len(), 1);
+        assert_eq!(built.omitted.len(), 2);
+        assert!(
+            built
+                .omitted
+                .iter()
+                .all(|r| r.reason == "evidence_work_limit")
+        );
+        let mut response = per_path_response(1);
+        response["transactions"][0]["metadata"]["paths"][0]["to"] = serde_json::json!(0);
+        let parsed: super::TrailBlockEvidence = serde_json::from_value(response).unwrap();
+        let built = parsed.inline_records::<MinimalEthSpec>(&spec);
+        assert!(built.records.is_empty());
+        assert_eq!(built.omitted[0].reason, "repeated_path_identity");
+    }
 
     const VALIDATOR_COUNT: usize = 48;
     /// A cached set of keys.
@@ -547,13 +673,11 @@ mod tests {
     }
 
     #[test]
-    fn trail_evidence_root_graffiti_uses_short_root_tag() {
-        let graffiti = trail_evidence_root_to_graffiti(
-            "0xabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-        )
-        .expect("valid evidence root should produce graffiti");
-        assert_eq!(&graffiti.0[..21], b"TPSR:abcdef0123456789");
-        assert!(graffiti.0[21..].iter().all(|byte| *byte == 0));
+    fn trail_evidence_root_uses_the_ssz_field_input() {
+        let root = format!("0x{}", "ab".repeat(32));
+        let parsed =
+            trail_tx_evidence_root_from_json(Some(serde_json::json!({"evidence_root":root})));
+        assert_eq!(parsed, Some(root.parse().unwrap()));
     }
 
     #[tokio::test]

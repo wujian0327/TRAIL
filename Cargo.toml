@@ -11,7 +11,13 @@ path = "src/lib.rs"
 name = "trail"
 path = "src/main.rs"
 
+[features]
+bls-hop-latency = []
 
+[[bin]]
+name = "bls_hop_latency"
+path = "src/bin/bls_hop_latency.rs"
+required-features = ["bls-hop-latency"]
 
 [dependencies]
 rand = "0.8.5"

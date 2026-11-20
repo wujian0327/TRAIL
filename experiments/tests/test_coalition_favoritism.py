@@ -8,9 +8,34 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "experiments"))
 from run_experiments import command_for_run, expand_runs, load_yaml, seed_bundle
 from trail_coalition_favoritism_report import aggregate_run, graph_identity, pair_runs, validate_observed_receipts
+from validator_indices import decode_certificate_path, load_validator_indices
 
 
 class CoalitionFavoritismTests(unittest.TestCase):
+    def test_audit_decodes_indexed_and_legacy_certificates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.assertEqual(decode_certificate_path(["bob"], load_validator_indices(directory)), ["bob"])
+            with self.assertRaisesRegex(ValueError, "requires validator_indices.json"):
+                decode_certificate_path([0], load_validator_indices(directory))
+            manifest = directory / "validator_indices.json"
+            manifest.write_text(json.dumps([
+                {"index": 0, "address": "alice"},
+                {"index": 1, "address": "bob"},
+            ]))
+            addresses = load_validator_indices(directory)
+            self.assertEqual(decode_certificate_path([1, 0], addresses), ["bob", "alice"])
+            self.assertEqual(decode_certificate_path([], addresses), [])
+            for index in [True, -1, 2, "bob"]:
+                with self.assertRaisesRegex(ValueError, "unknown validator index"):
+                    decode_certificate_path([index], addresses)
+            manifest.write_text(json.dumps([
+                {"index": 0, "address": "alice"},
+                {"index": 1, "address": "alice"},
+            ]))
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                load_validator_indices(directory)
+
     def test_matrices_and_seed_parameters(self):
         for name, count in [("pilot", 12), ("main", 240)]:
             spec = load_yaml(ROOT / f"experiments/configs/trail_coalition_favoritism_{name}.yaml")

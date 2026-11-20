@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
@@ -12,7 +13,7 @@ import re
 import subprocess
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -388,6 +389,96 @@ def selected_private_keys(args: argparse.Namespace) -> List[str]:
     return private_keys[: args.sender_count]
 
 
+def deterministic_calldata(seed: int, phase: str, index: int, size: int, variant: int = 0) -> bytes:
+    """Nonzero bytes, independent of client mode, wall clock and worker ordering."""
+    domain = json.dumps(["TRAIL-calldata-v1", seed, phase, index, variant], separators=(",", ":")).encode()
+    return bytes(1 + value % 255 for value in hashlib.shake_256(domain).digest(size))
+
+
+def calibrate_signed_transaction(private_key: str, transaction: dict, target: int,
+                                 seed: int, phase: str, index: int) -> tuple[bytes, dict]:
+    from eth_account import Account
+
+    if target <= 0:
+        raise ValueError("--raw-tx-target-bytes must be positive")
+    account = Account.from_key(private_key)
+    transaction = dict(transaction, type=2)
+    empty = account.sign_transaction(dict(transaction, data=b""))
+    # Long data and the enclosing RLP list gain length prefixes. This is only
+    # an initial guess; every accepted result is checked AFTER signing.
+    size = max(1, target - len(empty.raw_transaction) - 3)
+    variants = Counter()
+    for attempt in range(64):
+        if size < 1 or size > target:
+            break
+        variant = variants[size]
+        variants[size] += 1
+        data = deterministic_calldata(seed, phase, index, size, variant)
+        signed = account.sign_transaction(dict(transaction, data=data))
+        raw = bytes(signed.raw_transaction)
+        if len(raw) == target:
+            recovered = Account.recover_transaction(raw)
+            if recovered.lower() != account.address.lower():
+                raise ValueError("signed transaction recovery failed")
+            return raw, dict(raw_tx_bytes=len(raw), calldata_bytes=len(data), gas_limit=transaction["gas"],
+                             raw_tx_hex="0x" + raw.hex(), calldata_sha256=hashlib.sha256(data).hexdigest(),
+                             calldata_variant=variant, calibration_attempts=attempt + 2,
+                             recovered_sender=recovered, signature_recovery_valid=True)
+        size += target - len(raw)
+    raise ValueError(f"cannot calibrate signed Type-2 transaction to exactly {target} bytes (seed={seed}, phase={phase}, index={index})")
+
+
+def _prepare_sized_transaction(task):
+    index, private_key, transaction, target, seed, phase = task
+    raw, metadata = calibrate_signed_transaction(private_key, transaction, target, seed, phase, index)
+    return raw, metadata
+
+
+def prepare_sized_workload(args, endpoints, phase: str, count: int) -> dict | None:
+    """Prepare outside the timed send window; no transactions are submitted here."""
+    target = getattr(args, "raw_tx_target_bytes", None)
+    if target is None:
+        return None
+    from eth_account import Account
+
+    started = time.time()
+    private_keys = selected_private_keys(args)
+    accounts = [Account.from_key(key) for key in private_keys]
+    w3 = Web3(Web3.HTTPProvider(endpoints.el_rpcs[0], request_kwargs={"timeout": 30}))
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    recipient = Web3.to_checksum_address(args.recipient)
+    if w3.eth.get_code(recipient):
+        raise ValueError("sized workload requires an EOA recipient so nonzero-calldata gas bounds are valid")
+    nonces = [w3.eth.get_transaction_count(account.address, "pending") for account in accounts]
+    chain_id = w3.eth.chain_id
+    # Any transaction of target bytes has fewer than target calldata bytes.
+    # Probe that worst-case all-nonzero length against the REAL active fork.
+    probe = dict(type=2, **{"from": accounts[0].address}, to=recipient, value=args.value_wei,
+                 data=b"\x01" * target, maxFeePerGas=Web3.to_wei(args.max_fee_gwei, "gwei"),
+                 maxPriorityFeePerGas=Web3.to_wei(args.priority_fee_gwei, "gwei"))
+    estimated = int(w3.eth.estimate_gas(probe))
+    gas_limit = (estimated * 110 + 99) // 100
+    block = w3.eth.get_block("latest")
+    if gas_limit > int(block.gasLimit):
+        raise ValueError(f"sized transaction gas limit {gas_limit} exceeds block gas limit {block.gasLimit}")
+    tasks = []
+    for index in range(count):
+        sender = index % len(accounts)
+        transaction = dict(chainId=chain_id, to=recipient, value=args.value_wei, gas=gas_limit,
+                           nonce=nonces[sender] + index // len(accounts),
+                           maxFeePerGas=Web3.to_wei(args.max_fee_gwei, "gwei"),
+                           maxPriorityFeePerGas=Web3.to_wei(args.priority_fee_gwei, "gwei"))
+        tasks.append((index, private_keys[sender], transaction, target, args.seed, phase))
+    with ProcessPoolExecutor(max_workers=min(8, max(1, count))) as executor:
+        transactions = list(executor.map(_prepare_sized_transaction, tasks, chunksize=32))
+    return dict(nonces=nonces, chain_id=chain_id, transactions=transactions,
+                audit=dict(target_raw_tx_bytes=target, phase=phase, preparation_started_unix=started,
+                           preparation_finished_unix=time.time(), prepared_count=count,
+                           gas_probe_calldata_bytes=target, gas_probe_estimate=estimated,
+                           gas_limit=gas_limit, gas_margin_percent=10, recipient_is_eoa=True,
+                           probe_block_number=int(block.number), probe_block_gas_limit=int(block.gasLimit)))
+
+
 def run_workload(
     args: argparse.Namespace,
     endpoints: Endpoints,
@@ -395,12 +486,15 @@ def run_workload(
     phase: str = "measurement",
     tx_count: int | None = None,
     schedule_start_unix: float | None = None,
+    prepared: dict | None = None,
 ) -> Dict[str, Any]:
     from eth_account import Account
 
     private_keys = selected_private_keys(args)
     accounts = [Account.from_key(private_key) for private_key in private_keys]
     tx_count = args.tx_count if tx_count is None else tx_count
+    if getattr(args, "raw_tx_target_bytes", None) is not None and prepared is None:
+        prepared = prepare_sized_workload(args, endpoints, phase, tx_count)
     txs: List[Dict[str, Any]] = []
     genesis = beacon_genesis(endpoints.cl_apis[0])
     genesis_time = genesis["genesis_time"]
@@ -409,6 +503,8 @@ def run_workload(
     nonce_w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     nonces = [nonce_w3.eth.get_transaction_count(account.address, "pending") for account in accounts]
     chain_id = nonce_w3.eth.chain_id
+    if prepared is not None and (prepared["nonces"] != nonces or prepared["chain_id"] != chain_id):
+        raise RuntimeError("sender nonces or chain ID changed after transaction preparation")
     schedule_delay = 0.0
     if schedule_start_unix is not None:
         schedule_delay = max(0.0, schedule_start_unix - time.time())
@@ -422,20 +518,29 @@ def run_workload(
         origin = tx_record["origin"]
         w3 = Web3(Web3.HTTPProvider(endpoints.el_rpcs[origin], request_kwargs={"timeout": 10}))
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-        tx = {
-            "chainId": chain_id,
-            "from": account.address,
-            "to": Web3.to_checksum_address(args.recipient),
-            "value": args.value_wei,
-            "gas": 21000,
-            "nonce": tx_record["nonce"],
-            "maxFeePerGas": Web3.to_wei(args.max_fee_gwei, "gwei"),
-            "maxPriorityFeePerGas": Web3.to_wei(args.priority_fee_gwei, "gwei"),
-        }
-        signed = account.sign_transaction(tx)
-        raw_tx = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+        if prepared is None:
+            tx = {
+                "chainId": chain_id,
+                "from": account.address,
+                "to": Web3.to_checksum_address(args.recipient),
+                "value": args.value_wei,
+                "gas": 21000,
+                "nonce": tx_record["nonce"],
+                "maxFeePerGas": Web3.to_wei(args.max_fee_gwei, "gwei"),
+                "maxPriorityFeePerGas": Web3.to_wei(args.priority_fee_gwei, "gwei"),
+            }
+            signed = account.sign_transaction(tx)
+            raw_tx = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+            tx_record.update(raw_tx_bytes=len(raw_tx), calldata_bytes=0, gas_limit=tx["gas"])
+        else:
+            raw_tx, metadata = prepared["transactions"][tx_record["index"]]
+            tx_record.update(metadata)
+            if len(raw_tx) != args.raw_tx_target_bytes:
+                raise ValueError("prepared signed transaction has incorrect raw byte length")
         send_monotonic = time.monotonic()
         send_unix = time.time()
+        tx_record.update(sender=account.address, send_unix=send_unix, send_monotonic=send_monotonic,
+                         send_slot_estimate=slot_for_timestamp(send_unix, genesis_time, seconds_per_slot))
         tx_hash = send_raw_transaction_with_retry(w3, raw_tx, timeout_seconds=args.receipt_timeout).hex()
         tx_record.update(
             {
@@ -444,6 +549,7 @@ def run_workload(
                 "send_unix": send_unix,
                 "send_monotonic": send_monotonic,
                 "send_slot_estimate": slot_for_timestamp(send_unix, genesis_time, seconds_per_slot),
+                "send_ack_unix": time.time(),
             }
         )
         return tx_record
@@ -590,6 +696,7 @@ def run_workload(
         "inclusion_delay_slots": latency_summary(inclusion_delay_slots),
         "inclusion_delay_seconds": latency_summary(inclusion_delay_seconds),
         "txs": txs,
+        "transaction_construction": prepared["audit"] if prepared is not None else {"target_raw_tx_bytes": None},
     }
 
 
@@ -660,6 +767,8 @@ def receipt_fields(
         "inclusion_delay_slots": max(0, included_slot - send_slot),
         "inclusion_delay_seconds": inclusion_delay_seconds,
         "gas_used": int(receipt.gasUsed),
+        "included_block_gas_limit": int(block.gasLimit),
+        "included_block_gas_used": int(block.gasUsed),
         "receipt_unix": time.time(),
         "receipt_monotonic": receipt_monotonic,
         "observed_receipt_latency_seconds": receipt_monotonic - tx_record["send_monotonic"],
@@ -827,6 +936,7 @@ def collect_window_blocks(
     slots_per_epoch: int,
     measurement_txs: List[Dict[str, Any]],
     ssz_dir: Path,
+    raw_tx_target_bytes: int | None = None,
 ) -> Dict[str, Any]:
     """Collect canonical blocks in the half-open interval [start_slot, end_slot)."""
     measurement_by_hash = {
@@ -856,6 +966,9 @@ def collect_window_blocks(
         block_root = str(header.json()["data"]["root"])
         execution_payload = body.get("execution_payload") or body.get("executionPayload") or {}
         raw_transactions = execution_payload.get("transactions", [])
+        transaction_sizes = [len(decoded_bytes(raw)) for raw in raw_transactions]
+        if raw_tx_target_bytes is not None and any(size != raw_tx_target_bytes for size in transaction_sizes):
+            raise ValueError(f"slot {slot}: included transaction size differs from {raw_tx_target_bytes}B")
         transaction_hashes = [execution_transaction_hash(raw) for raw in raw_transactions]
         transaction_set = {value.lower() for value in transaction_hashes}
         measurement_hashes = transaction_set.intersection(measurement_by_hash)
@@ -920,6 +1033,10 @@ def collect_window_blocks(
                 "block_root": block_root,
                 "proposer_index": proposer,
                 "block_transaction_count": len(transaction_hashes),
+                "execution_transaction_bytes": sum(transaction_sizes),
+                "raw_transaction_size_histogram": dict(Counter(str(size) for size in transaction_sizes)),
+                "block_gas_limit": int(execution_payload["gas_limit"]) if "gas_limit" in execution_payload else None,
+                "block_gas_used": int(execution_payload["gas_used"]) if "gas_used" in execution_payload else None,
                 "measurement_transaction_count": len(measurement_hashes),
                 "evidence_record_count": record_count,
                 "valid_evidence_unique_transaction_count": len(evidence_tx_hashes),
@@ -1023,6 +1140,12 @@ def write_records_csv(path: Path, records: List[Dict[str, Any]]) -> None:
 def save_result(output_dir: Path, result: Dict[str, Any]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    transactions = [tx for phase in ["warmup", "workload"] for tx in (result.get(phase) or {}).get("txs", [])]
+    if transactions:
+        with (output_dir / "transactions.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=sorted({key for tx in transactions for key in tx}))
+            writer.writeheader()
+            writer.writerows(transactions)
     block_records = result.get("blocks", {}).get("records", [])
     if block_records:
         write_records_csv(output_dir / "block_records.csv", block_records)
@@ -1090,6 +1213,7 @@ def command_run(args: argparse.Namespace) -> Dict[str, Any]:
                 args.finality_timeout_seconds,
             )
     genesis = beacon_genesis(endpoints.cl_apis[0])
+    prepared = prepare_sized_workload(args, endpoints, "measurement", args.tx_count)
     planning_head = beacon_head(endpoints.cl_apis[0])
     measurement_start_slot = planning_head["head_slot"] + 2
     measurement_end_slot = measurement_start_slot + args.measurement_slots
@@ -1107,6 +1231,7 @@ def command_run(args: argparse.Namespace) -> Dict[str, Any]:
         endpoints,
         phase="measurement",
         schedule_start_unix=float(measurement_start_unix),
+        prepared=prepared,
     )
     window_txs = [
         tx
@@ -1152,6 +1277,7 @@ def command_run(args: argparse.Namespace) -> Dict[str, Any]:
         args.slots_per_epoch,
         workload.get("txs", []),
         args.output_root / args.run_id / "blocks_ssz",
+        raw_tx_target_bytes=getattr(args, "raw_tx_target_bytes", None),
     )
     result = {
         "run_id": args.run_id,
@@ -1272,6 +1398,8 @@ def main() -> None:
     run.add_argument("--value-wei", type=int, default=1)
     run.add_argument("--priority-fee-gwei", type=float, default=2.0)
     run.add_argument("--max-fee-gwei", type=float, default=50.0)
+    run.add_argument("--raw-tx-target-bytes", type=int, default=None,
+                     help="Exact signed Type-2 transaction length; calibrate deterministic nonzero calldata before sending")
     run.add_argument("--receipt-timeout", type=int, default=90)
     run.add_argument("--wait-receipts-after-send", action="store_true")
     run.add_argument("--seconds-per-slot", type=int, default=3)

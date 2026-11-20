@@ -51,6 +51,8 @@ mod is_valid_indexed_payload_attestation;
 pub mod process_operations;
 pub mod signature_sets;
 pub mod tests;
+#[cfg(test)]
+mod trail_path_profile;
 mod verify_attestation;
 mod verify_attester_slashing;
 mod verify_bls_to_execution_change;
@@ -264,26 +266,17 @@ fn record_trail_tx_gossip_metadata_for_block<E: EthSpec, Payload: AbstractExecPa
         .iter()
         .any(|record| record.epoch > epoch.as_u64())
     {
-        return record_trail_invalid_tx_gossip_metadata_evidence(
-            epoch,
-            inline_records.len(),
-            spec,
-        );
+        return record_trail_invalid_tx_gossip_metadata_evidence(epoch, inline_records.len(), spec);
     }
     let registry = trail_relay_public_registry();
     let verify_started = Instant::now();
-    let verified =
-        verify_trail_inline_block_aggregate(inline_records.as_ref(), registry, spec);
+    let verified = verify_trail_inline_path_certificates(inline_records.as_ref(), registry, spec);
     metrics::observe_duration(
         &state_processing_metrics::TRAIL_INLINE_EVIDENCE_VERIFY_SECONDS,
         verify_started.elapsed(),
     );
     if !verified {
-        return record_trail_invalid_tx_gossip_metadata_evidence(
-            epoch,
-            inline_records.len(),
-            spec,
-        );
+        return record_trail_invalid_tx_gossip_metadata_evidence(epoch, inline_records.len(), spec);
     }
 
     let stale_count = inline_records
@@ -332,7 +325,7 @@ fn trail_path_evidence_from_inline_record<E: EthSpec>(
     })
 }
 
-fn verify_trail_inline_block_aggregate<E: EthSpec>(
+fn verify_trail_inline_path_certificates<E: EthSpec>(
     records: &[TrailInlineEvidenceRecord<E>],
     registry: &TrailRelayPublicRegistry,
     spec: &ChainSpec,
@@ -346,39 +339,49 @@ fn verify_trail_inline_block_aggregate<E: EthSpec>(
     if evidence_work_units > spec.trail_config.evidence_work_limit {
         return false;
     }
-    let mut aggregate_signature = None;
-    let mut signature_records = Vec::new();
+    if records.len() > spec.trail_config.max_paths_per_block as usize {
+        return false;
+    }
+    let mut transactions = HashSet::new();
     for record in records {
-        if !trail_inline_record_requires_signature(record) {
-            continue;
+        if record.relay_path.is_empty()
+            || record.relay_path.len() > spec.trail_config.max_path_evidence_len as usize
+            || !transactions.insert(record.tx_hash)
+        {
+            return false;
         }
-        let Some(record_signature) = trail_inline_aggregate_signature(record) else {
+        let Some(signature) = trail_inline_aggregate_signature(record) else {
             return false;
         };
-        if let Some(expected_signature) = aggregate_signature {
-            if record_signature != expected_signature {
-                return false;
-            }
-        } else {
-            aggregate_signature = Some(record_signature);
-        }
-        let Some(mut per_tx_records) =
-            trail_inline_signature_records(record, registry, spec.deposit_chain_id)
+        let Ok(signature) = blst::min_sig::Signature::from_bytes(&signature) else {
+            return false;
+        };
+        let Some(path_keys) = trail_inline_path_keys(record, registry) else {
+            return false;
+        };
+        let Some((statements, pubkeys)) =
+            trail_inline_path_messages(record, &path_keys, spec.deposit_chain_id)
         else {
             return false;
         };
-        signature_records.append(&mut per_tx_records);
+        let messages = statements
+            .iter()
+            .map(|message| message.as_slice())
+            .collect::<Vec<_>>();
+        // The registry cache validates public keys once; each path signature is
+        // still checked independently, including its subgroup check.
+        if signature.aggregate_verify(
+            true,
+            &messages,
+            TRAIL_TX_PATH_DOMAIN.as_bytes(),
+            &pubkeys,
+            false,
+        ) != blst::BLST_ERROR::BLST_SUCCESS
+        {
+            return false;
+        }
     }
-    let Some(aggregate_signature) = aggregate_signature else {
-        return true;
-    };
-    verify_trail_aggregate_signature_bytes(registry, &aggregate_signature, &signature_records)
-}
-
-fn trail_inline_record_requires_signature<E: EthSpec>(
-    record: &TrailInlineEvidenceRecord<E>,
-) -> bool {
-    !record.relay_path.is_empty()
+    true
 }
 
 fn trail_inline_aggregate_signature<E: EthSpec>(
@@ -387,53 +390,73 @@ fn trail_inline_aggregate_signature<E: EthSpec>(
     record.aggregate_signature.as_ref().try_into().ok()
 }
 
-fn trail_inline_signature_records<E: EthSpec>(
+fn trail_inline_path_keys<'a, E: EthSpec>(
     record: &TrailInlineEvidenceRecord<E>,
-    registry: &TrailRelayPublicRegistry,
+    registry: &'a TrailRelayPublicRegistry,
+) -> Option<Vec<&'a TrailCachedPublicKey>> {
+    let cache = registry.validated_pubkeys();
+    let mut identities = HashSet::with_capacity(record.relay_path.len());
+    let mut addresses = HashSet::with_capacity(record.relay_path.len());
+    record
+        .relay_path
+        .iter()
+        .map(|index| {
+            if !identities.insert(*index) {
+                return None;
+            }
+            let address =
+                normalize_trail_relay_address(&registry.address_for_validator(*index, None))?;
+            let (address, key) = cache.get_key_value(&address)?;
+            if !addresses.insert(address) {
+                return None;
+            }
+            Some(key)
+        })
+        .collect()
+}
+
+fn trail_inline_path_messages<'a, E: EthSpec>(
+    record: &TrailInlineEvidenceRecord<E>,
+    keys: &[&'a TrailCachedPublicKey],
     chain_id: u64,
-) -> Option<Vec<TrailSignatureRecord>> {
-    let tx_hash = *record.tx_hash.as_ref();
-    let path = record.relay_path.iter().copied().collect::<Vec<_>>();
-    if path.is_empty() {
-        return None;
+) -> Option<(Vec<[u8; 32]>, Vec<&'a blst::min_sig::PublicKey>)> {
+    let origin = keys.first()?;
+    let mut input = Vec::with_capacity(128);
+    input.extend_from_slice(TRAIL_TX_PATH_DOMAIN.as_bytes());
+    input.extend_from_slice(&chain_id.to_be_bytes());
+    input.extend_from_slice(&record.epoch.to_be_bytes());
+    input.extend_from_slice(record.tx_hash.as_ref());
+    input.extend_from_slice(&origin.identity_hash);
+    let capacity = keys.len().saturating_mul(2).saturating_sub(1);
+    let mut statements = Vec::with_capacity(capacity);
+    let mut pubkeys = Vec::with_capacity(capacity);
+    statements.push(sha256_array(&input));
+    pubkeys.push(&origin.pubkey);
+    input.clear();
+    input.extend_from_slice(TRAIL_TX_PATH_DOMAIN.as_bytes());
+    input.extend_from_slice(&chain_id.to_be_bytes());
+    input.extend_from_slice(record.tx_hash.as_ref());
+    input.extend_from_slice(&record.epoch.to_be_bytes());
+    input.extend_from_slice(&origin.identity_hash);
+    let mut prefix = sha256_array(&input);
+    for edge in keys.windows(2) {
+        let [from, to] = edge else { return None };
+        input.clear();
+        input.extend_from_slice(TRAIL_TX_PATH_DOMAIN.as_bytes());
+        input.extend_from_slice(&prefix);
+        input.extend_from_slice(&from.identity_hash);
+        input.extend_from_slice(&to.identity_hash);
+        let message = sha256_array(&input);
+        statements.push(message);
+        pubkeys.push(&from.pubkey);
+        statements.push(message);
+        pubkeys.push(&to.pubkey);
+        input.clear();
+        input.extend_from_slice(&prefix);
+        input.extend_from_slice(&to.identity_hash);
+        prefix = sha256_array(&input);
     }
-    let addresses = path
-        .iter()
-        .map(|validator_index| registry.address_for_validator(*validator_index, None))
-        .collect::<Vec<_>>();
-    if addresses
-        .iter()
-        .any(|address| registry.pubkey(address).is_none())
-    {
-        return None;
-    }
-
-    let origin_statement = origin_statement(chain_id, record.epoch, &tx_hash, &addresses[0]);
-    let mut signature_records = vec![TrailSignatureRecord {
-        signer: addresses[0].clone(),
-        statement: origin_statement,
-        signature: [0; 48],
-    }];
-
-    if path.len() == 1 {
-        return Some(signature_records);
-    }
-
-    for edge_index in 0..addresses.len().saturating_sub(1) {
-        let prefix = chain_value(&tx_hash, chain_id, record.epoch, &addresses, edge_index);
-        let statement = edge_statement(&prefix, &addresses[edge_index], &addresses[edge_index + 1]);
-        signature_records.push(TrailSignatureRecord {
-            signer: addresses[edge_index].clone(),
-            statement,
-            signature: [0; 48],
-        });
-        signature_records.push(TrailSignatureRecord {
-            signer: addresses[edge_index + 1].clone(),
-            statement,
-            signature: [0; 48],
-        });
-    }
-    Some(signature_records)
+    Some((statements, pubkeys))
 }
 
 fn trail_el_rpc_url() -> Option<String> {
@@ -833,10 +856,36 @@ struct TrailRelayPublicRegistry {
     address_validators: HashMap<String, u64>,
     el_rpc_urls: HashMap<u64, String>,
     cl_http_urls: HashMap<u64, String>,
+    // Each registry is an immutable snapshot, loaded by the outer OnceLock.
+    // Only static keys and identity hashes are cached, never transaction- or
+    // epoch-dependent messages, signatures or verification results.
+    validated_pubkeys: OnceLock<HashMap<String, TrailCachedPublicKey>>,
+}
+
+struct TrailCachedPublicKey {
+    pubkey: blst::min_sig::PublicKey,
+    identity_hash: [u8; 32],
 }
 
 #[allow(dead_code)]
 impl TrailRelayPublicRegistry {
+    fn validated_pubkeys(&self) -> &HashMap<String, TrailCachedPublicKey> {
+        self.validated_pubkeys.get_or_init(|| {
+            self.pubkeys_by_address
+                .iter()
+                .filter_map(|(address, bytes)| {
+                    let pubkey = blst::min_sig::PublicKey::key_validate(bytes).ok()?;
+                    Some((
+                        address.clone(),
+                        TrailCachedPublicKey {
+                            pubkey,
+                            identity_hash: hash_identity(address),
+                        },
+                    ))
+                })
+                .collect()
+        })
+    }
     fn pubkey(&self, address: &str) -> Option<Vec<u8>> {
         let address = normalize_trail_relay_address(address)?;
         self.pubkeys_by_address.get(&address).cloned()
@@ -970,6 +1019,7 @@ fn load_trail_relay_public_registry() -> TrailRelayPublicRegistry {
         address_validators,
         el_rpc_urls,
         cl_http_urls,
+        validated_pubkeys: OnceLock::new(),
     }
 }
 
@@ -982,11 +1032,7 @@ fn derive_trail_cl_service_name(el_service_name: &str) -> Option<String> {
 }
 
 #[allow(dead_code)]
-fn verify_trail_signature(
-    pubkey: Option<Vec<u8>>,
-    signature: &str,
-    statement: &[u8; 32],
-) -> bool {
+fn verify_trail_signature(pubkey: Option<Vec<u8>>, signature: &str, statement: &[u8; 32]) -> bool {
     let Some(pubkey) = pubkey else {
         return false;
     };
@@ -1116,6 +1162,7 @@ fn write_evidence_string(input: &mut Vec<u8>, value: &str) {
     input.extend_from_slice(value.as_bytes());
 }
 
+#[cfg(test)]
 fn origin_statement(chain_id: u64, epoch: u64, tx_hash: &[u8; 32], address: &str) -> [u8; 32] {
     let mut input = Vec::with_capacity(TRAIL_TX_PATH_DOMAIN.len() + 8 + 8 + 32 + 32);
     input.extend_from_slice(TRAIL_TX_PATH_DOMAIN.as_bytes());
@@ -1126,6 +1173,7 @@ fn origin_statement(chain_id: u64, epoch: u64, tx_hash: &[u8; 32], address: &str
     sha256_array(&input)
 }
 
+#[cfg(test)]
 fn chain_value(
     tx_hash: &[u8; 32],
     chain_id: u64,
@@ -1153,6 +1201,7 @@ fn chain_value(
     chain
 }
 
+#[cfg(test)]
 fn edge_statement(prefix: &[u8; 32], from: &str, to: &str) -> [u8; 32] {
     let mut input = Vec::with_capacity(TRAIL_TX_PATH_DOMAIN.len() + 32 + 32 + 32);
     input.extend_from_slice(TRAIL_TX_PATH_DOMAIN.as_bytes());
@@ -1191,8 +1240,7 @@ fn normalize_trail_relay_address(address: &str) -> Option<String> {
 
 #[cfg(test)]
 fn normalize_trail_evidence_address(address: &str) -> String {
-    normalize_trail_relay_address(address)
-        .unwrap_or_else(|| address.trim().to_ascii_lowercase())
+    normalize_trail_relay_address(address).unwrap_or_else(|| address.trim().to_ascii_lowercase())
 }
 
 fn sha256_array(input: &[u8]) -> [u8; 32] {
@@ -1295,13 +1343,11 @@ mod trail_tx_gossip_tests {
         let sender_address = fallback_trail_relay_address(0);
         let receiver_address = fallback_trail_relay_address(1);
         let origin_statement = origin_statement(chain_id, epoch, &tx_hash, &sender_address);
-        let origin_signature =
-            sender.sign(&origin_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
+        let origin_signature = sender.sign(&origin_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
         let path_addresses = vec![sender_address.clone(), receiver_address.clone()];
         let prefix = chain_value(&tx_hash, chain_id, epoch, &path_addresses, 0);
         let edge_statement = edge_statement(&prefix, &sender_address, &receiver_address);
-        let sender_signature =
-            sender.sign(&edge_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
+        let sender_signature = sender.sign(&edge_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
         let receiver_signature =
             receiver.sign(&edge_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
         let registry = TrailRelayPublicRegistry {
@@ -1320,6 +1366,7 @@ mod trail_tx_gossip_tests {
             ]),
             el_rpc_urls: HashMap::new(),
             cl_http_urls: HashMap::new(),
+            validated_pubkeys: OnceLock::new(),
         };
         let metadata = TrailTxMetadata {
             domain: TRAIL_TX_PATH_DOMAIN.to_string(),
@@ -1383,8 +1430,7 @@ mod trail_tx_gossip_tests {
         let origin_pubkey = origin.sk_to_pk().to_bytes();
         let origin_address = fallback_trail_relay_address(0);
         let origin_statement = origin_statement(chain_id, epoch, &tx_hash, &origin_address);
-        let origin_signature =
-            origin.sign(&origin_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
+        let origin_signature = origin.sign(&origin_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
         let registry = TrailRelayPublicRegistry {
             pubkeys_by_address: HashMap::from([(origin_address.clone(), origin_pubkey.to_vec())]),
             validator_addresses: HashMap::from([(0, origin_address.clone())]),
@@ -1392,6 +1438,7 @@ mod trail_tx_gossip_tests {
             address_validators: HashMap::from([(origin_address.clone(), 0)]),
             el_rpc_urls: HashMap::new(),
             cl_http_urls: HashMap::new(),
+            validated_pubkeys: OnceLock::new(),
         };
         let metadata = TrailTxMetadata {
             domain: TRAIL_TX_PATH_DOMAIN.to_string(),
@@ -1484,6 +1531,7 @@ mod trail_tx_gossip_tests {
             ]),
             el_rpc_urls: HashMap::new(),
             cl_http_urls: HashMap::new(),
+            validated_pubkeys: OnceLock::new(),
         };
         let addresses = vec![origin_address.clone(), receiver_address.clone()];
         let origin_statement_bytes = origin_statement(chain_id, epoch, &tx_hash, &origin_address);
@@ -1494,8 +1542,7 @@ mod trail_tx_gossip_tests {
             TRAIL_TX_PATH_DOMAIN.as_bytes(),
             &[],
         );
-        let sender_signature =
-            origin.sign(&edge_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
+        let sender_signature = origin.sign(&edge_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
         let receiver_signature =
             receiver.sign(&edge_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
         let sig_refs = [&origin_signature, &sender_signature, &receiver_signature];
@@ -1508,7 +1555,7 @@ mod trail_tx_gossip_tests {
         spec.trail_config = TrailConfig::devnet_enabled_at(Epoch::new(0));
 
         let record = inline_record(tx_hash, epoch, vec![0, 1], aggregate);
-        assert!(verify_trail_inline_block_aggregate(
+        assert!(verify_trail_inline_path_certificates(
             &[record.clone()],
             &registry,
             &spec
@@ -1516,7 +1563,7 @@ mod trail_tx_gossip_tests {
 
         let mut work_limited_spec = spec.clone();
         work_limited_spec.trail_config.evidence_work_limit = 1;
-        assert!(!verify_trail_inline_block_aggregate(
+        assert!(!verify_trail_inline_path_certificates(
             &[record.clone()],
             &registry,
             &work_limited_spec
@@ -1525,11 +1572,8 @@ mod trail_tx_gossip_tests {
         let origin_only_tx_hash = [0x52; 32];
         let origin_only_statement =
             origin_statement(chain_id, epoch, &origin_only_tx_hash, &origin_address);
-        let origin_only_signature = origin.sign(
-            &origin_only_statement,
-            TRAIL_TX_PATH_DOMAIN.as_bytes(),
-            &[],
-        );
+        let origin_only_signature =
+            origin.sign(&origin_only_statement, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]);
         let mixed_sig_refs = [
             &origin_signature,
             &sender_signature,
@@ -1540,24 +1584,108 @@ mod trail_tx_gossip_tests {
             .expect("mixed aggregate signature should build")
             .to_signature()
             .to_bytes();
-        let relayed_record = inline_record(tx_hash, epoch, vec![0, 1], mixed_aggregate);
-        let origin_only_record =
-            inline_record(origin_only_tx_hash, epoch, vec![0], mixed_aggregate);
-        assert!(verify_trail_inline_block_aggregate(
+        let relayed_record = inline_record(tx_hash, epoch, vec![0, 1], aggregate);
+        let origin_only_record = inline_record(
+            origin_only_tx_hash,
+            epoch,
+            vec![0],
+            origin_only_signature.to_bytes(),
+        );
+        assert_ne!(
+            relayed_record.aggregate_signature,
+            origin_only_record.aggregate_signature
+        );
+        // A legacy block-wide aggregate must not authenticate either path independently.
+        assert!(!verify_trail_inline_path_certificates(
+            &[inline_record(tx_hash, epoch, vec![0, 1], mixed_aggregate)],
+            &registry,
+            &spec
+        ));
+        assert!(verify_trail_inline_path_certificates(
             &[relayed_record, origin_only_record],
             &registry,
             &spec
         ));
 
+        let reverse_hash = [0x53; 32];
+        let reverse_addresses = vec![receiver_address.clone(), origin_address.clone()];
+        let reverse_origin = origin_statement(chain_id, epoch, &reverse_hash, &receiver_address);
+        let reverse_prefix = chain_value(&reverse_hash, chain_id, epoch, &reverse_addresses, 0);
+        let reverse_edge =
+            super::edge_statement(&reverse_prefix, &receiver_address, &origin_address);
+        let reverse_sigs = [
+            receiver.sign(&reverse_origin, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]),
+            receiver.sign(&reverse_edge, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]),
+            origin.sign(&reverse_edge, TRAIL_TX_PATH_DOMAIN.as_bytes(), &[]),
+        ];
+        let refs = reverse_sigs.iter().collect::<Vec<_>>();
+        let reverse_signature = blst::min_sig::AggregateSignature::aggregate(&refs, true)
+            .unwrap()
+            .to_signature()
+            .to_bytes();
+        let reverse_record = inline_record(reverse_hash, epoch, vec![1, 0], reverse_signature);
+        assert_ne!(
+            record.aggregate_signature,
+            reverse_record.aggregate_signature
+        );
+        assert!(verify_trail_inline_path_certificates(
+            &[record.clone(), reverse_record.clone()],
+            &registry,
+            &spec
+        ));
+        assert!(!verify_trail_inline_path_certificates(
+            &[record.clone(), record.clone()],
+            &registry,
+            &spec
+        ));
+        let mut broken_reverse = reverse_record;
+        broken_reverse.epoch = epoch.saturating_add(1);
+        assert!(!verify_trail_inline_path_certificates(
+            &[record.clone(), broken_reverse],
+            &registry,
+            &spec
+        ));
+
+        let mut wrong_epoch = record.clone();
+        wrong_epoch.epoch = epoch.saturating_add(1);
+        let mut wrong_transaction = record.clone();
+        wrong_transaction.tx_hash = Hash256::from_slice(&[0x99; 32]);
+        let repeated = inline_record(tx_hash, epoch, vec![0, 1, 0], aggregate);
+        let empty = inline_record(tx_hash, epoch, vec![], aggregate);
+        for invalid in [wrong_epoch, wrong_transaction, repeated, empty] {
+            assert!(!verify_trail_inline_path_certificates(
+                &[invalid],
+                &registry,
+                &spec
+            ));
+        }
+        let mut short_spec = spec.clone();
+        short_spec.trail_config.max_path_evidence_len = 1;
+        assert!(!verify_trail_inline_path_certificates(
+            &[record.clone()],
+            &registry,
+            &short_spec
+        ));
+        assert!(!verify_trail_inline_path_certificates(
+            &vec![record.clone(); 1025],
+            &registry,
+            &spec
+        ));
+        assert!(verify_trail_inline_path_certificates::<MinimalEthSpec>(
+            &[],
+            &registry,
+            &spec
+        ));
+
         let tampered_path = inline_record(tx_hash, epoch, vec![1, 0], aggregate);
-        assert!(!verify_trail_inline_block_aggregate(
+        assert!(!verify_trail_inline_path_certificates(
             &[tampered_path],
             &registry,
             &spec
         ));
 
         let unknown_relay = inline_record(tx_hash, epoch, vec![0, 2], aggregate);
-        assert!(!verify_trail_inline_block_aggregate(
+        assert!(!verify_trail_inline_path_certificates(
             &[unknown_relay],
             &registry,
             &spec
@@ -1566,7 +1694,7 @@ mod trail_tx_gossip_tests {
         let mut bad_signature = aggregate;
         bad_signature[0] ^= 0x01;
         let bad_signature_record = inline_record(tx_hash, epoch, vec![0, 1], bad_signature);
-        assert!(!verify_trail_inline_block_aggregate(
+        assert!(!verify_trail_inline_path_certificates(
             &[bad_signature_record],
             &registry,
             &spec
@@ -1593,16 +1721,14 @@ mod trail_tx_gossip_tests {
             address_validators: HashMap::new(),
             el_rpc_urls: HashMap::new(),
             cl_http_urls: HashMap::new(),
+            validated_pubkeys: OnceLock::new(),
         };
         assert_eq!(registry.address_for_validator(1, None), relay_address);
         assert_eq!(registry.payout_address_for_validator(1), payout_address);
     }
 }
 
-fn update_trail_finality_dependent_metrics<E: EthSpec>(
-    state: &BeaconState<E>,
-    spec: &ChainSpec,
-) {
+fn update_trail_finality_dependent_metrics<E: EthSpec>(state: &BeaconState<E>, spec: &ChainSpec) {
     trail_settle_credits_through_epoch(state.finalized_checkpoint().epoch);
     submit_trail_finalized_settlements(state.finalized_checkpoint().epoch);
     update_trail_settled_score_metrics::<E>(state, spec);

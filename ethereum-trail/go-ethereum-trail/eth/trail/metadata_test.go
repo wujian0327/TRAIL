@@ -399,11 +399,11 @@ func TestStoreRecordsBlockEvidence(t *testing.T) {
 	if evidence.EvidenceRoot == "" {
 		t.Fatal("missing block evidence root")
 	}
-	if evidence.AggregateSignature == "" {
+	if evidence.Transactions[0].AggregateSignature == "" {
 		t.Fatal("missing block aggregate signature")
 	}
-	if evidence.AggregateSignatureCount != 1 {
-		t.Fatalf("unexpected aggregate signature count %d", evidence.AggregateSignatureCount)
+	if evidence.Transactions[0].AggregateSignatureCount != 1 {
+		t.Fatalf("unexpected aggregate signature count %d", evidence.Transactions[0].AggregateSignatureCount)
 	}
 	if len(evidence.Transactions) != 1 || evidence.Transactions[0].TxHash != hash.Hex() {
 		t.Fatalf("unexpected tx evidence: %#v", evidence.Transactions)
@@ -419,7 +419,7 @@ func TestStoreRecordsBlockEvidence(t *testing.T) {
 
 func TestStoreRecordsCommittedFeeInput(t *testing.T) {
 	t.Setenv("TRAIL_FEE_ESCROW", "1")
-	secret := blst.KeyGen([]byte("trail prompt23 fee evidence key"))
+	secret := blst.KeyGen([]byte("trail prompt23 fee evidence key key material padding"))
 	store := testStore(0, secret)
 	tx := types.NewTx(&types.LegacyTx{
 		Nonce:    1,
@@ -824,4 +824,98 @@ func testStore(validator uint64, secret *blst.SecretKey) *Store {
 	store.epoch.Store(7)
 	store.localAddress = store.registerRelayIdentity(validator, fallbackRelayAddress(validator), store.publicKey)
 	return store
+}
+
+func TestBlockEvidenceUsesIndependentPathCertificates(t *testing.T) {
+	stores := []*Store{
+		testStore(0, blst.KeyGen([]byte("per path origin test key material 000"))),
+		testStore(1, blst.KeyGen([]byte("per path middle test key material 111"))),
+		testStore(2, blst.KeyGen([]byte("per path receiver test key material 222"))),
+	}
+	for _, store := range stores {
+		for i, known := range stores {
+			store.registerRelayIdentity(uint64(i), fallbackRelayAddress(uint64(i)), known.publicKey)
+		}
+		store.peers["middle"] = relayIdentity{1, fallbackRelayAddress(1)}
+		store.peers["receiver"] = relayIdentity{2, fallbackRelayAddress(2)}
+	}
+	origin, middle, receiver := stores[0], stores[1], stores[2]
+	makeTx := func(nonce uint64) *types.Transaction {
+		return types.NewTx(&types.LegacyTx{Nonce: nonce, To: &common.Address{0x42}, Gas: 21_000})
+	}
+	first, second := makeTx(100), makeTx(101)
+	origin.EnsureLocalHash(first.Hash())
+	middle.RecordInbound([]common.Hash{first.Hash()}, origin.MetadataBatchForPeer([]common.Hash{first.Hash()}, "middle"))
+	receiver.RecordInbound([]common.Hash{first.Hash()}, middle.MetadataBatchForPeer([]common.Hash{first.Hash()}, "receiver"))
+	origin.EnsureLocalHash(second.Hash())
+	receiver.RecordInbound([]common.Hash{second.Hash()}, origin.MetadataBatchForPeer([]common.Hash{second.Hash()}, "receiver"))
+	evidence := receiver.BuildBlockEvidence(common.HexToHash("0xcafe"), 10, types.Transactions{first, second}, nil, nil, common.Address{})
+	if len(evidence.Transactions) != 2 || len(evidence.UncertifiedTransactions) != 0 {
+		t.Fatalf("certificates missing: %#v", evidence)
+	}
+	if evidence.Transactions[0].AggregateSignature == evidence.Transactions[1].AggregateSignature {
+		t.Fatal("different transactions/paths share a signature")
+	}
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := document["aggregate_signature"]; exists {
+		t.Fatal("block-wide aggregate must not be returned")
+	}
+	for _, tx := range evidence.Transactions {
+		var meta propagationMetadata
+		if err := json.Unmarshal(tx.Metadata, &meta); err != nil {
+			t.Fatal(err)
+		}
+		records := meta.signatureRecords()
+		pubkeys := make([]*blst.P2Affine, 0, len(records))
+		messages := make([]blst.Message, 0, len(records))
+		for _, record := range records {
+			pubkeys = append(pubkeys, new(blst.P2Affine).Uncompress(receiver.pubkey(record.signer)))
+			messages = append(messages, record.statement)
+		}
+		encoded, err := hexBytes(tx.AggregateSignature)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signature := new(blst.P1Affine).Uncompress(encoded)
+		if signature == nil || !signature.AggregateVerify(true, pubkeys, true, messages, []byte(Domain)) {
+			t.Fatal("independent certificate fails verification")
+		}
+	}
+	var valid propagationMetadata
+	if err := json.Unmarshal(evidence.Transactions[0].Metadata, &valid); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*propagationMetadata){
+		"wrong_epoch":       func(m *propagationMetadata) { m.Epoch++ },
+		"wrong_transaction": func(m *propagationMetadata) { m.TxHash = second.Hash().Hex() },
+		"invalid_signature": func(m *propagationMetadata) { m.Paths[0].SenderSignature = "0x00" },
+		"repeated_identity": func(m *propagationMetadata) { m.Paths = append(m.Paths, m.Paths[0]) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var changed propagationMetadata
+			if err := json.Unmarshal(evidence.Transactions[0].Metadata, &changed); err != nil {
+				t.Fatal(err)
+			}
+			mutate(&changed)
+			encoded, err := json.Marshal(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := receiver.pathAggregateSignature(first.Hash(), encoded); err == nil {
+				t.Fatal("invalid path certificate accepted")
+			}
+		})
+	}
+	receiver.metadata[first.Hash()] = TxMetadata(`{}`)
+	omitted := receiver.BuildBlockEvidence(common.HexToHash("0xbeef"), 11, types.Transactions{first, second}, nil, nil, common.Address{})
+	if len(omitted.Transactions) != 1 || len(omitted.UncertifiedTransactions) != 1 || omitted.UncertifiedTransactions[0].TxHash != first.Hash().Hex() {
+		t.Fatal("invalid certificate omission is not explicit")
+	}
 }

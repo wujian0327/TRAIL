@@ -1,13 +1,18 @@
 use crate::blockchain::transaction::Transaction;
+use crate::consensus::{ValidatorRegistry, ValidatorRegistryError};
 use crate::wallet::Wallet;
 use crate::{tools, wallet};
-use blst::min_sig::{PublicKey, Signature};
+use blst::min_sig::PublicKey;
 use dashmap::DashMap;
 use hex::{decode, encode};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+
+#[cfg(feature = "bls-hop-latency")]
+#[doc(hidden)]
+pub mod latency_bench;
 
 lazy_static! {
     static ref RECEIPT_COMMITMENT_CACHE: DashMap<String, String> = DashMap::new();
@@ -39,7 +44,7 @@ pub struct TransactionPaths {
 
 /// Revised block-level path record.
 ///
-/// `paths` stores the non-proposer validator sequence. The proposer is obtained
+/// `paths` stores the non-proposer validator indices. The proposer is obtained
 /// from the block header during verification.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AggregatedSignedPaths {
@@ -48,7 +53,7 @@ pub struct AggregatedSignedPaths {
     #[serde(default)]
     pub epoch: u64,
     pub signature: String,
-    pub paths: Vec<String>,
+    pub paths: Vec<u64>,
 }
 
 impl TransactionPaths {
@@ -262,8 +267,11 @@ impl TransactionPaths {
         true
     }
 
-    pub fn to_aggregated_signed_paths(&self) -> AggregatedSignedPaths {
-        AggregatedSignedPaths::from_transaction_paths(self.clone())
+    pub fn to_aggregated_signed_paths(
+        &self,
+        registry: &ValidatorRegistry,
+    ) -> Result<AggregatedSignedPaths, ValidatorRegistryError> {
+        AggregatedSignedPaths::from_transaction_paths(self, registry)
     }
 
     pub fn from_json(json: Vec<u8>) -> Result<TransactionPaths, PathError> {
@@ -346,196 +354,244 @@ pub fn conflicting_receipt_count(tx_hash: &str, epoch: u64, receiver: &str) -> u
 }
 
 impl AggregatedSignedPaths {
-    pub fn from_transaction_paths(paths: TransactionPaths) -> AggregatedSignedPaths {
-        let full_nodes = paths.node_sequence();
-        if full_nodes.is_empty() {
-            return AggregatedSignedPaths {
-                chain_id: paths.chain_id,
-                epoch: paths.epoch,
-                signature: String::new(),
-                paths: Vec::new(),
-            };
+    pub fn from_transaction_paths(
+        paths: &TransactionPaths,
+        registry: &ValidatorRegistry,
+    ) -> Result<Self, ValidatorRegistryError> {
+        let nodes = paths.node_sequence();
+        let (proposer, non_proposers) = nodes
+            .split_last()
+            .expect("path includes transaction origin");
+        registry.index(proposer)?;
+
+        // Invalid hop evidence has an empty signature, preserving transaction
+        // inclusion and the existing handling of ineligible relay evidence.
+        let mut signature = String::new();
+        if paths.verify_completed_hops() {
+            let signatures = paths
+                .paths
+                .iter()
+                .flat_map(|hop| {
+                    std::iter::once(&hop.sender_signature).chain(hop.receiver_signature.iter())
+                })
+                .map(|signature| Wallet::bls_signature_from_string(signature.clone()))
+                .collect::<Result<Vec<_>, _>>();
+            if let Ok(signatures) = signatures {
+                signature = Wallet::bls_aggregated_sign(signatures);
+            }
         }
 
-        let non_proposer_nodes = full_nodes[..full_nodes.len().saturating_sub(1)].to_vec();
-        if full_nodes.len() == 1 {
-            return AggregatedSignedPaths {
-                chain_id: paths.chain_id,
-                epoch: paths.epoch,
-                signature: String::new(),
-                paths: Vec::new(),
-            };
-        }
-        if !paths.verify_completed_hops() {
-            return AggregatedSignedPaths {
-                chain_id: paths.chain_id,
-                epoch: paths.epoch,
-                signature: String::new(),
-                paths: non_proposer_nodes,
-            };
-        }
-
-        let mut signatures: Vec<Signature> = Vec::with_capacity(paths.paths.len() * 2);
-        for hop in &paths.paths {
-            let Ok(sender_sig) = Wallet::bls_signature_from_string(hop.sender_signature.clone())
-            else {
-                return AggregatedSignedPaths {
-                    chain_id: paths.chain_id,
-                    epoch: paths.epoch,
-                    signature: String::new(),
-                    paths: non_proposer_nodes,
-                };
-            };
-            signatures.push(sender_sig);
-            let Some(receiver_signature) = &hop.receiver_signature else {
-                return AggregatedSignedPaths {
-                    chain_id: paths.chain_id,
-                    epoch: paths.epoch,
-                    signature: String::new(),
-                    paths: non_proposer_nodes,
-                };
-            };
-            let Ok(receiver_sig) = Wallet::bls_signature_from_string(receiver_signature.clone())
-            else {
-                return AggregatedSignedPaths {
-                    chain_id: paths.chain_id,
-                    epoch: paths.epoch,
-                    signature: String::new(),
-                    paths: non_proposer_nodes,
-                };
-            };
-            signatures.push(receiver_sig);
-        }
-
-        AggregatedSignedPaths {
+        Ok(Self {
             chain_id: paths.chain_id,
             epoch: paths.epoch,
-            signature: Wallet::bls_aggregated_sign(signatures),
-            paths: non_proposer_nodes,
+            signature,
+            paths: non_proposers
+                .iter()
+                .map(|address| registry.index(address))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    pub(crate) fn empty(chain_id: u64, epoch: u64) -> Self {
+        Self {
+            chain_id,
+            epoch,
+            signature: String::new(),
+            paths: Vec::new(),
         }
     }
 
-    pub fn verify(&self, transaction: Transaction, miner: String) -> bool {
-        self.verify_at_epoch(transaction, miner, 0)
+    pub fn verify_at_epoch(
+        &self,
+        transaction: &Transaction,
+        miner: &str,
+        epoch: u64,
+        registry: &ValidatorRegistry,
+    ) -> bool {
+        self.verify_at_epoch_with_cache(transaction, miner, epoch, registry, true)
     }
 
-    pub fn verify_at_epoch(&self, transaction: Transaction, miner: String, epoch: u64) -> bool {
-        self.verify_at_epoch_with_cache(transaction, miner, epoch, true)
-    }
-
-    /// Verify a path record without consulting or populating the process-local
-    /// cache. This is used by cold-path benchmarks and by callers that need to
-    /// account for the full cryptographic verification cost explicitly.
+    /// Verify a path record without consulting or populating the process-local cache.
     pub fn verify_at_epoch_uncached(
         &self,
-        transaction: Transaction,
-        miner: String,
+        transaction: &Transaction,
+        miner: &str,
         epoch: u64,
+        registry: &ValidatorRegistry,
     ) -> bool {
-        self.verify_at_epoch_with_cache(transaction, miner, epoch, false)
+        self.verify_at_epoch_with_cache(transaction, miner, epoch, registry, false)
     }
 
     fn verify_at_epoch_with_cache(
         &self,
-        transaction: Transaction,
-        miner: String,
+        transaction: &Transaction,
+        miner: &str,
         epoch: u64,
+        registry: &ValidatorRegistry,
         use_cache: bool,
     ) -> bool {
-        if self.epoch != epoch {
+        if !self.matches_context(epoch) || !transaction.verify() {
             return false;
         }
-        if transaction.from == miner && self.paths.is_empty() {
-            return transaction.verify();
-        }
+        self.verify_evidence(transaction, miner, registry, use_cache)
+    }
+
+    fn matches_context(&self, epoch: u64) -> bool {
+        self.epoch == epoch && self.chain_id == DEFAULT_TRAIL_CHAIN_ID
+    }
+
+    fn verify_evidence(
+        &self,
+        transaction: &Transaction,
+        miner: &str,
+        registry: &ValidatorRegistry,
+        use_cache: bool,
+    ) -> bool {
         if self.paths.is_empty() {
-            return false;
+            return transaction.from == miner
+                && self.signature.is_empty()
+                && registry.index(miner).is_ok();
         }
-        if self.signature.is_empty() {
-            return false;
-        }
-        if !transaction.verify() {
+        // Each stored index and the header proposer must name a distinct
+        // validator. Consensus also applies its configured hop limit.
+        if self.signature.is_empty() || self.paths.len() >= registry.len() {
             return false;
         }
 
-        let full_nodes = self.full_path(miner.clone());
-        if full_nodes.first() != Some(&transaction.from) {
+        let Ok(full_nodes) = self.full_path(miner, registry) else {
+            return false;
+        };
+        if full_nodes.first() != Some(&transaction.from) || has_repeated_nodes(&full_nodes) {
             return false;
         }
-        if has_repeated_nodes(&full_nodes) {
-            return false;
-        }
-        let hop_count = full_nodes.len().saturating_sub(1);
-        if hop_count == 0 {
-            return transaction.from == full_nodes[0];
-        }
-        let cache_key = self.verification_cache_key(&transaction.hash, &miner);
-        if use_cache {
-            if let Some(cached) = PATH_VERIFY_CACHE.get(&cache_key) {
+        let cache_key = use_cache.then(|| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{:?}",
+                encode(registry.fingerprint()),
+                transaction.hash,
+                self.chain_id,
+                self.epoch,
+                miner,
+                self.signature,
+                self.paths
+            )
+        });
+        if let Some(key) = &cache_key {
+            if let Some(cached) = PATH_VERIFY_CACHE.get(key) {
                 return *cached.value();
             }
         }
         let Ok(signature) = Wallet::bls_signature_from_string(self.signature.clone()) else {
             return false;
         };
+        let Ok((messages, pks)) = self.signer_messages(transaction, &full_nodes, registry) else {
+            return false;
+        };
+        let valid = Wallet::bls_aggregated_verify_parsed(messages, pks, signature);
+        if let Some(key) = cache_key {
+            PATH_VERIFY_CACHE.insert(key, valid);
+        }
+        valid
+    }
 
+    fn signer_messages(
+        &self,
+        transaction: &Transaction,
+        full_nodes: &[String],
+        registry: &ValidatorRegistry,
+    ) -> Result<(Vec<Vec<u8>>, Vec<PublicKey>), ValidatorRegistryError> {
+        let hop_count = self.paths.len();
         let mut messages: Vec<Vec<u8>> = Vec::with_capacity(hop_count * 2);
         let mut pks: Vec<PublicKey> = Vec::with_capacity(hop_count * 2);
-        for idx in 0..hop_count {
+        for (idx, nodes) in full_nodes.windows(2).enumerate() {
             let prefix = chain_value_for_nodes(
                 &transaction.hash,
                 self.chain_id,
                 self.epoch,
-                &full_nodes,
+                full_nodes,
                 idx,
             );
-            let message = edge_statement(&prefix, &full_nodes[idx], &full_nodes[idx + 1]);
-            let Some(sender_pk) = wallet::get_bls_pub_key(full_nodes[idx].clone()) else {
-                return false;
-            };
-            let Some(receiver_pk) = wallet::get_bls_pub_key(full_nodes[idx + 1].clone()) else {
-                return false;
-            };
+            let message = edge_statement(&prefix, &nodes[0], &nodes[1]);
+            let sender_pk = registry.public_key(&nodes[0])?;
+            let receiver_pk = registry.public_key(&nodes[1])?;
             messages.push(message.clone());
             pks.push(sender_pk);
             messages.push(message);
             pks.push(receiver_pk);
         }
 
-        let valid = Wallet::bls_aggregated_verify_parsed(messages, pks, signature);
-        if use_cache {
-            PATH_VERIFY_CACHE.insert(cache_key, valid);
-        }
-        valid
+        Ok((messages, pks))
     }
 
-    fn verification_cache_key(&self, tx_hash: &str, miner: &str) -> String {
-        format!(
-            "{}|{}|{}|{}|{}|{}",
-            tx_hash,
-            self.chain_id,
-            self.epoch,
-            miner,
-            self.signature,
-            self.paths.join(">")
-        )
+    pub fn full_path(
+        &self,
+        miner: &str,
+        registry: &ValidatorRegistry,
+    ) -> Result<Vec<String>, ValidatorRegistryError> {
+        registry.index(miner)?;
+        let mut nodes = self
+            .paths
+            .iter()
+            .map(|&index| registry.address(index).map(str::to_owned))
+            .collect::<Result<Vec<_>, _>>()?;
+        nodes.push(miner.to_owned());
+        Ok(nodes)
     }
 
-    pub fn full_path(&self, miner: String) -> Vec<String> {
-        let mut full_path = self.paths.clone();
-        if full_path.last() != Some(&miner) {
-            full_path.push(miner);
-        }
-        full_path
-    }
-
-    pub fn has_repeated_identities(&self) -> bool {
-        has_repeated_nodes(&self.paths)
-    }
-
+    /// Core size for a well-formed certificate. Zero-hop and ineligible
+    /// records with an empty signature carry no BLS bytes.
     pub fn bytes(&self) -> u64 {
-        let path_bytes: u64 = self.paths.iter().map(|n| n.as_bytes().len() as u64).sum();
-        path_bytes + self.signature.as_bytes().len() as u64
+        let signature_bytes = decode(self.signature.trim_start_matches("0x"))
+            .map_or(0, |signature| signature.len() as u64);
+        signature_bytes + 8 * self.paths.len() as u64
+    }
+
+    /// Chain ID (u64), epoch (u64), signature byte length (u8), raw signature,
+    /// index count (u64), and fixed-width indices (u64), all little-endian.
+    pub fn to_compact_binary(&self) -> Result<Vec<u8>, PathError> {
+        let signature = decode(self.signature.strip_prefix("0x").unwrap_or(&self.signature))
+            .map_err(|_| PathError::InvalidBinaryEncoding)?;
+        if !matches!(signature.len(), 0 | 48) {
+            return Err(PathError::InvalidBinaryEncoding);
+        }
+        let mut bytes = Vec::with_capacity(25 + signature.len() + self.paths.len() * 8);
+        bytes.extend_from_slice(&self.chain_id.to_le_bytes());
+        bytes.extend_from_slice(&self.epoch.to_le_bytes());
+        bytes.push(signature.len() as u8);
+        bytes.extend_from_slice(&signature);
+        bytes.extend_from_slice(&(self.paths.len() as u64).to_le_bytes());
+        for index in &self.paths {
+            bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    pub fn from_compact_binary(bytes: &[u8]) -> Result<Self, PathError> {
+        if bytes.len() < 25 || !matches!(bytes[16], 0 | 48) {
+            return Err(PathError::InvalidBinaryEncoding);
+        }
+        let signature_end = 17 + bytes[16] as usize;
+        let count_end = signature_end + 8;
+        if bytes.len() < count_end {
+            return Err(PathError::InvalidBinaryEncoding);
+        }
+        let read_u64 = |field: &[u8]| u64::from_le_bytes(field.try_into().unwrap());
+        let indices = &bytes[count_end..];
+        let count = read_u64(&bytes[signature_end..count_end]);
+        if indices.len() % 8 != 0 || count != (indices.len() / 8) as u64 {
+            return Err(PathError::InvalidBinaryEncoding);
+        }
+        let signature = if signature_end == 17 {
+            String::new()
+        } else {
+            format!("0x{}", encode(&bytes[17..signature_end]))
+        };
+        Ok(Self {
+            chain_id: read_u64(&bytes[..8]),
+            epoch: read_u64(&bytes[8..16]),
+            signature,
+            paths: indices.chunks_exact(8).map(read_u64).collect(),
+        })
     }
 
     pub fn to_json(&self) -> Vec<u8> {
@@ -619,6 +675,7 @@ fn default_trail_chain_id() -> u64 {
 #[derive(Debug)]
 pub enum PathError {
     JSONError,
+    InvalidBinaryEncoding,
 }
 
 impl fmt::Display for PathError {
@@ -626,6 +683,9 @@ impl fmt::Display for PathError {
         match *self {
             PathError::JSONError => {
                 write!(f, "Invalid Json Error")
+            }
+            PathError::InvalidBinaryEncoding => {
+                write!(f, "invalid path certificate binary encoding")
             }
         }
     }
@@ -651,8 +711,8 @@ mod tests {
         Wallet,
         Wallet,
         Wallet,
+        ValidatorRegistry,
     ) {
-        clear_receipt_cache_for_tests();
         let origin = Wallet::new();
         let relay1 = Wallet::new();
         let relay2 = Wallet::new();
@@ -665,6 +725,8 @@ mod tests {
         assert!(transaction_paths.complete_pending_hop(relay2.clone()));
         assert!(transaction_paths.append_outgoing_hop(miner.address.clone(), relay2.clone()));
         assert!(transaction_paths.complete_pending_hop(miner.clone()));
+        let registry =
+            ValidatorRegistry::from_wallets([&origin, &relay1, &relay2, &miner]).unwrap();
         (
             transaction,
             transaction_paths,
@@ -672,95 +734,247 @@ mod tests {
             relay1,
             relay2,
             miner,
+            registry,
         )
     }
 
     #[test]
     fn valid_two_sided_path() {
-        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner) =
+        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner, registry) =
             build_valid_path(7);
         assert!(transaction_paths.verify(miner.address.clone()));
-        let aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
-        assert!(aggregated.verify_at_epoch(transaction, miner.address, 7));
+        let aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
+        assert!(aggregated.verify_at_epoch(&transaction, &miner.address, 7, &registry));
+    }
+
+    #[test]
+    fn indexed_paths_round_trip_and_verify_at_supported_lengths() {
+        for hops in [2, 4, 8, 16] {
+            let wallets: Vec<_> = (0..=hops)
+                .map(|index| Wallet::new_deterministic(2400 + hops as u64, index))
+                .collect();
+            let registry = ValidatorRegistry::from_wallets(wallets.iter().rev()).unwrap();
+            let miner = &wallets.last().unwrap().address;
+            let tx = Transaction::new(miner.clone(), 32, wallets[0].clone());
+            let mut path = TransactionPaths::new_with_epoch(tx.clone(), 7);
+            for pair in wallets.windows(2) {
+                assert!(path.append_completed_hop(
+                    pair[1].address.clone(),
+                    pair[0].clone(),
+                    pair[1].clone(),
+                ));
+            }
+
+            let certificate = path.to_aggregated_signed_paths(&registry).unwrap();
+            assert_eq!(certificate.paths.len(), hops as usize);
+            assert_eq!(
+                certificate.full_path(miner, &registry).unwrap(),
+                path.node_sequence()
+            );
+            assert_eq!(certificate.bytes(), 48 + 8 * hops as u64);
+            let binary = certificate.to_compact_binary().unwrap();
+            assert_eq!(binary.len() as u64, certificate.bytes() + 25);
+            let restored = AggregatedSignedPaths::from_compact_binary(&binary).unwrap();
+            assert_eq!(restored.to_json(), certificate.to_json());
+            assert!(restored.verify_at_epoch(&tx, miner, 7, &registry));
+            assert!(restored.verify_at_epoch_uncached(&tx, miner, 7, &registry));
+            assert!(
+                AggregatedSignedPaths::from_compact_binary(&binary[..binary.len() - 1]).is_err()
+            );
+            let mut incorrect_count = binary;
+            incorrect_count[65..73].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(AggregatedSignedPaths::from_compact_binary(&incorrect_count).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_indices_and_proposers_and_changed_indices() {
+        let (tx, path, origin, relay1, relay2, miner, registry) = build_valid_path(7);
+        let mut certificate = path.to_aggregated_signed_paths(&registry).unwrap();
+        assert!(!certificate.verify_at_epoch(&tx, &relay2.address, 7, &registry));
+
+        let spare = Wallet::new();
+        let extended =
+            ValidatorRegistry::from_wallets([&origin, &relay1, &relay2, &miner, &spare]).unwrap();
+        // With the proposer already in the sequence, appending the same
+        // identity from the header must also fail.
+        let mut repeated_proposer = path.to_aggregated_signed_paths(&extended).unwrap();
+        repeated_proposer
+            .paths
+            .push(extended.index(&miner.address).unwrap());
+        assert!(!repeated_proposer.verify_at_epoch(&tx, &miner.address, 7, &extended));
+
+        let mut changed = path.to_aggregated_signed_paths(&extended).unwrap();
+        changed.paths[1] = extended.index(&spare.address).unwrap();
+        assert!(!changed.verify_at_epoch(&tx, &miner.address, 7, &extended));
+
+        certificate.paths[1] = u64::MAX;
+        assert_eq!(
+            certificate.full_path(&miner.address, &registry),
+            Err(ValidatorRegistryError::UnknownIndex(u64::MAX))
+        );
+        assert!(!certificate.verify_at_epoch(&tx, &miner.address, 7, &registry));
+
+        let incomplete = ValidatorRegistry::from_wallets([&origin, &relay2, &miner]).unwrap();
+        assert!(
+            matches!(path.to_aggregated_signed_paths(&incomplete), Err(ValidatorRegistryError::UnknownAddress(address)) if address == relay1.address)
+        );
+    }
+
+    #[test]
+    fn cached_verification_is_bound_to_the_registry_keys() {
+        let (tx, path, origin, relay1, relay2, miner, registry) = build_valid_path(6);
+        let certificate = path.to_aggregated_signed_paths(&registry).unwrap();
+        let wrong_keys = ValidatorRegistry::new([
+            (origin.address.clone(), origin.bls_public_key),
+            (relay1.address.clone(), relay2.bls_public_key),
+            (relay2.address.clone(), relay2.bls_public_key),
+            (miner.address.clone(), miner.bls_public_key),
+        ])
+        .unwrap();
+        assert_eq!(
+            certificate.full_path(&miner.address, &wrong_keys).unwrap(),
+            path.node_sequence()
+        );
+        assert!(certificate.verify_at_epoch(&tx, &miner.address, 6, &registry));
+        assert!(!certificate.verify_at_epoch(&tx, &miner.address, 6, &wrong_keys));
+        assert!(!certificate.verify_at_epoch_uncached(&tx, &miner.address, 6, &wrong_keys));
+        assert!(certificate.verify_at_epoch(&tx, &miner.address, 6, &registry));
+    }
+
+    #[test]
+    fn individual_hop_checks_reject_canceling_signature_errors() {
+        let (tx, mut path, _, _, _, miner, registry) = build_valid_path(7);
+        let valid = path.to_aggregated_signed_paths(&registry).unwrap();
+
+        // Swapping the two signers' proofs leaves their BLS sum unchanged.
+        // Each proof must still match its own registered key.
+        let hop = &mut path.paths[0];
+        std::mem::swap(
+            &mut hop.sender_signature,
+            hop.receiver_signature.as_mut().unwrap(),
+        );
+        assert!(!path.verify_completed_hops());
+        let signatures = path
+            .paths
+            .iter()
+            .flat_map(|hop| {
+                [
+                    Wallet::bls_signature_from_string(hop.sender_signature.clone()).unwrap(),
+                    Wallet::bls_signature_from_string(hop.receiver_signature.clone().unwrap())
+                        .unwrap(),
+                ]
+            })
+            .collect();
+        assert_eq!(Wallet::bls_aggregated_sign(signatures), valid.signature);
+        let rejected = path.to_aggregated_signed_paths(&registry).unwrap();
+        assert!(rejected.signature.is_empty());
+        assert!(!rejected.verify_at_epoch(&tx, &miner.address, 7, &registry));
     }
 
     #[test]
     fn missing_receiver_signature_fails() {
-        clear_receipt_cache_for_tests();
         let origin = Wallet::new();
         let relay = Wallet::new();
+        let registry = ValidatorRegistry::from_wallets([&origin, &relay]).unwrap();
         let transaction = Transaction::new("123".to_string(), 32, origin.clone());
         let mut transaction_paths = TransactionPaths::new_with_epoch(transaction.clone(), 1);
         assert!(transaction_paths.append_outgoing_hop(relay.address.clone(), origin));
         assert!(!transaction_paths.verify(relay.address.clone()));
-        let aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
-        assert!(!aggregated.verify_at_epoch(transaction, relay.address, 1));
+        let aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
+        assert!(!aggregated.verify_at_epoch(&transaction, &relay.address, 1, &registry));
     }
 
     #[test]
     fn modified_transaction_fails() {
-        let (mut transaction, transaction_paths, _origin, _relay1, _relay2, miner) =
+        let (mut transaction, transaction_paths, origin, _relay1, _relay2, miner, registry) =
             build_valid_path(1);
-        let aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
+        let aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
         transaction.amount += 1;
-        assert!(!aggregated.verify_at_epoch(transaction, miner.address, 1));
+        assert!(!aggregated.verify_at_epoch(&transaction, &miner.address, 1, &registry));
+        let different_signed_transaction = Transaction::new("123".to_string(), 33, origin);
+        assert!(different_signed_transaction.verify());
+        assert!(!aggregated.verify_at_epoch(
+            &different_signed_transaction,
+            &miner.address,
+            1,
+            &registry
+        ));
     }
 
     #[test]
     fn modified_path_epoch_fails() {
-        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner) =
+        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner, registry) =
             build_valid_path(1);
-        let mut aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
+        let mut aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
         aggregated.epoch = 2;
-        assert!(!aggregated.verify_at_epoch(transaction, miner.address, 1));
+        assert!(!aggregated.verify_at_epoch(&transaction, &miner.address, 1, &registry));
     }
 
     #[test]
     fn replayed_path_in_different_epoch_fails() {
-        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner) =
+        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner, registry) =
             build_valid_path(1);
-        let aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
-        assert!(!aggregated.verify_at_epoch(transaction, miner.address, 2));
+        let aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
+        assert!(!aggregated.verify_at_epoch(&transaction, &miner.address, 2, &registry));
     }
 
     #[test]
     fn modified_chain_id_fails() {
-        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner) =
+        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner, registry) =
             build_valid_path(1);
-        let mut aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
+        let mut aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
         aggregated.chain_id += 1;
-        assert!(!aggregated.verify_at_epoch(transaction, miner.address, 1));
+        assert!(!aggregated.verify_at_epoch(&transaction, &miner.address, 1, &registry));
     }
 
     #[test]
     fn reordered_node_fails() {
-        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner) =
+        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner, registry) =
             build_valid_path(1);
-        let mut aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
+        let mut aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
         aggregated.paths.swap(1, 2);
-        assert!(!aggregated.verify_at_epoch(transaction, miner.address, 1));
+        assert!(!aggregated.verify_at_epoch(&transaction, &miner.address, 1, &registry));
     }
 
     #[test]
     fn removed_node_fails() {
-        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner) =
+        let (transaction, transaction_paths, _origin, _relay1, _relay2, miner, registry) =
             build_valid_path(1);
-        let mut aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
+        let mut aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
         aggregated.paths.remove(1);
-        assert!(!aggregated.verify_at_epoch(transaction, miner.address, 1));
+        assert!(!aggregated.verify_at_epoch(&transaction, &miner.address, 1, &registry));
     }
 
     #[test]
     fn repeated_identity_fails() {
-        let (transaction, transaction_paths, _origin, relay1, _relay2, miner) = build_valid_path(1);
-        let mut aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
-        aggregated.paths.push(relay1.address);
-        assert!(!aggregated.verify_at_epoch(transaction, miner.address, 1));
+        let (transaction, transaction_paths, _origin, relay1, _relay2, miner, registry) =
+            build_valid_path(1);
+        let mut aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
+        aggregated.paths[2] = registry.index(&relay1.address).unwrap();
+        assert!(!aggregated.verify_at_epoch(&transaction, &miner.address, 1, &registry));
     }
 
     #[test]
     fn conflicting_receipts_are_detected() {
-        clear_receipt_cache_for_tests();
         let origin = Wallet::new();
         let other_origin = Wallet::new();
         let receiver = Wallet::new();
@@ -784,64 +998,87 @@ mod tests {
     fn aggregate_verification_accepts_repeated_messages_with_different_keys() {
         let origin = Wallet::new();
         let relay = Wallet::new();
+        let registry = ValidatorRegistry::from_wallets([&origin, &relay]).unwrap();
         let transaction = Transaction::new("123".to_string(), 32, origin.clone());
         let mut transaction_paths = TransactionPaths::new_with_epoch(transaction.clone(), 5);
         assert!(transaction_paths.append_outgoing_hop(relay.address.clone(), origin));
         assert!(transaction_paths.complete_pending_hop(relay.clone()));
-        let aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
-        assert!(aggregated.verify_at_epoch(transaction, relay.address, 5));
+        let aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
+        assert!(aggregated.verify_at_epoch(&transaction, &relay.address, 5, &registry));
     }
 
     #[test]
     fn malformed_aggregate_signature_is_rejected_without_panicking() {
-        clear_receipt_cache_for_tests();
         let origin = Wallet::new_deterministic(9001, 0);
         let relay = Wallet::new_deterministic(9001, 1);
+        let registry = ValidatorRegistry::from_wallets([&origin, &relay]).unwrap();
         let transaction =
             Transaction::with_costs(relay.address.clone(), 1, 1.0, 1.0, origin.clone());
         let mut paths = TransactionPaths::new_with_epoch(transaction.clone(), 3);
         assert!(paths.append_completed_hop(relay.address.clone(), origin, relay.clone(),));
-        let mut aggregate = paths.to_aggregated_signed_paths();
+        let mut aggregate = paths.to_aggregated_signed_paths(&registry).unwrap();
         aggregate.signature = "0x00".to_string();
-        assert!(!aggregate.verify_at_epoch_uncached(transaction, relay.address, 3,));
+        assert!(!aggregate.verify_at_epoch_uncached(&transaction, &relay.address, 3, &registry));
     }
 
     #[test]
     fn cached_and_uncached_aggregate_verification_agree() {
-        clear_receipt_cache_for_tests();
         let origin = Wallet::new_deterministic(9002, 0);
         let relay = Wallet::new_deterministic(9002, 1);
+        let registry = ValidatorRegistry::from_wallets([&origin, &relay]).unwrap();
         let transaction =
             Transaction::with_costs(relay.address.clone(), 1, 1.0, 1.0, origin.clone());
         let mut paths = TransactionPaths::new_with_epoch(transaction.clone(), 4);
         assert!(paths.append_completed_hop(relay.address.clone(), origin, relay.clone(),));
-        let aggregate = paths.to_aggregated_signed_paths();
-        assert!(aggregate.verify_at_epoch(transaction.clone(), relay.address.clone(), 4,));
-        assert!(aggregate.verify_at_epoch_uncached(transaction, relay.address, 4,));
+        let aggregate = paths.to_aggregated_signed_paths(&registry).unwrap();
+        assert!(aggregate.verify_at_epoch(&transaction, &relay.address, 4, &registry));
+        assert!(aggregate.verify_at_epoch_uncached(&transaction, &relay.address, 4, &registry));
     }
 
     #[test]
     fn direct_originator_to_proposer_path() {
         let origin = Wallet::new();
         let miner = Wallet::new();
+        let registry = ValidatorRegistry::from_wallets([&origin, &miner]).unwrap();
         let transaction = Transaction::new("123".to_string(), 32, origin.clone());
         let mut transaction_paths = TransactionPaths::new_with_epoch(transaction.clone(), 4);
         assert!(transaction_paths.append_outgoing_hop(miner.address.clone(), origin));
         assert!(transaction_paths.complete_pending_hop(miner.clone()));
-        let aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
-        assert_eq!(aggregated.paths, vec![transaction.from.clone()]);
-        assert!(aggregated.verify_at_epoch(transaction, miner.address, 4));
+        let aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
+        assert_eq!(
+            aggregated.paths,
+            vec![registry.index(&transaction.from).unwrap()]
+        );
+        assert!(aggregated.verify_at_epoch(&transaction, &miner.address, 4, &registry));
     }
 
     #[test]
     fn proposer_generated_transaction_has_empty_path() {
         let miner = Wallet::new();
+        let registry = ValidatorRegistry::from_wallets([&miner]).unwrap();
         let transaction = Transaction::new("123".to_string(), 32, miner.clone());
         let transaction_paths = TransactionPaths::new_with_epoch(transaction.clone(), 4);
-        let aggregated = AggregatedSignedPaths::from_transaction_paths(transaction_paths);
+        let aggregated = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
         assert!(aggregated.paths.is_empty());
         assert!(aggregated.signature.is_empty());
-        assert!(aggregated.verify_at_epoch(transaction, miner.address, 4));
+        assert!(aggregated.verify_at_epoch(&transaction, &miner.address, 4, &registry));
+        assert!(!aggregated.verify_at_epoch(
+            &transaction,
+            &miner.address,
+            4,
+            &ValidatorRegistry::default()
+        ));
+        assert_eq!(aggregated.bytes(), 0);
+        assert_eq!(aggregated.to_compact_binary().unwrap().len(), 25);
+        let mut malformed = aggregated;
+        malformed.chain_id += 1;
+        assert!(!malformed.verify_at_epoch(&transaction, &miner.address, 4, &registry));
     }
 
     #[test]
@@ -850,6 +1087,8 @@ mod tests {
         let wallet2 = Wallet::new();
         let wallet3 = Wallet::new();
         let miner = Wallet::new();
+        let registry =
+            ValidatorRegistry::from_wallets([&wallet, &wallet2, &wallet3, &miner]).unwrap();
         let transaction = Transaction::new("123".to_string(), 32, wallet.clone());
         let mut transaction_paths = TransactionPaths::new(transaction.clone());
         assert!(transaction_paths.append_outgoing_hop(wallet2.address.clone(), wallet.clone()));
@@ -864,9 +1103,18 @@ mod tests {
         wallet::insert_bls_pub_key(miner.address.clone(), miner.bls_public_key);
         assert!(transaction_paths.verify(miner.address.clone()));
 
-        let aggregated_signed_paths =
-            AggregatedSignedPaths::from_transaction_paths(transaction_paths);
-        assert!(aggregated_signed_paths.verify(transaction.clone(), miner.address.clone()));
-        assert_eq!(aggregated_signed_paths.paths.last(), Some(&wallet3.address));
+        let aggregated_signed_paths = transaction_paths
+            .to_aggregated_signed_paths(&registry)
+            .unwrap();
+        assert!(aggregated_signed_paths.verify_at_epoch(
+            &transaction,
+            &miner.address,
+            0,
+            &registry
+        ));
+        assert_eq!(
+            aggregated_signed_paths.paths.last(),
+            Some(&registry.index(&wallet3.address).unwrap())
+        );
     }
 }

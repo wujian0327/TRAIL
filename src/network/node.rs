@@ -301,6 +301,13 @@ impl Node {
         }
     }
 
+    pub(crate) fn set_initial_blockchain(&mut self, blockchain: &Blockchain) {
+        self.blockchain = Arc::new(RwLock::new(blockchain.clone()));
+        for sybil in &mut self.sybil_nodes {
+            sybil.set_initial_blockchain(blockchain);
+        }
+    }
+
     pub async fn generate_block(&self, epoch: u64, slot: u64) -> Result<Block, BlockError> {
         let transaction_paths_to_pack = {
             let transaction_paths_cache = self.transaction_paths_cache.read().await;
@@ -328,35 +335,25 @@ impl Node {
                 .map(|&x| x.clone())
                 .collect();
 
-            drop(blockchain);
-            drop(transaction_paths_cache);
-
-            // 4. 更新缓存：移除已打包的交易
-            if !to_pack.is_empty() {
-                let mut cache_write = self.transaction_paths_cache.write().await;
-                for tx in &to_pack {
-                    cache_write.remove(&tx.transaction.hash);
-                }
-            }
-
             to_pack
         };
 
-        let mut transactions: Vec<Transaction> =
-            Vec::with_capacity(transaction_paths_to_pack.len());
+        let mut transactions = Vec::with_capacity(transaction_paths_to_pack.len());
         let mut paths: Vec<AggregatedSignedPaths> =
             Vec::with_capacity(transaction_paths_to_pack.len());
 
-        for x in transaction_paths_to_pack {
-            transactions.push(x.transaction.clone());
-            paths.push(x.to_aggregated_signed_paths());
+        let (last_index, last_hash, registry) = {
+            let blockchain = self.blockchain.read().await;
+            (
+                blockchain.get_last_index(),
+                blockchain.get_last_hash(),
+                blockchain.validator_registry().clone(),
+            )
+        };
+        for transaction_paths in transaction_paths_to_pack {
+            paths.push(transaction_paths.to_aggregated_signed_paths(&registry)?);
+            transactions.push(transaction_paths.transaction.clone());
         }
-
-        // 获取需要的信息后再释放读锁
-        let blockchain = self.blockchain.read().await;
-        let last_index = blockchain.get_last_index();
-        let last_hash = blockchain.get_last_hash();
-        drop(blockchain);
 
         let body = Body::new(transactions, paths);
         let new_block = {
@@ -380,6 +377,13 @@ impl Node {
                 error!("Node[{}] error :{}", self.index, e);
                 return Err(BlockError::InvalidBlock);
             };
+        }
+
+        if !new_block.body.transactions.is_empty() {
+            let mut cache = self.transaction_paths_cache.write().await;
+            for transaction in &new_block.body.transactions {
+                cache.remove(&transaction.hash);
+            }
         }
 
         Ok(new_block)
@@ -1452,6 +1456,7 @@ mod tests {
     use crate::blockchain::block::Body;
     use crate::blockchain::path::TransactionPaths;
     use crate::blockchain::transaction::Transaction;
+    use crate::consensus::ValidatorRegistry;
     use crate::wallet::Wallet;
     use std::time::Duration;
 
@@ -1468,6 +1473,10 @@ mod tests {
         let wallet2 = Wallet::new();
         let wallet3 = Wallet::new();
         let miner = Wallet::new();
+        let registry = Arc::new(
+            ValidatorRegistry::from_wallets([&wallet, &wallet2, &wallet3, &miner]).unwrap(),
+        );
+        let blockchain = blockchain.with_validator_registry(registry.clone());
         let transaction = Transaction::new("123".to_string(), 32, wallet.clone());
         let mut transaction_paths = TransactionPaths::new(transaction.clone());
         transaction_paths.add_path(wallet2.address.clone(), wallet);
@@ -1479,7 +1488,9 @@ mod tests {
 
         let body = Body::new(
             vec![transaction],
-            vec![transaction_paths.to_aggregated_signed_paths()],
+            vec![transaction_paths
+                .to_aggregated_signed_paths(&registry)
+                .unwrap()],
         );
         let block = Block::new(
             blockchain.get_last_index() + 1,
@@ -1530,6 +1541,10 @@ mod tests {
         let wallet1 = Wallet::new();
         let wallet2 = Wallet::new();
         let wallet3 = Wallet::new();
+        let registry = Arc::new(
+            ValidatorRegistry::from_wallets([&wallet0, &wallet1, &wallet2, &wallet3]).unwrap(),
+        );
+        let blockchain = blockchain.with_validator_registry(registry);
         let mut node0 = Node::new_with_wallet(
             0,
             0,

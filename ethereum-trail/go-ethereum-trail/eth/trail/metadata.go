@@ -133,23 +133,32 @@ type BlockEvidence struct {
 	TxCount                 int                        `json:"tx_count"`
 	EvidenceCount           int                        `json:"evidence_count"`
 	EvidenceRoot            string                     `json:"evidence_root,omitempty"`
-	AggregateSignature      string                     `json:"aggregate_signature,omitempty"`
-	AggregateSignatureCount int                        `json:"aggregate_signature_count,omitempty"`
+	SignatureScheme         string                     `json:"signature_scheme"`
+	UncertifiedTransactions []UncertifiedTransaction   `json:"uncertified_transactions,omitempty"`
 	RecordedUnixMillis      int64                      `json:"recorded_unix_millis"`
 	Transactions            []BlockTransactionEvidence `json:"transactions"`
 }
 
+// UncertifiedTransaction exposes every path certificate omitted by Geth.
+type UncertifiedTransaction struct {
+	Index  int    `json:"index"`
+	TxHash string `json:"tx_hash"`
+	Reason string `json:"reason"`
+}
+
 type BlockTransactionEvidence struct {
-	Index                int             `json:"index"`
-	TxHash               string          `json:"tx_hash"`
-	GasUsed              uint64          `json:"gas_used,omitempty"`
-	EffectiveGasTipWei   string          `json:"effective_gas_tip_wei,omitempty"`
-	PriorityFeeWei       string          `json:"priority_fee_wei,omitempty"`
-	BaseFeeWei           string          `json:"base_fee_wei,omitempty"`
-	IrrecoverableCostWei string          `json:"irrecoverable_cost_wei,omitempty"`
-	FeeRecipient         string          `json:"fee_recipient,omitempty"`
-	EscrowRecipient      string          `json:"escrow_recipient,omitempty"`
-	Metadata             json.RawMessage `json:"metadata"`
+	AggregateSignature      string          `json:"aggregate_signature"`
+	AggregateSignatureCount int             `json:"aggregate_signature_count"`
+	Index                   int             `json:"index"`
+	TxHash                  string          `json:"tx_hash"`
+	GasUsed                 uint64          `json:"gas_used,omitempty"`
+	EffectiveGasTipWei      string          `json:"effective_gas_tip_wei,omitempty"`
+	PriorityFeeWei          string          `json:"priority_fee_wei,omitempty"`
+	BaseFeeWei              string          `json:"base_fee_wei,omitempty"`
+	IrrecoverableCostWei    string          `json:"irrecoverable_cost_wei,omitempty"`
+	FeeRecipient            string          `json:"fee_recipient,omitempty"`
+	EscrowRecipient         string          `json:"escrow_recipient,omitempty"`
+	Metadata                json.RawMessage `json:"metadata"`
 }
 
 type SettlementPayload struct {
@@ -548,6 +557,7 @@ func (s *Store) buildBlockEvidenceLocked(blockHash common.Hash, blockNumber uint
 		BlockNumber:        blockNumber,
 		TxCount:            len(txs),
 		RecordedUnixMillis: time.Now().UnixMilli(),
+		SignatureScheme:    "per_path_v1",
 		Transactions:       []BlockTransactionEvidence{},
 	}
 	for i, tx := range txs {
@@ -557,54 +567,100 @@ func (s *Store) buildBlockEvidenceLocked(blockHash common.Hash, blockNumber uint
 		hash := tx.Hash()
 		meta := s.metadata[hash]
 		if len(meta) == 0 {
+			evidence.UncertifiedTransactions = append(evidence.UncertifiedTransactions, UncertifiedTransaction{i, hash.Hex(), "missing_propagation_metadata"})
+			continue
+		}
+		signature, count, err := s.pathAggregateSignature(hash, meta)
+		if err != nil {
+			evidence.UncertifiedTransactions = append(evidence.UncertifiedTransactions, UncertifiedTransaction{i, hash.Hex(), "invalid_path_certificate: " + err.Error()})
+			txMetadataInvalidMeter.Mark(1)
 			continue
 		}
 		txEvidence := BlockTransactionEvidence{
-			Index:    i,
-			TxHash:   hash.Hex(),
-			Metadata: append(json.RawMessage(nil), meta...),
+			AggregateSignature:      signature,
+			AggregateSignatureCount: count,
+			Index:                   i,
+			TxHash:                  hash.Hex(),
+			Metadata:                append(json.RawMessage(nil), meta...),
 		}
 		s.attachFeeEvidence(&txEvidence, tx, receiptAt(receipts, i), baseFee, feeRecipient)
 		evidence.Transactions = append(evidence.Transactions, txEvidence)
 	}
 	evidence.EvidenceCount = len(evidence.Transactions)
-	evidence.EvidenceRoot, evidence.AggregateSignature, evidence.AggregateSignatureCount = s.blockEvidenceCommitment(blockHash, blockNumber, evidence.Transactions)
+	evidence.EvidenceRoot = s.blockEvidenceCommitment(blockHash, blockNumber, evidence.Transactions)
 	return evidence
 }
 
-func (s *Store) blockEvidenceCommitment(blockHash common.Hash, blockNumber uint64, txs []BlockTransactionEvidence) (string, string, int) {
+// pathAggregateSignature retains the existing origin and sender/receiver domains,
+// but never combines signatures belonging to different transactions.
+func (s *Store) pathAggregateSignature(hash common.Hash, raw TxMetadata) (string, int, error) {
+	var meta propagationMetadata
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return "", 0, err
+	}
+	meta.normalizeAddresses(s)
+	if meta.Domain != Domain || meta.ChainID != s.chainID || meta.TxHash != hash.Hex() {
+		return "", 0, fmt.Errorf("transaction or signature domain mismatch")
+	}
+	if meta.hasRepeatedValidators() {
+		return "", 0, fmt.Errorf("repeated or disconnected relay identity")
+	}
+	nodes := meta.addressSequence()
+	seen := make(map[uint64]bool)
+	for i, index := range meta.indexSequence() {
+		if seen[index] || s.addressForValidator(index) != nodes[i] {
+			return "", 0, fmt.Errorf("unregistered or repeated validator identity")
+		}
+		seen[index] = true
+	}
+	for i, edge := range meta.Paths {
+		expected := chainValue(hash, meta.ChainID, meta.Epoch, nodes, i)
+		if edge.Prefix != "0x"+hex.EncodeToString(expected) {
+			return "", 0, fmt.Errorf("invalid path prefix")
+		}
+	}
+	records := meta.signatureRecords()
+	if len(records) != 1+2*len(meta.Paths) {
+		return "", 0, fmt.Errorf("incomplete signed path")
+	}
+	signatures := make([]*blst.P1Affine, 0, len(records))
+	pubkeys := make([]*blst.P2Affine, 0, len(records))
+	messages := make([]blst.Message, 0, len(records))
+	for _, record := range records {
+		if len(record.signature) != 48 {
+			return "", 0, fmt.Errorf("invalid signature length")
+		}
+		signature := new(blst.P1Affine).Uncompress(record.signature)
+		pubkey := new(blst.P2Affine).Uncompress(s.pubkey(record.signer))
+		if signature == nil || pubkey == nil {
+			return "", 0, fmt.Errorf("invalid signature or unregistered key")
+		}
+		signatures = append(signatures, signature)
+		pubkeys = append(pubkeys, pubkey)
+		messages = append(messages, record.statement)
+	}
+	aggregate := new(blst.P1Aggregate)
+	if !aggregate.Aggregate(signatures, true) {
+		return "", 0, fmt.Errorf("signature aggregation failed")
+	}
+	signature := aggregate.ToAffine()
+	if !signature.AggregateVerify(true, pubkeys, true, messages, []byte(Domain)) {
+		return "", 0, fmt.Errorf("path signature verification failed")
+	}
+	return "0x" + hex.EncodeToString(signature.Compress()), len(records), nil
+}
+
+func (s *Store) blockEvidenceCommitment(blockHash common.Hash, blockNumber uint64, txs []BlockTransactionEvidence) string {
 	records := make([]blockSignatureRecord, 0)
 	for _, tx := range txs {
 		var meta propagationMetadata
 		if err := json.Unmarshal(tx.Metadata, &meta); err != nil {
-			txMetadataInvalidMeter.Mark(1)
 			continue
 		}
 		meta.normalizeAddresses(s)
 		records = append(records, meta.signatureRecords()...)
 	}
-	root := blockEvidenceRoot(blockHash, blockNumber, records, txs)
-	if len(records) == 0 {
-		return "0x" + hex.EncodeToString(root), "", 0
-	}
-	signatures := make([]*blst.P1Affine, 0, len(records))
-	for _, record := range records {
-		sig := new(blst.P1Affine).Uncompress(record.signature)
-		if sig == nil {
-			txMetadataInvalidMeter.Mark(1)
-			continue
-		}
-		signatures = append(signatures, sig)
-	}
-	if len(signatures) != len(records) {
-		return "0x" + hex.EncodeToString(root), "", 0
-	}
-	aggregate := new(blst.P1Aggregate)
-	if !aggregate.Aggregate(signatures, true) {
-		txMetadataInvalidMeter.Mark(1)
-		return "0x" + hex.EncodeToString(root), "", 0
-	}
-	return "0x" + hex.EncodeToString(root), "0x" + hex.EncodeToString(aggregate.ToAffine().Compress()), len(records)
+	return "0x" + hex.EncodeToString(blockEvidenceRoot(blockHash, blockNumber, records, txs))
 }
 
 func receiptAt(receipts types.Receipts, index int) *types.Receipt {
@@ -1800,6 +1856,7 @@ func cloneBlockEvidence(evidence *BlockEvidence) *BlockEvidence {
 		return nil
 	}
 	clone := *evidence
+	clone.UncertifiedTransactions = append([]UncertifiedTransaction(nil), evidence.UncertifiedTransactions...)
 	clone.Transactions = make([]BlockTransactionEvidence, len(evidence.Transactions))
 	for i, tx := range evidence.Transactions {
 		clone.Transactions[i] = tx

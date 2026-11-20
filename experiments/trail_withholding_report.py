@@ -11,6 +11,7 @@ import statistics
 
 from scipy.stats import t
 from run_experiments import ROOT, expand_runs, load_yaml
+from validator_indices import decode_certificate_path, load_validator_indices
 
 
 def json_lines(path):
@@ -106,6 +107,7 @@ def audit_run(run):
     slots = json_lines(directory/'withholding_slots.jsonl')
     states = json_lines(directory/'withholding_states.jsonl')
     blocks = json_lines(directory/'blocks.jsonl')
+    validator_addresses = load_validator_indices(directory)
     assert [e['epoch'] for e in epochs] == list(range(run['max_epochs']))
     assert [s['epoch'] for s in states] == list(range(run['max_epochs']))
     assert len(slots) == len(blocks) == run['max_epochs']*run['slot_per_epoch']
@@ -159,12 +161,13 @@ def audit_run(run):
             assert generated[tx['hash']]['epoch'] == epoch
             assert tx == generated[tx['hash']]['transaction']
             assert proof['epoch'] == epoch
-            if proof['paths']:
-                assert proof['paths'][0] == tx['from'] and block['header']['miner'] not in proof['paths']
+            path = decode_certificate_path(proof['paths'], validator_addresses)
+            if path:
+                assert path[0] == tx['from'] and block['header']['miner'] not in path
                 assert proof['signature']
             else:
                 assert tx['from'] == block['header']['miner']
-            assert len(proof['paths']) == len(set(proof['paths']))
+            assert len(path) == len(set(path))
     violations = []
     for e, state in zip(epochs, states):
         epoch = e['epoch']; count = decision_counts[epoch]

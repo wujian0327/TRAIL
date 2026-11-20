@@ -1,0 +1,43 @@
+{
+  "suite": "r1_1_540b_performance_pilot_20261118",
+  "protocol_version": "frozen-v1",
+  "certificate_scheme": "per_path_v1",
+  "verifier": "independent_paths_with_validated_registry_cache",
+  "nodes": [
+    8
+  ],
+  "loads_tx_per_slot": [
+    64,
+    128,
+    256
+  ],
+  "topologies": [
+    "ba"
+  ],
+  "variants": [
+    "baseline",
+    "trail"
+  ],
+  "seeds": [
+    0
+  ],
+  "validators_per_node": 1,
+  "seconds_per_slot": 3,
+  "slots_per_epoch": 8,
+  "warmup_epochs": 5,
+  "measurement_epochs": 5,
+  "resource_sample_interval_seconds": 1.0,
+  "prometheus_scrape_interval_seconds": 1.0,
+  "send_concurrency": 64,
+  "receipt_concurrency": 64,
+  "receipt_timeout_seconds": 1200,
+  "finality_timeout_seconds": 1800,
+  "randomize_order": false,
+  "geth_image": "trail/geth:r1c1-per-path-20261118",
+  "lighthouse_image": "trail/lighthouse:r1c1-path-cache-20261118",
+  "smoke_first": true,
+  "stop_owned_engine_on_exit": true,
+  "raw_tx_target_bytes": 540,
+  "report_script": "experiments/report_r1_1_540b_performance.py",
+  "short_reference_suite": "r1_1_path_performance_pilot_20261118"
+}
